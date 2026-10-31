@@ -1,0 +1,26 @@
+[package]
+name = "pgwal-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The pgwal command: archives the WAL of a Postgres server."
+
+[[bin]]
+name = "pgwal"
+path = "src/main.rs"
+
+[dependencies]
+pgwal-receiver = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-postgres = { workspace = true }

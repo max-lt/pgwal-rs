@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/pgwal", "crates/pgwal-receiver"]
+members = ["crates/pgwal", "crates/pgwal-receiver", "crates/pgwal-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ repository = "https://github.com/max-lt/pgwal-rs"
 
 [workspace.dependencies]
 pgwal = { path = "crates/pgwal" }
+pgwal-receiver = { path = "crates/pgwal-receiver" }
 tokio = { version = "1.52", features = ["full"] }
 bytes = "1"
 thiserror = "2"
@@ -18,3 +19,6 @@ tracing = "0.1"
 async-trait = "0.1"
 tempfile = "3"
 tokio-postgres = "0.7"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
