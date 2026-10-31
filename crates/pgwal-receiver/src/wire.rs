@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pgwal::Lsn;
+use postgres_protocol::authentication::sasl::{ChannelBinding, SCRAM_SHA_256, ScramSha256};
 use postgres_protocol::message::frontend;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -25,6 +26,12 @@ const DUPLICATE_OBJECT: &str = "42710";
 
 /// SQLSTATE `undefined_object`.
 const UNDEFINED_OBJECT: &str = "42704";
+
+// Authentication request codes of the `R` message.
+const AUTH_OK: i32 = 0;
+const AUTH_SASL: i32 = 10;
+const AUTH_SASL_CONTINUE: i32 = 11;
+const AUTH_SASL_FINAL: i32 = 12;
 
 pub(crate) struct SystemInfo {
     pub system_id: u64,
@@ -55,10 +62,13 @@ pub(crate) struct Conn<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
-    /// Opens a physical replication connection. The backend must trust `user`.
+    /// Opens a physical replication connection. Without `password`, the
+    /// backend must trust `user`. With it, the backend can ask for
+    /// SCRAM-SHA-256.
     pub async fn connect(
         stream: S,
         user: &str,
+        password: Option<&str>,
         application_name: &str,
         idle_timeout: Duration,
     ) -> Result<Self, Error> {
@@ -78,15 +88,48 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         )?;
         conn.stream.write_all(&out).await?;
 
+        let mut scram = None;
         loop {
             let (tag, mut body) = conn.read_frame().await?;
             match tag {
-                b'R' if take_i32(&mut body)? == 0 => {}
-                b'R' => {
-                    return Err(protocol(
-                        "backend demanded a password (expected trust auth)",
-                    ));
-                }
+                b'R' => match take_i32(&mut body)? {
+                    AUTH_OK => {}
+                    AUTH_SASL => {
+                        let Some(password) = password else {
+                            return Err(protocol("backend asked for a password; none given"));
+                        };
+                        if !body[..]
+                            .split(|b| *b == 0)
+                            .any(|m| m == SCRAM_SHA_256.as_bytes())
+                        {
+                            return Err(protocol("backend does not offer SCRAM-SHA-256"));
+                        }
+                        let client =
+                            ScramSha256::new(password.as_bytes(), ChannelBinding::unsupported());
+                        let mut out = BytesMut::new();
+                        frontend::sasl_initial_response(SCRAM_SHA_256, client.message(), &mut out)?;
+                        conn.stream.write_all(&out).await?;
+                        scram = Some(client);
+                    }
+                    AUTH_SASL_CONTINUE => {
+                        let client = scram
+                            .as_mut()
+                            .ok_or_else(|| protocol("SASL continue before SASL start"))?;
+                        client.update(&body)?;
+                        let mut out = BytesMut::new();
+                        frontend::sasl_response(client.message(), &mut out)?;
+                        conn.stream.write_all(&out).await?;
+                    }
+                    AUTH_SASL_FINAL => scram
+                        .as_mut()
+                        .ok_or_else(|| protocol("SASL final before SASL start"))?
+                        .finish(&body)?,
+                    code => {
+                        return Err(protocol(format!(
+                            "backend asked for authentication method {code}; only trust and SCRAM-SHA-256 work"
+                        )));
+                    }
+                },
                 b'E' => return Err(db_error(body)),
                 b'Z' => return Ok(conn),
                 _ => {}

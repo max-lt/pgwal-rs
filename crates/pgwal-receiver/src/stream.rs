@@ -26,6 +26,8 @@ pub struct StreamConfig {
     /// Physical replication slot, created on first use.
     pub slot: String,
     pub user: String,
+    /// For SCRAM-SHA-256. `None` when the server trusts `user`.
+    pub password: Option<String>,
     /// The name `synchronous_standby_names` matches.
     pub application_name: String,
     /// One directory per cluster. One receiver at a time can use it.
@@ -64,8 +66,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     validate(cfg)?;
-    let mut conn =
-        Conn::connect(stream, &cfg.user, &cfg.application_name, cfg.idle_timeout).await?;
+    let mut conn = Conn::connect(
+        stream,
+        &cfg.user,
+        cfg.password.as_deref(),
+        &cfg.application_name,
+        cfg.idle_timeout,
+    )
+    .await?;
     let system = conn.identify_system().await?;
     let seg_size = parse_segment_size(&conn.show("wal_segment_size").await?)?;
     conn.ensure_physical_slot(&cfg.slot).await?;
@@ -270,8 +278,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     validate(cfg)?;
-    let mut conn =
-        Conn::connect(stream, &cfg.user, &cfg.application_name, cfg.idle_timeout).await?;
+    let mut conn = Conn::connect(
+        stream,
+        &cfg.user,
+        cfg.password.as_deref(),
+        &cfg.application_name,
+        cfg.idle_timeout,
+    )
+    .await?;
     conn.drop_slot(&cfg.slot).await
 }
 

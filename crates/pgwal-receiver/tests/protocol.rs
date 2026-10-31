@@ -99,6 +99,7 @@ fn config(dir: &Path) -> StreamConfig {
     StreamConfig {
         slot: SLOT.into(),
         user: "postgres".into(),
+        password: None,
         application_name: "pgwal".into(),
         dir: dir.to_path_buf(),
         upload_every: Duration::from_millis(20),
@@ -683,7 +684,7 @@ async fn hostile_frames_are_errors_not_panics() {
 }
 
 #[tokio::test]
-async fn a_password_challenge_is_refused() {
+async fn a_cleartext_password_challenge_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(MemSink::default());
     let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
@@ -691,7 +692,7 @@ async fn a_password_challenge_is_refused() {
     server.send(b'R', &3i32.to_be_bytes()).await;
     let err = finish(task).await.unwrap_err();
     assert!(
-        matches!(err, Error::Protocol(ref m) if m.contains("password")),
+        matches!(err, Error::Protocol(ref m) if m.contains("authentication method 3")),
         "{err}"
     );
 }

@@ -179,6 +179,7 @@ fn spawn_receiver(root: &Path, wal: &Path, objects: &Path) -> JoinHandle<Result<
     let cfg = StreamConfig {
         slot: SLOT.into(),
         user: "postgres".into(),
+        password: None,
         application_name: "pgwal_receiver".into(),
         dir: wal.to_path_buf(),
         upload_every: Duration::from_millis(100),
@@ -417,6 +418,7 @@ fn stream_config(wal: &Path) -> StreamConfig {
     StreamConfig {
         slot: SLOT.into(),
         user: "postgres".into(),
+        password: None,
         application_name: "pgwal_receiver".into(),
         dir: wal.to_path_buf(),
         upload_every: Duration::from_millis(100),
