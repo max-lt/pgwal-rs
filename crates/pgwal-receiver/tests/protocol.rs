@@ -1,0 +1,780 @@
+//! The receiver against a scripted walsender over an in-memory stream: resume,
+//! timeouts, hang-ups and hostile input, without a Postgres server.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use pgwal::assemble_segment;
+use pgwal_receiver::{Error, Lsn, RangeKey, StreamConfig, WalSink, receive, salvage};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+const SEG: u64 = 1 << 20;
+const SLOT: &str = "pgwal_test";
+const CHUNK: usize = 128 << 10;
+/// Timeline 2 begins inside segment 3.
+const HISTORY: &str = "1\t0/300A00\tno recovery target specified\n";
+
+#[derive(Default)]
+struct MemSink(Mutex<BTreeMap<String, Bytes>>);
+
+#[async_trait]
+impl WalSink for MemSink {
+    async fn put(&self, key: &str, wal: Bytes) -> io::Result<()> {
+        self.0.lock().unwrap().insert(key.to_owned(), wal);
+        Ok(())
+    }
+
+    async fn list(&self, dir: &str) -> io::Result<Vec<String>> {
+        let prefix = format!("{dir}/");
+        let objects = self.0.lock().unwrap();
+        Ok(objects
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect())
+    }
+
+    async fn delete(&self, keys: &[String]) -> io::Result<()> {
+        let mut objects = self.0.lock().unwrap();
+        for key in keys {
+            objects.remove(key);
+        }
+        Ok(())
+    }
+}
+
+impl MemSink {
+    fn ranges(&self) -> Vec<(Lsn, Lsn, Bytes)> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| !key.ends_with(".history"))
+            .map(|(key, wal)| {
+                let k = RangeKey::parse(key).unwrap();
+                assert_eq!(k.system_id, 7401, "{key}");
+                assert_eq!(wal.len() as u64, k.end.0 - k.start.0, "{key}");
+                (k.start, k.end, wal.clone())
+            })
+            .collect()
+    }
+
+    /// Asserts that the objects tile `[from, to)` exactly: no gap, no overlap.
+    fn assert_tiles(&self, from: Lsn, to: Lsn) {
+        let mut at = from;
+        for (start, end, _) in self.ranges() {
+            assert_eq!(start, at, "gap or overlap at {at}");
+            at = end;
+        }
+        assert_eq!(at, to);
+    }
+}
+
+/// An object store that is down.
+struct DownSink;
+
+#[async_trait]
+impl WalSink for DownSink {
+    async fn put(&self, _key: &str, _wal: Bytes) -> io::Result<()> {
+        Err(io::Error::other("object store down"))
+    }
+
+    async fn list(&self, _dir: &str) -> io::Result<Vec<String>> {
+        Err(io::Error::other("object store down"))
+    }
+
+    async fn delete(&self, _keys: &[String]) -> io::Result<()> {
+        Err(io::Error::other("object store down"))
+    }
+}
+
+fn config(dir: &Path) -> StreamConfig {
+    StreamConfig {
+        slot: SLOT.into(),
+        user: "postgres".into(),
+        application_name: "pgwal".into(),
+        dir: dir.to_path_buf(),
+        upload_every: Duration::from_millis(20),
+        idle_timeout: Duration::from_secs(5),
+    }
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8 ^ seed).collect()
+}
+
+/// Starts a receiver and returns the server end of its connection.
+fn spawn_receiver(
+    cfg: StreamConfig,
+    sink: &Arc<MemSink>,
+) -> (JoinHandle<Result<Lsn, Error>>, Walsender) {
+    let (task, server, _stop) = spawn_stoppable(cfg, sink);
+    (task, server)
+}
+
+/// As [`spawn_receiver`], plus the sender that stops the receiver. Dropping the
+/// sender does not stop it.
+fn spawn_stoppable(
+    cfg: StreamConfig,
+    sink: &Arc<MemSink>,
+) -> (
+    JoinHandle<Result<Lsn, Error>>,
+    Walsender,
+    oneshot::Sender<()>,
+) {
+    let (client, server) = tokio::io::duplex(4 << 20);
+    let sink: Arc<dyn WalSink> = sink.clone();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let stop = async move {
+        if stop_rx.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let task = tokio::spawn(async move { receive(client, &cfg, sink, stop).await });
+    (
+        task,
+        Walsender {
+            io: server,
+            buf: BytesMut::new(),
+        },
+        stop_tx,
+    )
+}
+
+async fn finish(task: JoinHandle<Result<Lsn, Error>>) -> Result<Lsn, Error> {
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("receiver did not return")
+        .unwrap()
+}
+
+/// The server side of a replication connection.
+struct Walsender {
+    io: DuplexStream,
+    buf: BytesMut,
+}
+
+impl Walsender {
+    async fn fill(&mut self) {
+        let n = self.io.read_buf(&mut self.buf).await.unwrap();
+        assert!(n > 0, "receiver closed the connection");
+    }
+
+    async fn read_startup(&mut self) -> BTreeMap<String, String> {
+        while self.buf.len() < 4 {
+            self.fill().await;
+        }
+        let len = u32::from_be_bytes(self.buf[..4].try_into().unwrap()) as usize;
+        while self.buf.len() < len {
+            self.fill().await;
+        }
+        let mut msg = self.buf.split_to(len);
+        msg.advance(8);
+        let mut params = BTreeMap::new();
+        let mut fields = msg[..]
+            .split(|&b| b == 0)
+            .map(|f| String::from_utf8(f.to_vec()).unwrap());
+        while let (Some(key), Some(value)) = (fields.next(), fields.next()) {
+            if key.is_empty() {
+                break;
+            }
+            params.insert(key, value);
+        }
+        params
+    }
+
+    async fn read(&mut self) -> (u8, BytesMut) {
+        loop {
+            if self.buf.len() >= 5 {
+                let len = u32::from_be_bytes(self.buf[1..5].try_into().unwrap()) as usize;
+                if self.buf.len() > len {
+                    let mut msg = self.buf.split_to(1 + len);
+                    let tag = msg[0];
+                    msg.advance(5);
+                    return (tag, msg);
+                }
+            }
+            self.fill().await;
+        }
+    }
+
+    async fn expect_query(&mut self) -> String {
+        let (tag, body) = self.read().await;
+        assert_eq!(tag, b'Q');
+        String::from_utf8(body[..body.len() - 1].to_vec()).unwrap()
+    }
+
+    async fn send(&mut self, tag: u8, body: &[u8]) {
+        let mut out = BytesMut::new();
+        out.put_u8(tag);
+        out.put_u32(4 + body.len() as u32);
+        out.put_slice(body);
+        self.io.write_all(&out).await.unwrap();
+    }
+
+    async fn ready(&mut self) {
+        self.send(b'Z', b"I").await;
+    }
+
+    async fn row(&mut self, values: &[Option<&str>]) {
+        let mut body = BytesMut::new();
+        body.put_i16(values.len() as i16);
+        for value in values {
+            match value {
+                Some(v) => {
+                    body.put_i32(v.len() as i32);
+                    body.put_slice(v.as_bytes());
+                }
+                None => body.put_i32(-1),
+            }
+        }
+        self.send(b'D', &body).await;
+        self.send(b'C', b"SELECT\0").await;
+        self.ready().await;
+    }
+
+    async fn error(&mut self, code: &str, message: &str) {
+        let body = format!("SERROR\0C{code}\0M{message}\0\0");
+        self.send(b'E', body.as_bytes()).await;
+    }
+
+    /// Answers the handshake up to the slot creation, on timeline 1.
+    async fn open(&mut self) {
+        self.open_on(1).await;
+    }
+
+    async fn open_on(&mut self, timeline: u32) {
+        let params = self.read_startup().await;
+        assert_eq!(params["replication"], "true");
+        assert_eq!(params["application_name"], "pgwal");
+        self.send(b'R', &0i32.to_be_bytes()).await;
+        self.ready().await;
+        assert_eq!(self.expect_query().await, "IDENTIFY_SYSTEM");
+        self.row(&[
+            Some("7401"),
+            Some(&timeline.to_string()),
+            Some("0/2000000"),
+            None,
+        ])
+        .await;
+        assert_eq!(self.expect_query().await, "SHOW wal_segment_size");
+        self.row(&[Some("1MB")]).await;
+        let create = self.expect_query().await;
+        assert_eq!(
+            create,
+            format!("CREATE_REPLICATION_SLOT {SLOT} PHYSICAL RESERVE_WAL")
+        );
+        self.error("42710", "replication slot already exists").await;
+        self.ready().await;
+        if timeline > 1 {
+            assert_eq!(
+                self.expect_query().await,
+                format!("TIMELINE_HISTORY {timeline}")
+            );
+            self.row(&[Some(&format!("{timeline:08X}.history")), Some(HISTORY)])
+                .await;
+        }
+    }
+
+    /// Answers the rest of the handshake and returns the START_REPLICATION
+    /// query. `restart` is the slot position, asked only by an empty store.
+    async fn start(&mut self, restart: Option<Lsn>) -> String {
+        let mut query = self.expect_query().await;
+        if let Some(restart) = restart {
+            assert_eq!(query, format!("READ_REPLICATION_SLOT {SLOT}"));
+            self.row(&[Some("physical"), Some(&restart.to_string()), Some("1")])
+                .await;
+            query = self.expect_query().await;
+        }
+        assert!(query.starts_with("START_REPLICATION"), "{query}");
+        self.send(b'W', &[0, 0, 0]).await;
+        query
+    }
+
+    async fn xlogdata(&mut self, start: Lsn, wal: &[u8], wal_end: Lsn) {
+        let mut body = BytesMut::new();
+        body.put_u8(b'w');
+        body.put_u64(start.0);
+        body.put_u64(wal_end.0);
+        body.put_u64(0);
+        body.put_slice(wal);
+        self.send(b'd', &body).await;
+    }
+
+    /// Sends `wal` from `start` and announces its end as the server's WAL end.
+    async fn stream(&mut self, start: Lsn, wal: &[u8]) -> Lsn {
+        let end = Lsn(start.0 + wal.len() as u64);
+        self.stream_announcing(start, wal, end).await;
+        end
+    }
+
+    async fn stream_announcing(&mut self, start: Lsn, wal: &[u8], wal_end: Lsn) {
+        for (i, chunk) in wal.chunks(CHUNK).enumerate() {
+            self.xlogdata(Lsn(start.0 + (i * CHUNK) as u64), chunk, wal_end)
+                .await;
+        }
+    }
+
+    async fn keepalive(&mut self, wal_end: Lsn, reply_requested: bool) {
+        let mut body = BytesMut::new();
+        body.put_u8(b'k');
+        body.put_u64(wal_end.0);
+        body.put_u64(0);
+        body.put_u8(reply_requested.into());
+        self.send(b'd', &body).await;
+    }
+
+    /// Reads the next status update: `(flushed, reply_requested)`.
+    async fn status(&mut self) -> (Lsn, bool) {
+        loop {
+            let (tag, mut body) = self.read().await;
+            if tag != b'd' {
+                continue;
+            }
+            assert_eq!(body.get_u8(), b'r');
+            let written = body.get_u64();
+            let flushed = body.get_u64();
+            assert!(flushed <= written);
+            assert_eq!(body.get_u64(), 0, "a receiver never reports apply");
+            body.get_i64();
+            return (Lsn(flushed), body.get_u8() == 1);
+        }
+    }
+
+    /// Reads status updates until one confirms the flush of `lsn`.
+    async fn await_flush(&mut self, lsn: Lsn) {
+        while self.status().await.0 < lsn {}
+    }
+
+    /// Reads status updates until one asks for a reply.
+    async fn await_reply_request(&mut self) {
+        while !self.status().await.1 {}
+    }
+
+    /// Ends the stream the way a walsender does at shutdown.
+    async fn end(&mut self) {
+        self.send(b'C', b"COPY 0\0").await;
+    }
+}
+
+#[tokio::test]
+async fn streams_across_segments_confirms_the_flush_and_uploads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+
+    server.open().await;
+    let query = server.start(Some(Lsn(SEG + 0x1234))).await;
+    assert_eq!(
+        query,
+        format!("START_REPLICATION SLOT {SLOT} PHYSICAL 0/100000 TIMELINE 1"),
+        "starts at the segment that holds the slot position"
+    );
+    let wal = pattern((SEG + SEG / 2) as usize, 0);
+    let end = server.stream(Lsn(SEG), &wal).await;
+    server.keepalive(end, true).await;
+    server.await_flush(end).await;
+    server.end().await;
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    sink.assert_tiles(Lsn(SEG), end);
+    let ranges = sink.ranges();
+    assert_eq!(
+        assemble_segment(1, SEG, &ranges).unwrap(),
+        wal[..SEG as usize]
+    );
+    assert_eq!(
+        assemble_segment(2, SEG, &ranges).unwrap()[..(SEG / 2) as usize],
+        wal[SEG as usize..]
+    );
+}
+
+#[tokio::test]
+async fn resumes_at_the_unfinished_segment_without_uploading_twice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let wal = pattern(0xC0000, 3);
+
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let first = server.stream(Lsn(SEG), &wal[..0x80000]).await;
+    server.await_flush(first).await;
+    server.end().await;
+    assert_eq!(finish(task).await.unwrap(), first);
+
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    let query = server.start(None).await;
+    assert!(query.contains("PHYSICAL 0/100000 "), "{query}");
+    let end = server.stream(Lsn(SEG), &wal).await;
+    server.await_flush(end).await;
+    server.end().await;
+    assert_eq!(finish(task).await.unwrap(), end);
+
+    sink.assert_tiles(Lsn(SEG), end);
+    assert_eq!(
+        assemble_segment(1, SEG, &sink.ranges()).unwrap()[..wal.len()],
+        wal[..]
+    );
+}
+
+/// At shutdown the walsender ends the stream as soon as it has our flush
+/// confirmation. A status we send after that finds the socket closed; the
+/// stream still ended cleanly.
+#[tokio::test]
+async fn a_status_the_closed_server_never_reads_does_not_fail_a_clean_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let end = server.stream(Lsn(SEG), &pattern(4096, 0)).await;
+    server.keepalive(end, true).await;
+    server.end().await;
+    drop(server);
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    sink.assert_tiles(Lsn(SEG), end);
+}
+
+#[tokio::test]
+async fn a_stop_on_a_caught_up_server_ends_at_its_position() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server, stop) = spawn_stoppable(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let end = server.stream(Lsn(SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+
+    stop.send(()).unwrap();
+    server.await_reply_request().await;
+    server.keepalive(end, false).await;
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    let tag = loop {
+        match server.read().await {
+            (b'd', _) => continue,
+            (tag, _) => break tag,
+        }
+    };
+    assert_eq!(
+        tag, b'c',
+        "after its last status, the receiver ends the copy"
+    );
+    sink.assert_tiles(Lsn(SEG), end);
+}
+
+/// A walsender that lags answers with what it has sent, below the WAL end
+/// its XLogData announced. The receiver keeps reading until that end.
+#[tokio::test]
+async fn a_stop_on_a_lagging_server_waits_for_the_announced_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server, stop) = spawn_stoppable(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let wal = pattern(8192, 5);
+    let (sent, end) = (Lsn(SEG + 4096), Lsn(SEG + 8192));
+    server.stream_announcing(Lsn(SEG), &wal[..4096], end).await;
+    server.await_flush(sent).await;
+
+    stop.send(()).unwrap();
+    server.await_reply_request().await;
+    server.keepalive(sent, false).await;
+    server.stream_announcing(sent, &wal[4096..], end).await;
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    sink.assert_tiles(Lsn(SEG), end);
+    assert_eq!(
+        assemble_segment(1, SEG, &sink.ranges()).unwrap()[..wal.len()],
+        wal[..]
+    );
+}
+
+/// With nothing local on a later timeline, the stream starts at the segment
+/// of the switch point, not at the slot, and the history file reaches the
+/// sink.
+#[tokio::test]
+async fn a_later_timeline_starts_at_its_switch_point_and_archives_its_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    let query = server.start(None).await;
+    assert_eq!(
+        query,
+        format!("START_REPLICATION SLOT {SLOT} PHYSICAL 0/300000 TIMELINE 2")
+    );
+    let end = server.stream(Lsn(3 * SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+    server.end().await;
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    let objects = sink.0.lock().unwrap().clone();
+    assert_eq!(&objects["7401/00000002.history"][..], HISTORY.as_bytes());
+    sink.assert_tiles(Lsn(3 * SEG), end);
+}
+
+#[tokio::test]
+async fn an_invalidated_slot_is_reported_as_wal_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.expect_query().await; // READ_REPLICATION_SLOT
+    server
+        .row(&[Some("physical"), Some("0/100000"), Some("1")])
+        .await;
+    assert!(server.expect_query().await.starts_with("START_REPLICATION"));
+    server
+        .error("55000", "can no longer access replication slot")
+        .await;
+    server.ready().await;
+
+    let err = finish(task).await.unwrap_err();
+    assert!(
+        matches!(err, Error::WalGone { requested, .. } if requested == Lsn(SEG)),
+        "{err}"
+    );
+}
+
+/// The switch point of an old timeline is gone from the server. The stream
+/// falls back to the slot position on the same connection.
+#[tokio::test]
+async fn a_later_timeline_whose_first_wal_is_gone_starts_at_the_slot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    assert!(server.expect_query().await.contains("PHYSICAL 0/300000 "));
+    server
+        .error("58P01", "requested WAL segment has already been removed")
+        .await;
+    server.ready().await;
+    assert_eq!(
+        server.expect_query().await,
+        format!("READ_REPLICATION_SLOT {SLOT}")
+    );
+    server
+        .row(&[Some("physical"), Some("0/500123"), Some("2")])
+        .await;
+    assert!(server.expect_query().await.contains("PHYSICAL 0/500000 "));
+    server.send(b'W', &[0, 0, 0]).await;
+    let end = server.stream(Lsn(5 * SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+    server.end().await;
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    sink.assert_tiles(Lsn(5 * SEG), end);
+}
+
+#[tokio::test]
+async fn a_gap_ends_the_stream_and_what_was_flushed_is_still_uploaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let end = server.stream(Lsn(SEG), &pattern(100, 0)).await;
+    server.await_flush(end).await;
+    server
+        .xlogdata(Lsn(end.0 + 100), b"after a hole", Lsn(end.0 + 112))
+        .await;
+
+    let err = finish(task).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Protocol(ref m) if m.contains("gap")),
+        "{err}"
+    );
+    sink.assert_tiles(Lsn(SEG), end);
+}
+
+#[tokio::test]
+async fn a_hang_up_mid_stream_is_an_error_and_what_was_flushed_is_uploaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let end = server.stream(Lsn(SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+    drop(server);
+
+    let err = finish(task).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof),
+        "{err}"
+    );
+    sink.assert_tiles(Lsn(SEG), end);
+}
+
+#[tokio::test]
+async fn a_silent_server_times_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let cfg = StreamConfig {
+        idle_timeout: Duration::from_millis(300),
+        ..config(tmp.path())
+    };
+    let (task, mut server) = spawn_receiver(cfg, &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+
+    let err = finish(task).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Io(ref e) if e.kind() == io::ErrorKind::TimedOut),
+        "{err}"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_server_error_during_streaming_surfaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    server
+        .error(
+            "57P01",
+            "terminating connection due to administrator command",
+        )
+        .await;
+
+    let err = finish(task).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Db { ref code, .. } if code == "57P01"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn hostile_frames_are_errors_not_panics() {
+    let frames: [&[u8]; 4] = [
+        // A frame length far beyond the cap.
+        &[b'd', 0x7f, 0xff, 0xff, 0xff],
+        // A length that does not even cover itself.
+        &[b'd', 0, 0, 0, 2],
+        // XLogData cut inside its header.
+        &[b'd', 0, 0, 0, 8, b'w', 1, 2, 3],
+        // An unknown CopyData kind.
+        &[b'd', 0, 0, 0, 5, b'x'],
+    ];
+    for frame in frames {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(MemSink::default());
+        let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+        server.open().await;
+        server.start(Some(Lsn(SEG))).await;
+        server.io.write_all(frame).await.unwrap();
+        let err = finish(task).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "{frame:?}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn a_password_challenge_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.read_startup().await;
+    server.send(b'R', &3i32.to_be_bytes()).await;
+    let err = finish(task).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Protocol(ref m) if m.contains("password")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_second_receiver_on_the_same_directory_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (first, mut first_server) = spawn_receiver(config(tmp.path()), &sink);
+    first_server.open().await;
+    first_server.start(Some(Lsn(SEG))).await;
+
+    let (second, mut second_server) = spawn_receiver(config(tmp.path()), &sink);
+    second_server.open().await;
+    let err = finish(second).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Store(ref m) if m.contains("in use")),
+        "{err}"
+    );
+
+    drop(first_server);
+    assert!(finish(first).await.is_err());
+}
+
+#[tokio::test]
+async fn invalid_config_is_refused_before_any_io() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    for cfg in [
+        StreamConfig {
+            slot: "PgWal-Test".into(),
+            ..config(tmp.path())
+        },
+        StreamConfig {
+            upload_every: Duration::ZERO,
+            ..config(tmp.path())
+        },
+    ] {
+        let (task, server) = spawn_receiver(cfg, &sink);
+        let err = finish(task).await.unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        drop(server);
+    }
+    assert!(!tmp.path().join("system_id").exists());
+}
+
+/// The object store is down for a whole run, and the run dies. The WAL it
+/// flushed locally reaches the object store through `salvage`, exactly.
+#[tokio::test]
+async fn salvage_uploads_what_a_dead_run_flushed_but_never_uploaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (client, server) = tokio::io::duplex(4 << 20);
+    let mut server = Walsender {
+        io: server,
+        buf: BytesMut::new(),
+    };
+    let cfg = config(tmp.path());
+    let task = tokio::spawn(async move {
+        receive(client, &cfg, Arc::new(DownSink), std::future::pending()).await
+    });
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let wal = pattern((SEG + SEG / 2) as usize, 7);
+    let end = server.stream(Lsn(SEG), &wal).await;
+    server.await_flush(end).await;
+    drop(server);
+    assert!(finish(task).await.is_err(), "the run dies");
+
+    let sink = Arc::new(MemSink::default());
+    assert_eq!(salvage(tmp.path(), sink.clone()).await.unwrap(), Some(end));
+    sink.assert_tiles(Lsn(SEG), end);
+    assert_eq!(
+        assemble_segment(1, SEG, &sink.ranges()).unwrap(),
+        wal[..SEG as usize]
+    );
+
+    let objects = sink.0.lock().unwrap().len();
+    assert_eq!(salvage(tmp.path(), sink.clone()).await.unwrap(), Some(end));
+    assert_eq!(sink.0.lock().unwrap().len(), objects, "nothing twice");
+    assert_eq!(
+        salvage(&tmp.path().join("absent"), sink.clone())
+            .await
+            .unwrap(),
+        None
+    );
+}

@@ -1,0 +1,22 @@
+[package]
+name = "pgwal-receiver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Streams the WAL of a Postgres server over physical replication and uploads it by LSN range."
+
+[dependencies]
+pgwal = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+postgres-protocol = "0.6"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-postgres = { workspace = true }

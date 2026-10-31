@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/pgwal", "crates/pgwal-receiver"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/max-lt/pgwal-rs"
+
+[workspace.dependencies]
+pgwal = { path = "crates/pgwal" }
+tokio = { version = "1.52", features = ["full"] }
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+async-trait = "0.1"
+tempfile = "3"
+tokio-postgres = "0.7"
