@@ -1,13 +1,15 @@
-//! Runs `pgwal receive` against a Postgres server that asks for
-//! SCRAM-SHA-256 over TCP.
+//! Runs `pgwal receive` against Postgres servers that ask for SCRAM-SHA-256
+//! over TCP, with and without TLS.
 //!
 //! Skipped when no Postgres binaries are found: set `PGWAL_PG_BIN` to their
 //! directory.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use tempfile::TempDir;
 use tokio_postgres::NoTls;
 
 const PASSWORD: &str = "s3cret";
@@ -43,29 +45,174 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Stops the server when the test ends, also on a panic.
-struct Server<'a> {
-    bin: &'a Path,
-    data: PathBuf,
+/// A CA, and a server certificate for 127.0.0.1 that it signs, as PEM.
+struct Pki {
+    ca: String,
+    cert: String,
+    key: String,
 }
 
-impl Drop for Server<'_> {
+fn pki() -> Pki {
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec!["127.0.0.1".into()])
+        .unwrap()
+        .signed_by(&key, &ca, &ca_key)
+        .unwrap();
+    Pki {
+        ca: ca.pem(),
+        cert: cert.pem(),
+        key: key.serialize_pem(),
+    }
+}
+
+/// A running server, stopped when the test ends, also on a panic.
+struct Cluster {
+    bin: PathBuf,
+    root: TempDir,
+    port: u16,
+}
+
+impl Cluster {
+    /// With `tls`, the server takes TCP connections over TLS only.
+    fn start(bin: PathBuf, tls: Option<&Pki>) -> Cluster {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let pwfile = root.path().join("pw");
+        std::fs::write(&pwfile, PASSWORD).unwrap();
+        run(
+            &bin,
+            "initdb",
+            &[
+                "-D",
+                data.to_str().unwrap(),
+                "-U",
+                "postgres",
+                "--auth=scram-sha-256",
+                "--pwfile",
+                pwfile.to_str().unwrap(),
+            ],
+        );
+        let host = match tls {
+            Some(pki) => {
+                std::fs::write(data.join("server.crt"), &pki.cert).unwrap();
+                std::fs::write(data.join("server.key"), &pki.key).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    data.join("server.key"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+                let mut conf = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(data.join("postgresql.conf"))
+                    .unwrap();
+                std::io::Write::write_all(&mut conf, b"ssl = on\n").unwrap();
+                "hostssl"
+            }
+            None => "host",
+        };
+        std::fs::write(
+            data.join("pg_hba.conf"),
+            format!(
+                "local all all scram-sha-256\n\
+                 {host} all all 127.0.0.1/32 scram-sha-256\n\
+                 {host} replication all 127.0.0.1/32 scram-sha-256\n"
+            ),
+        )
+        .unwrap();
+        let port = free_port();
+        let opts = format!(
+            "-c listen_addresses=127.0.0.1 -p {port} -k {}",
+            root.path().to_str().unwrap()
+        );
+        let log = root.path().join("log");
+        run(
+            &bin,
+            "pg_ctl",
+            &[
+                "-D",
+                data.to_str().unwrap(),
+                "-l",
+                log.to_str().unwrap(),
+                "-o",
+                &opts,
+                "-w",
+                "start",
+            ],
+        );
+        Cluster { bin, root, port }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.root.path().join(name)
+    }
+
+    /// A client over the Unix socket, which needs no TLS.
+    async fn client(&self) -> tokio_postgres::Client {
+        let (client, conn) = tokio_postgres::connect(
+            &format!(
+                "host={} port={} user=postgres password={PASSWORD} dbname=postgres",
+                self.root.path().to_str().unwrap(),
+                self.port
+            ),
+            NoTls,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(conn);
+        client
+    }
+
+    /// Starts `pgwal receive` on TCP with `extra` arguments.
+    fn receiver(&self, extra: &[&str]) -> Receiver {
+        let child = Command::new(env!("CARGO_BIN_EXE_pgwal"))
+            .args([
+                "receive",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &self.port.to_string(),
+            ])
+            .arg("--dir")
+            .arg(self.path("store"))
+            .arg("--archive")
+            .arg(self.path("archive"))
+            .args(["--upload-every", "1"])
+            .args(extra)
+            .env("PGPASSWORD", PASSWORD)
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        Receiver(child)
+    }
+}
+
+impl Drop for Cluster {
     fn drop(&mut self) {
         let _ = Command::new(self.bin.join("pg_ctl"))
-            .args([
-                "-D",
-                self.data.to_str().unwrap(),
-                "-m",
-                "immediate",
-                "-w",
-                "stop",
-            ])
+            .args(["-D", self.path("data").to_str().unwrap()])
+            .args(["-m", "immediate", "-w", "stop"])
             .output();
     }
 }
 
 /// Kills `pgwal` when the test ends, also on a panic.
-struct Receiver(std::process::Child);
+struct Receiver(Child);
+
+impl Receiver {
+    fn interrupt(mut self) -> std::process::ExitStatus {
+        run(
+            Path::new("/bin"),
+            "kill",
+            &["-INT", &self.0.id().to_string()],
+        );
+        self.0.wait().unwrap()
+    }
+}
 
 impl Drop for Receiver {
     fn drop(&mut self) {
@@ -87,108 +234,113 @@ fn objects_under(dir: &Path) -> usize {
         .sum()
 }
 
+async fn slot_active(client: &tokio_postgres::Client) -> Option<bool> {
+    client
+        .query_opt(
+            "SELECT active FROM pg_replication_slots WHERE slot_name = 'pgwal'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .map(|row| row.get(0))
+}
+
+/// Writes WAL, waits for an archived object, and stops `pgwal`.
+async fn archive_and_stop(cluster: &Cluster, mut pgwal: Receiver) {
+    let client = cluster.client().await;
+    client
+        .batch_execute("CREATE TABLE t AS SELECT g FROM generate_series(1, 10000) g")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while objects_under(&cluster.path("archive")) == 0 {
+        assert!(Instant::now() < deadline, "no object reached the archive");
+        assert!(pgwal.0.try_wait().unwrap().is_none(), "pgwal exited early");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(slot_active(&client).await, Some(true));
+    let status = pgwal.interrupt();
+    assert!(status.success(), "pgwal exited with {status}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn receive_archives_wal_with_scram_auth() {
     let Some(bin) = pg_bin() else {
         eprintln!("skipping: postgres binaries not found");
         return;
     };
-    let root = tempfile::tempdir().unwrap();
-    let data = root.path().join("data");
-    let pwfile = root.path().join("pw");
-    std::fs::write(&pwfile, PASSWORD).unwrap();
-    run(
-        &bin,
-        "initdb",
-        &[
-            "-D",
-            data.to_str().unwrap(),
-            "-U",
-            "postgres",
-            "--auth=scram-sha-256",
-            "--pwfile",
-            pwfile.to_str().unwrap(),
-        ],
-    );
-    let port = free_port();
-    let opts = format!(
-        "-c listen_addresses=127.0.0.1 -p {port} -k {}",
-        root.path().to_str().unwrap()
-    );
-    let log = root.path().join("log");
-    run(
-        &bin,
-        "pg_ctl",
-        &[
-            "-D",
-            data.to_str().unwrap(),
-            "-l",
-            log.to_str().unwrap(),
-            "-o",
-            &opts,
-            "-w",
-            "start",
-        ],
-    );
-    let _server = Server {
-        bin: &bin,
-        data: data.clone(),
+    let cluster = Cluster::start(bin, None);
+    let pgwal = cluster.receiver(&[]);
+    archive_and_stop(&cluster, pgwal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_full_archives_wal_over_tls() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
     };
+    let pki = pki();
+    let cluster = Cluster::start(bin, Some(&pki));
+    std::fs::write(cluster.path("ca.pem"), &pki.ca).unwrap();
+    let ca = cluster.path("ca.pem");
+    let pgwal = cluster.receiver(&[
+        "--sslmode",
+        "verify-full",
+        "--sslrootcert",
+        ca.to_str().unwrap(),
+    ]);
+    archive_and_stop(&cluster, pgwal).await;
+}
 
-    let archive = root.path().join("archive");
-    let mut pgwal = Receiver(
-        Command::new(env!("CARGO_BIN_EXE_pgwal"))
-            .args([
-                "receive",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-            ])
-            .arg("--dir")
-            .arg(root.path().join("store"))
-            .arg("--archive")
-            .arg(&archive)
-            .args(["--upload-every", "1"])
-            .env("PGPASSWORD", PASSWORD)
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
+#[tokio::test(flavor = "multi_thread")]
+async fn require_archives_wal_without_a_ca() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let cluster = Cluster::start(bin, Some(&pki()));
+    let pgwal = cluster.receiver(&["--sslmode", "require"]);
+    archive_and_stop(&cluster, pgwal).await;
+}
 
-    let (client, conn) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={port} user=postgres password={PASSWORD} dbname=postgres"),
-        NoTls,
-    )
-    .await
-    .unwrap();
-    tokio::spawn(conn);
-    client
-        .batch_execute("CREATE TABLE t AS SELECT g FROM generate_series(1, 10000) g")
-        .await
-        .unwrap();
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_full_refuses_a_certificate_of_another_ca() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let cluster = Cluster::start(bin, Some(&pki()));
+    std::fs::write(cluster.path("other-ca.pem"), pki().ca).unwrap();
+    let ca = cluster.path("other-ca.pem");
+    let mut pgwal = cluster.receiver(&[
+        "--sslmode",
+        "verify-full",
+        "--sslrootcert",
+        ca.to_str().unwrap(),
+    ]);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(pgwal.0.try_wait().unwrap().is_none(), "pgwal exited");
+    assert_eq!(slot_active(&cluster.client().await).await, None);
+    assert_eq!(objects_under(&cluster.path("archive")), 0);
+}
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while objects_under(&archive) == 0 {
-        assert!(Instant::now() < deadline, "no object reached the archive");
-        assert!(pgwal.0.try_wait().unwrap().is_none(), "pgwal exited early");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let active: bool = client
-        .query_one(
-            "SELECT active FROM pg_replication_slots WHERE slot_name = 'pgwal'",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert!(active);
-
-    run(
-        Path::new("/bin"),
-        "kill",
-        &["-INT", &pgwal.0.id().to_string()],
-    );
-    let status = pgwal.0.wait().unwrap();
-    assert!(status.success(), "pgwal exited with {status}");
+#[tokio::test(flavor = "multi_thread")]
+async fn require_stops_on_a_server_without_tls() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let cluster = Cluster::start(bin, None);
+    let mut pgwal = cluster.receiver(&["--sslmode", "require"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = pgwal.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "pgwal did not stop");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(!status.success());
+    assert_eq!(slot_active(&cluster.client().await).await, None);
 }

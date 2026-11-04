@@ -7,12 +7,15 @@ use clap::{Args, Parser, Subcommand};
 use pgwal_receiver::{Error, Lsn, StreamConfig, WalSink, receive};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::watch;
+use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod sink;
+mod tls;
 
 use sink::DirSink;
+use tls::SslMode;
 
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -45,6 +48,13 @@ struct ReceiveArgs {
     /// A role with the REPLICATION attribute.
     #[arg(long, env = "PGUSER", default_value = "postgres")]
     user: String,
+    /// TLS to the server. It applies to TCP only.
+    #[arg(long, env = "PGSSLMODE", value_enum, default_value_t = SslMode::Disable)]
+    sslmode: SslMode,
+    /// PEM file of the CAs that `verify-full` trusts. Without it, it trusts
+    /// the Mozilla roots.
+    #[arg(long, env = "PGSSLROOTCERT")]
+    sslrootcert: Option<PathBuf>,
     /// Physical replication slot, created on first use.
     #[arg(long, default_value = "pgwal")]
     slot: String,
@@ -75,6 +85,13 @@ async fn main() -> Result<()> {
 }
 
 async fn run_receive(args: ReceiveArgs) -> Result<()> {
+    if args.host.starts_with('/') && args.sslmode != SslMode::Disable {
+        bail!(
+            "--sslmode applies to TCP only, not to the Unix socket in {}",
+            args.host
+        );
+    }
+    let tls = tls::connector(args.sslmode, args.sslrootcert.as_deref())?;
     let cfg = StreamConfig {
         slot: args.slot,
         user: args.user,
@@ -102,7 +119,16 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
                 let _ = stop.wait_for(|stopped| *stopped).await;
             }
         };
-        match receive_once(&args.host, args.port, &cfg, sink.clone(), stopped).await {
+        match receive_once(
+            &args.host,
+            args.port,
+            tls.as_ref(),
+            &cfg,
+            sink.clone(),
+            stopped,
+        )
+        .await
+        {
             Ok(lsn) if *stop.borrow() => {
                 info!(%lsn, "archived");
                 return Ok(());
@@ -114,6 +140,7 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
             Err(e @ (Error::Config(_) | Error::SystemMismatch { .. } | Error::WalGone { .. })) => {
                 bail!(e)
             }
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => bail!(e),
             Err(e) => warn!(retry_in = ?backoff, "receive failed: {e}"),
         }
         tokio::select! {
@@ -127,6 +154,7 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
 async fn receive_once(
     host: &str,
     port: u16,
+    tls: Option<&TlsConnector>,
     cfg: &StreamConfig,
     sink: Arc<dyn WalSink>,
     stop: impl Future<Output = ()>,
@@ -137,6 +165,9 @@ async fn receive_once(
     } else {
         let stream = TcpStream::connect((host, port)).await?;
         stream.set_nodelay(true)?;
-        receive(stream, cfg, sink, stop).await
+        match tls {
+            Some(tls) => receive(tls::connect(stream, tls, host).await?, cfg, sink, stop).await,
+            None => receive(stream, cfg, sink, stop).await,
+        }
     }
 }
