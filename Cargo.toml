@@ -8,10 +8,11 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/max-lt/pgwal-rs"
+readme = "README.md"
 
 [workspace.dependencies]
-pgwal = { path = "crates/pgwal" }
-pgwal-receiver = { path = "crates/pgwal-receiver" }
+pgwal = { path = "crates/pgwal", version = "0.1.0" }
+pgwal-receiver = { path = "crates/pgwal-receiver", version = "0.1.0" }
 tokio = { version = "1.52", features = ["full"] }
 bytes = "1"
 thiserror = "2"
