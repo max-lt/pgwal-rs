@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/pgwal", "crates/pgwal-receiver", "crates/pgwal-cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -11,8 +11,8 @@ repository = "https://github.com/max-lt/pgwal-rs"
 readme = "README.md"
 
 [workspace.dependencies]
-pgwal = { path = "crates/pgwal", version = "0.1.0" }
-pgwal-receiver = { path = "crates/pgwal-receiver", version = "0.1.0" }
+pgwal = { path = "crates/pgwal", version = "0.2.0" }
+pgwal-receiver = { path = "crates/pgwal-receiver", version = "0.2.0" }
 tokio = { version = "1.52", features = ["full"] }
 bytes = "1"
 thiserror = "2"
