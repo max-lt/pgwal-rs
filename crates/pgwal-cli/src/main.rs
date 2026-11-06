@@ -11,6 +11,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod rebase;
 mod restore;
 mod sink;
 mod tls;
@@ -39,6 +40,11 @@ enum Cmd {
     /// Write the archived WAL that follows a base backup or a snapshot into
     /// its pg_wal.
     Restore(restore::RestoreArgs),
+    /// Print the archive keys, read on stdin, that a restore of a copy reads.
+    Plan(restore::PlanArgs),
+    /// Move a copy of the data directory forward to the end of the archive,
+    /// with a Postgres that stays in recovery and serves no client.
+    Rebase(rebase::RebaseArgs),
 }
 
 #[derive(Args, Debug)]
@@ -90,6 +96,8 @@ async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Receive(args) => run_receive(args).await,
         Cmd::Restore(args) => restore::run(args),
+        Cmd::Plan(args) => restore::run_plan(args),
+        Cmd::Rebase(args) => rebase::run(args),
     }
 }
 

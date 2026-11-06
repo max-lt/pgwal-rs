@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use pgwal::{
-    BackupLabel, ControlFile, Recovery, history_key, plan, request_archive_recovery,
+    BackupLabel, ControlFile, Lsn, Recovery, history_key, plan, request_archive_recovery,
     request_standby, segment_size, write_history, write_segment,
 };
 use tracing::{info, warn};
@@ -23,7 +23,7 @@ pub struct RestoreArgs {
     accept_gap: bool,
     /// Start as a standby that stays in recovery, on the timeline of the
     /// archive, instead of a server that promotes. A copy of it after a
-    /// clean stop is a new image to restore from.
+    /// clean stop is a new base backup.
     #[arg(long)]
     standby: bool,
 }
@@ -31,15 +31,60 @@ pub struct RestoreArgs {
 /// Writes the archived WAL that follows the copy into its `pg_wal`. The
 /// next start of Postgres replays it. Prints the LSN where the replay ends.
 pub fn run(args: RestoreArgs) -> Result<()> {
-    let pgdata = &args.pgdata;
-    if pgdata.join("postmaster.pid").exists() {
-        bail!(
-            "{} has a postmaster.pid: stop Postgres, or remove the file of a copy",
-            pgdata.display()
+    let end = apply(&args.archive, &args.pgdata, args.accept_gap, args.standby)?;
+    println!("{end}");
+    Ok(())
+}
+
+#[derive(Args, Debug)]
+pub struct PlanArgs {
+    /// The copy of the data directory to restore.
+    #[arg(long)]
+    pgdata: PathBuf,
+    /// A prefix of the keys on stdin, such as a bucket prefix. The output
+    /// keeps it.
+    #[arg(long, default_value = "")]
+    prefix: String,
+}
+
+/// Reads archive keys on stdin, one per line, and prints the ones that a
+/// restore of `--pgdata` reads: the objects to fetch before `pgwal restore`.
+pub fn run_plan(args: PlanArgs) -> Result<()> {
+    let start = replay_start(&args.pgdata)?;
+    let keys: Vec<String> = std::io::stdin()
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| line.strip_prefix(&args.prefix).map(str::to_owned))
+        .collect();
+    let plan = plan(keys.iter().map(String::as_str), &start.from, start.seg_size);
+    if let Some(gap) = plan.gap {
+        warn!(%gap, "the archive has a gap: a restore stops there");
+    }
+    for timeline in &plan.histories {
+        println!(
+            "{}{}",
+            args.prefix,
+            history_key(start.control.system_id, *timeline)
         );
     }
-    let pg_wal = pgdata.join("pg_wal");
-    std::fs::create_dir_all(&pg_wal)?;
+    for (_, _, keys) in &plan.segments {
+        for key in keys {
+            println!("{}{key}", args.prefix);
+        }
+    }
+    Ok(())
+}
+
+/// Where the replay of a copy starts, and its segment size.
+struct Start {
+    control: ControlFile,
+    /// `control`, with the start of `backup_label` when the copy has one.
+    from: ControlFile,
+    label: Option<BackupLabel>,
+    seg_size: u64,
+}
+
+fn replay_start(pgdata: &Path) -> Result<Start> {
     let control = ControlFile::read(pgdata)
         .with_context(|| format!("reading {}/global/pg_control", pgdata.display()))?;
     let label = BackupLabel::read(pgdata)?;
@@ -53,18 +98,43 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         },
         None => control,
     };
-    let seg_size = match segment_size(&pg_wal) {
+    let seg_size = match segment_size(&pgdata.join("pg_wal")) {
         Ok(size) => size,
         Err(_) => label
             .as_ref()
             .and_then(BackupLabel::segment_size)
             .context("no segment in pg_wal and no backup_label: unknown WAL segment size")?,
     };
+    Ok(Start {
+        control,
+        from,
+        label,
+        seg_size,
+    })
+}
 
-    let keys = archive_keys(&args.archive)?;
+/// Writes the archived WAL that follows the copy in `pgdata` into its
+/// `pg_wal`, and returns the LSN where the replay ends.
+pub fn apply(archive: &Path, pgdata: &Path, accept_gap: bool, standby: bool) -> Result<Lsn> {
+    if pgdata.join("postmaster.pid").exists() {
+        bail!(
+            "{} has a postmaster.pid: stop Postgres, or remove the file of a copy",
+            pgdata.display()
+        );
+    }
+    let pg_wal = pgdata.join("pg_wal");
+    std::fs::create_dir_all(&pg_wal)?;
+    let Start {
+        control,
+        from,
+        label,
+        seg_size,
+    } = replay_start(pgdata)?;
+
+    let keys = archive_keys(archive)?;
     let plan = plan(keys.iter().map(String::as_str), &from, seg_size);
     if let Some(gap) = plan.gap {
-        if !args.accept_gap {
+        if !accept_gap {
             bail!("the archive has a gap at {gap}; --accept-gap restores up to it");
         }
         warn!(%gap, "the archive has a gap: the replay stops there");
@@ -78,13 +148,13 @@ pub fn run(args: RestoreArgs) -> Result<()> {
 
     for timeline in &plan.histories {
         let key = history_key(control.system_id, *timeline);
-        write_history(&pg_wal, *timeline, &read_object(&args.archive, &key)?)?;
+        write_history(&pg_wal, *timeline, &read_object(archive, &key)?)?;
     }
     for (timeline, segno, keys) in &plan.segments {
         let objects = keys
             .iter()
             .map(|key| {
-                let wal = read_object(&args.archive, &key.to_string())?;
+                let wal = read_object(archive, &key.to_string())?;
                 if wal.len() as u64 != key.end.0 - key.start.0 {
                     bail!("archived object {key} holds {} bytes", wal.len());
                 }
@@ -104,7 +174,7 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         Recovery::Crash { end } => (false, Some(end)),
         Recovery::Archive { end } => (true, Some(end)),
     };
-    if args.standby {
+    if standby {
         request_standby(pgdata)?;
     } else if archive_recovery {
         request_archive_recovery(pgdata)?;
@@ -116,11 +186,10 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         segments = plan.segments.len(),
         histories = plan.histories.len(),
         archive_recovery,
-        standby = args.standby,
+        standby,
         "WAL written to pg_wal; start Postgres to replay it"
     );
-    println!("{}", end.unwrap_or(from.redo));
-    Ok(())
+    Ok(end.unwrap_or(from.redo))
 }
 
 /// The keys of the archive: the file paths under `root`. Names that start

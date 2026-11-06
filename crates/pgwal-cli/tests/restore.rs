@@ -331,10 +331,10 @@ async fn restore_refuses_an_archive_with_a_gap() {
 }
 
 /// A standby restore replays the archive and stays on its timeline. A copy
-/// of it after a clean stop is a new image, and a restore from it has every
+/// of it after a clean stop is a new base backup, and a restore from it has every
 /// row.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_standby_restore_makes_an_image_to_restore_from() {
+async fn a_standby_restore_makes_a_new_base_backup() {
     let Some(bin) = pg_bin() else {
         eprintln!("skipping: postgres binaries not found");
         return;
@@ -376,13 +376,13 @@ async fn a_standby_restore_makes_an_image_to_restore_from() {
     drop(client);
     setup.stop("backup");
 
-    let image = pgwal::ControlFile::read(&setup.path("backup")).unwrap();
-    assert_eq!(image.timeline, 1);
+    let rebased = pgwal::ControlFile::read(&setup.path("backup")).unwrap();
+    assert_eq!(rebased.timeline, 1);
     std::fs::remove_file(setup.path("backup/standby.signal")).unwrap();
     let out = setup.restore(&[]);
     assert!(
         out.status.success(),
-        "pgwal restore of the new image failed:\n{}",
+        "pgwal restore of the new base backup failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     setup.start("backup");
@@ -394,4 +394,128 @@ async fn a_standby_restore_makes_an_image_to_restore_from() {
         .map(|row| (row.get(0), row.get(1)))
         .unwrap();
     assert_eq!((rows, sum), (ROWS, ROWS * (ROWS + 1) / 2));
+}
+
+impl Setup {
+    fn rebase(&self) -> Output {
+        let (archive, backup) = (self.path("archive"), self.path("backup"));
+        Command::new(env!("CARGO_BIN_EXE_pgwal"))
+            .args([
+                "rebase",
+                "--archive",
+                path(&archive),
+                "--pgdata",
+                path(&backup),
+            ])
+            .args(["--pg-bin", path(&self.bin), "--user", "postgres"])
+            .output()
+            .unwrap()
+    }
+}
+
+/// A rebase moves a base backup to the last checkpoint of the archive,
+/// leaves no trace of its own server, and a restore of the result has every
+/// row.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let setup = Setup::new(bin);
+    setup.archived_backup().await;
+    let backup = setup.path("backup");
+    let label = pgwal::BackupLabel::read(&backup).unwrap().unwrap();
+    let hba = std::fs::read(backup.join("pg_hba.conf")).unwrap();
+
+    let out = setup.rebase();
+    assert!(
+        out.status.success(),
+        "pgwal rebase failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let redo: pgwal::Lsn = String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let control = pgwal::ControlFile::read(&backup).unwrap();
+    assert_eq!(control.redo, redo);
+    assert!(
+        redo > label.start,
+        "redo {redo} did not move from {}",
+        label.start
+    );
+    assert_eq!(control.timeline, 1);
+    assert!(!backup.join("standby.signal").exists());
+    assert!(!backup.join("postmaster.pid").exists());
+    assert_eq!(std::fs::read(backup.join("pg_hba.conf")).unwrap(), hba);
+
+    // Nothing new in the archive: the redo point stays.
+    let again = setup.rebase();
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(again.stdout).unwrap().trim(),
+        redo.to_string()
+    );
+
+    let out = setup.restore(&[]);
+    assert!(
+        out.status.success(),
+        "pgwal restore of the rebased copy failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    setup.start("backup");
+    let (rows, sum): (i64, i64) = setup
+        .client()
+        .await
+        .query_one("SELECT count(*), sum(i)::bigint FROM t", &[])
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .unwrap();
+    assert_eq!((rows, sum), (ROWS, ROWS * (ROWS + 1) / 2));
+}
+
+/// `pgwal plan` keeps the keys after the start of the copy, with their
+/// prefix.
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_lists_the_keys_a_restore_reads() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let setup = Setup::new(bin);
+    let keys = setup.archived_backup().await;
+    let backup = setup.path("backup");
+    let start = pgwal::BackupLabel::read(&backup).unwrap().unwrap().start;
+
+    let input: String = keys.iter().map(|k| format!("bucket/{k}\n")).collect();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pgwal"))
+        .args(["plan", "--pgdata", path(&backup), "--prefix", "bucket/"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let planned: Vec<String> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+
+    assert!(!planned.is_empty());
+    assert!(planned.len() < keys.len(), "every key planned: {planned:?}");
+    for key in &planned {
+        let key = key.strip_prefix("bucket/").expect("the prefix stays");
+        assert!(keys.contains(&key.to_owned()), "unknown key {key}");
+        let range = pgwal::RangeKey::parse(key).unwrap();
+        assert!(range.end > start, "{key} ends before the start {start}");
+    }
 }

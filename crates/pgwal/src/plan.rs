@@ -5,7 +5,7 @@ use crate::{ControlFile, Lsn, RangeKey, parse_history_key};
 /// How Postgres reaches the end of the replayed WAL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recovery {
-    /// The archive holds nothing after the image.
+    /// The archive holds nothing after the base backup.
     Nothing,
     /// Crash recovery replays `pg_wal` up to `end`.
     Crash { end: Lsn },
@@ -15,7 +15,7 @@ pub enum Recovery {
     Archive { end: Lsn },
 }
 
-/// The archived WAL a restored image needs.
+/// The archived WAL a restored base backup needs.
 #[derive(Debug)]
 pub struct ReplayPlan {
     /// Timelines whose history file goes into `pg_wal`.
@@ -23,13 +23,13 @@ pub struct ReplayPlan {
     /// `(timeline, segno, objects)`, one entry per segment file.
     pub segments: Vec<(u32, u64, Vec<RangeKey>)>,
     pub recovery: Recovery,
-    /// Where the archive has a gap on the image timeline, if it has one.
+    /// Where the archive has a gap on the timeline of the base backup, if it has one.
     pub gap: Option<Lsn>,
 }
 
-/// Plans the replay of the archive `keys` onto an image that `control`
-/// describes: the image timeline after its checkpoint, and every later
-/// timeline. At the first gap on the image timeline, the rest goes and the
+/// Plans the replay of the archive `keys` onto a base backup that `control`
+/// describes: its timeline after its checkpoint, and every later
+/// timeline. At the first gap on its timeline, the rest goes and the
 /// replay promotes: a server that went on from the gap on the same timeline
 /// would write other WAL at the LSNs the archive keeps after it.
 pub fn plan<'a>(
@@ -103,7 +103,7 @@ fn drop_contained(mut keys: Vec<RangeKey>) -> Vec<RangeKey> {
     keys
 }
 
-/// Keeps the ranges of the image timeline that chain from the checkpoint
+/// Keeps the ranges of the timeline of the base backup that chain from the checkpoint
 /// without a gap. After a gap, drops the rest, later timelines included, and
 /// returns where the gap starts.
 fn drop_after_gap(ranges: &mut Vec<RangeKey>, control: &ControlFile) -> Option<Lsn> {

@@ -75,9 +75,40 @@ pg_ctl -D /restore/data start
 - The replay goes to the end of the archive. There is no target time.
 - The command prints the LSN where the replay ends.
 - With `--standby`, Postgres replays the archive as a standby and does not
-  promote. A copy of the data directory after a clean stop is a new image,
+  promote. A copy of the data directory after a clean stop is a new base backup,
   on the timeline of the archive. Its replay starts at the last checkpoint
   of the primary in the archive.
+
+### Rebase
+
+`pgwal rebase` moves a base backup forward to the end of the archive,
+without a new `pg_basebackup` of the primary.
+
+```sh
+pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
+  --pg-bin /usr/lib/postgresql/18/bin
+```
+
+- The command writes the WAL into the copy, starts a Postgres on it as a
+  standby on a private socket, waits for the replay to reach the end of the
+  archive, and stops it. The copy is then a base backup at the last
+  checkpoint of the primary in the archive. The command prints its redo
+  point.
+- The binaries must be of the major version of the copy, on the same
+  platform as the primary. `--pg-bin` (or `PGWAL_PG_BIN`) gives their
+  directory. Without it, they come from `PATH`.
+- `--user` is a superuser of the copy, for the local connection that
+  watches the replay. Its default is `postgres`.
+- When the copy has page checksums, `pg_checksums --check` checks it.
+- The command runs as the owner of the data directory, not as root.
+
+`pgwal plan` reads archive keys on stdin and prints the ones that a restore
+or a rebase of a copy reads. Fetch only these from object storage:
+
+```sh
+aws s3 ls --recursive s3://bucket/wal/ | awk '{print $4}' \
+  | pgwal plan --pgdata /backups/2026-11-06 --prefix wal/
+```
 
 ## Requirements
 
