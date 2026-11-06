@@ -11,8 +11,13 @@ point is the upload interval, not one 16 MiB segment.
 - `pgwal`: the WAL archive format, `pg_control`, the replay plan and the
   segment writer. It uses `std` only.
 - `pgwal-receiver`: the replication stream, the local store, the uploader,
-  salvage and compaction. A sink implements the `WalSink` trait.
+  salvage and compaction. A sink implements the `WalSink` trait. Without
+  the default `runtime` feature, only the protocol module `wire` builds,
+  for hosts without tokio such as wasm32.
 - `pgwal-cli`: the `pgwal` command.
+- `pgwal-worker`: a receiver in a Cloudflare Durable Object, for one
+  database. It is not published on crates.io. See its
+  [README](crates/pgwal-worker/README.md).
 
 ## Usage
 

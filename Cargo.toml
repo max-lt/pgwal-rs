@@ -5,7 +5,7 @@ members = ["crates/pgwal", "crates/pgwal-receiver", "crates/pgwal-cli"]
 exclude = ["crates/pgwal-worker"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -13,8 +13,8 @@ repository = "https://github.com/max-lt/pgwal-rs"
 readme = "README.md"
 
 [workspace.dependencies]
-pgwal = { path = "crates/pgwal", version = "0.2.0" }
-pgwal-receiver = { path = "crates/pgwal-receiver", version = "0.2.0" }
+pgwal = { path = "crates/pgwal", version = "0.3.0" }
+pgwal-receiver = { path = "crates/pgwal-receiver", version = "0.3.0" }
 tokio = { version = "1.52", default-features = false }
 bytes = "1"
 thiserror = "2"
