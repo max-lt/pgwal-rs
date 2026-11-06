@@ -13,6 +13,23 @@ default = ["runtime"]
 # The receive loop, the local store and the uploader. Without it, only the
 # `wire` module builds, for targets without the tokio runtime (wasm32).
 runtime = ["tokio/full"]
+# A WalSink in an S3 bucket: SigV4, If-None-Match, HTTPS with rustls and ring.
+s3 = [
+    "runtime",
+    "dep:futures-util",
+    "dep:hex",
+    "dep:hmac",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-rustls",
+    "dep:hyper-util",
+    "dep:quick-xml",
+    "dep:rustls",
+    "dep:serde",
+    "dep:sha2",
+    "dep:webpki-roots",
+    "dep:zeroize",
+]
 
 [dependencies]
 pgwal = { workspace = true }
@@ -22,6 +39,19 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 postgres-protocol = "0.6"
+futures-util = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-rustls = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
