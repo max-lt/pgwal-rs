@@ -1,0 +1,31 @@
+[package]
+name = "pgwal-worker"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/max-lt/pgwal-rs"
+description = "A pgwal receiver in a Cloudflare Durable Object: WAL to SQLite before the ack, then to R2."
+publish = false
+
+# Its own workspace: it builds for wasm32 only, with worker-build.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pgwal = { path = "../pgwal" }
+pgwal-receiver = { path = "../pgwal-receiver", default-features = false }
+worker = "0.8"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+futures-util = { version = "0.3", default-features = false }
+getrandom = { version = "0.4", features = ["wasm_js"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true

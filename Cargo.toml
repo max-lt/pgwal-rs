@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/pgwal", "crates/pgwal-receiver", "crates/pgwal-cli"]
+# Built for wasm32 with worker-build, outside of the native workspace.
+exclude = ["crates/pgwal-worker"]
 
 [workspace.package]
 version = "0.2.0"

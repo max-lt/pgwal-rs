@@ -1,0 +1,39 @@
+name = "pgwal-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "worker-build --release"
+
+[[durable_objects.bindings]]
+name = "RECEIVER"
+class_name = "Receiver"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Receiver"]
+
+[[r2_buckets]]
+binding = "WAL"
+bucket_name = "pgwal"
+
+# PGPASSWORD and ADMIN_TOKEN are secrets: wrangler secret put.
+[vars]
+PGHOST = "db.example.com"
+PGPORT = "5432"
+PGUSER = "postgres"
+SLOT = "pgwal"
+PREFIX = ""
+SESSION_SECONDS = "600"
+UPLOAD_SECONDS = "10"
+LOG_LEVEL = "info"
+
+[limits]
+cpu_ms = 300000
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
