@@ -9,7 +9,9 @@ mod control;
 mod lsn;
 mod plan;
 
-pub use apply::{request_archive_recovery, segment_size, write_history, write_segment};
+pub use apply::{
+    request_archive_recovery, request_standby, segment_size, write_history, write_segment,
+};
 pub use archive::{
     RangeKey, assemble_segment, history_file_name, history_key, overlay_segment, parse_history_key,
     timeline_start,

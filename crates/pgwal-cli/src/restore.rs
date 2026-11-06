@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use pgwal::{
-    BackupLabel, ControlFile, Recovery, history_key, plan, request_archive_recovery, segment_size,
-    write_history, write_segment,
+    BackupLabel, ControlFile, Recovery, history_key, plan, request_archive_recovery,
+    request_standby, segment_size, write_history, write_segment,
 };
 use tracing::{info, warn};
 
@@ -21,10 +21,15 @@ pub struct RestoreArgs {
     /// Restore up to the first gap of the archive, instead of stopping.
     #[arg(long)]
     accept_gap: bool,
+    /// Start as a standby that stays in recovery, on the timeline of the
+    /// archive, instead of a server that promotes. A copy of it after a
+    /// clean stop is a new image to restore from.
+    #[arg(long)]
+    standby: bool,
 }
 
 /// Writes the archived WAL that follows the copy into its `pg_wal`. The
-/// next start of Postgres replays it.
+/// next start of Postgres replays it. Prints the LSN where the replay ends.
 pub fn run(args: RestoreArgs) -> Result<()> {
     let pgdata = &args.pgdata;
     if pgdata.join("postmaster.pid").exists() {
@@ -99,7 +104,9 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         Recovery::Crash { end } => (false, Some(end)),
         Recovery::Archive { end } => (true, Some(end)),
     };
-    if archive_recovery {
+    if args.standby {
+        request_standby(pgdata)?;
+    } else if archive_recovery {
         request_archive_recovery(pgdata)?;
     }
     info!(
@@ -109,8 +116,10 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         segments = plan.segments.len(),
         histories = plan.histories.len(),
         archive_recovery,
+        standby = args.standby,
         "WAL written to pg_wal; start Postgres to replay it"
     );
+    println!("{}", end.unwrap_or(from.redo));
     Ok(())
 }
 

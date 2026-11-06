@@ -329,3 +329,69 @@ async fn restore_refuses_an_archive_with_a_gap() {
         .get(0);
     assert!(rows < ROWS, "{rows} rows past the gap");
 }
+
+/// A standby restore replays the archive and stays on its timeline. A copy
+/// of it after a clean stop is a new image, and a restore from it has every
+/// row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_standby_restore_makes_an_image_to_restore_from() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let setup = Setup::new(bin);
+    setup.archived_backup().await;
+
+    let out = setup.restore(&["--standby"]);
+    assert!(
+        out.status.success(),
+        "pgwal restore --standby failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let end = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    setup.start("backup");
+    let client = setup.client().await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let reached: bool = client
+            .query_one(
+                &format!("SELECT pg_last_wal_replay_lsn() >= '{end}'::pg_lsn"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if reached {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the replay never reached {end}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let in_recovery: bool = client
+        .query_one("SELECT pg_is_in_recovery()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(in_recovery, "the standby promoted");
+    drop(client);
+    setup.stop("backup");
+
+    let image = pgwal::ControlFile::read(&setup.path("backup")).unwrap();
+    assert_eq!(image.timeline, 1);
+    std::fs::remove_file(setup.path("backup/standby.signal")).unwrap();
+    let out = setup.restore(&[]);
+    assert!(
+        out.status.success(),
+        "pgwal restore of the new image failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    setup.start("backup");
+    let (rows, sum): (i64, i64) = setup
+        .client()
+        .await
+        .query_one("SELECT count(*), sum(i)::bigint FROM t", &[])
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .unwrap();
+    assert_eq!((rows, sum), (ROWS, ROWS * (ROWS + 1) / 2));
+}

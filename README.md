@@ -73,6 +73,11 @@ pg_ctl -D /restore/data start
 - Postgres accepts connections once the replay ends, not when `pg_ctl start`
   returns.
 - The replay goes to the end of the archive. There is no target time.
+- The command prints the LSN where the replay ends.
+- With `--standby`, Postgres replays the archive as a standby and does not
+  promote. A copy of the data directory after a clean stop is a new image,
+  on the timeline of the archive. Its replay starts at the last checkpoint
+  of the primary in the archive.
 
 ## Requirements
 

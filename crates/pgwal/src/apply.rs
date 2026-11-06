@@ -71,6 +71,18 @@ pub fn request_archive_recovery(data_dir: &Path) -> io::Result<()> {
     )
 }
 
+/// Makes the next start of Postgres a standby that replays the WAL already
+/// in `pg_wal` and stays in recovery, on the timeline of the archive. Hot
+/// standby stays on, so a client can watch `pg_last_wal_replay_lsn()`. Safe
+/// to call twice.
+pub fn request_standby(data_dir: &Path) -> io::Result<()> {
+    std::fs::write(data_dir.join("standby.signal"), b"")?;
+    append_missing(
+        &data_dir.join("postgresql.auto.conf"),
+        &["restore_command = 'false'"],
+    )
+}
+
 /// Appends each line of `lines` that `path` does not hold yet.
 fn append_missing(path: &Path, lines: &[&str]) -> io::Result<()> {
     let mut text = match std::fs::read_to_string(path) {
