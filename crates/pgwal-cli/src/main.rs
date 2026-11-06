@@ -11,6 +11,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod restore;
 mod sink;
 mod tls;
 
@@ -35,6 +36,9 @@ struct Cli {
 enum Cmd {
     /// Stream the WAL of a server over physical replication into an archive.
     Receive(ReceiveArgs),
+    /// Write the archived WAL that follows a base backup or a snapshot into
+    /// its pg_wal.
+    Restore(restore::RestoreArgs),
 }
 
 #[derive(Args, Debug)]
@@ -81,6 +85,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
     match Cli::parse().cmd {
         Cmd::Receive(args) => run_receive(args).await,
+        Cmd::Restore(args) => restore::run(args),
     }
 }
 

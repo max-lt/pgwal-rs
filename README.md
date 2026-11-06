@@ -44,6 +44,36 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
 - The command reconnects after an error. It stops on Ctrl-C, after it uploads
   the WAL it received.
 
+### Restore
+
+A restore needs a copy of the data directory, taken while `pgwal receive`
+archives the WAL: a base backup or a snapshot.
+
+```sh
+# While the server runs, once or on a schedule:
+pg_basebackup -h db.example -U replicator -D /backups/2026-11-06 -X none
+
+# At restore time:
+cp -a /backups/2026-11-06 /restore/data
+pgwal restore --archive /var/lib/pgwal/archive --pgdata /restore/data
+pg_ctl -D /restore/data start
+```
+
+- `-X none` leaves the WAL of the copy out of the backup: the archive holds
+  it.
+- `pgwal restore` writes the archived WAL that follows the copy into its
+  `pg_wal`. Postgres replays it at its next start.
+- The replay starts at `START WAL LOCATION` of `backup_label`, or at the
+  checkpoint of `pg_control` without a label.
+- A base backup replays as an archive recovery, then promotes to a new
+  timeline. The command follows the timelines of the archive.
+- The command refuses an archive with a gap after the start. With
+  `--accept-gap`, it restores up to the gap.
+- The command refuses a data directory with a `postmaster.pid`.
+- Postgres accepts connections once the replay ends, not when `pg_ctl start`
+  returns.
+- The replay goes to the end of the archive. There is no target time.
+
 ## Requirements
 
 - A role with the `REPLICATION` attribute, and a `pg_hba.conf` line for the

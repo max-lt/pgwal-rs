@@ -557,6 +557,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "pgwal",
  "pgwal-receiver",
  "rcgen",
  "rustls",

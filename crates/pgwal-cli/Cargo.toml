@@ -13,6 +13,7 @@ name = "pgwal"
 path = "src/main.rs"
 
 [dependencies]
+pgwal = { workspace = true }
 pgwal-receiver = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
