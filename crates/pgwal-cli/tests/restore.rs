@@ -199,7 +199,7 @@ impl Setup {
             ],
         );
         client
-            .batch_execute("CREATE TABLE t (i bigint)")
+            .batch_execute("CREATE TABLE t (i bigint); CREATE INDEX t_i ON t (i)")
             .await
             .unwrap();
         for batch in 0..4 {
@@ -216,6 +216,12 @@ impl Setup {
                 .await
                 .unwrap();
         }
+        let file: String = client
+            .query_one("SELECT pg_relation_filepath('t')", &[])
+            .await
+            .unwrap()
+            .get(0);
+        std::fs::write(self.path("t.path"), file).unwrap();
         drop(client);
         // A clean shutdown waits for the receiver to confirm the final WAL.
         self.stop("data");
@@ -397,6 +403,14 @@ async fn a_standby_restore_makes_a_new_base_backup() {
 }
 
 impl Setup {
+    fn verify(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_pgwal"))
+            .args(["verify", "--pgdata", path(&self.path("backup"))])
+            .args(["--pg-bin", path(&self.bin), "--user", "postgres"])
+            .output()
+            .unwrap()
+    }
+
     fn rebase(&self) -> Output {
         let (archive, backup) = (self.path("archive"), self.path("backup"));
         Command::new(env!("CARGO_BIN_EXE_pgwal"))
@@ -518,4 +532,53 @@ async fn plan_lists_the_keys_a_restore_reads() {
         let range = pgwal::RangeKey::parse(key).unwrap();
         assert!(range.end > start, "{key} ends before the start {start}");
     }
+}
+
+/// `pgwal verify` finds a broken page: by its checksum when the copy has
+/// page checksums, and by pg_amcheck when it has none.
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_finds_a_broken_page() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let setup = Setup::new(bin);
+    setup.archived_backup().await;
+    let out = setup.rebase();
+    assert!(
+        out.status.success(),
+        "pgwal rebase failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(setup.verify().status.success());
+
+    // The line pointers of the first page of t start at byte 24. A normal
+    // line pointer (lp_flags 1) at offset 0x7ff0 points past the 8 kB page.
+    let backup = setup.path("backup");
+    let file = backup.join(std::fs::read_to_string(setup.path("t.path")).unwrap());
+    let mut bytes = std::fs::read(&file).unwrap();
+    let lp: u32 = 0x7ff0 | (1 << 15) | (0x40 << 17);
+    bytes[24..28].copy_from_slice(&lp.to_le_bytes());
+    std::fs::write(&file, bytes).unwrap();
+
+    let out = setup.verify();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a bad checksum passed");
+    assert!(stderr.contains("checksums"), "{stderr}");
+
+    run(
+        &setup.bin,
+        "pg_checksums",
+        &["--disable", "-D", path(&backup)],
+    );
+    let out = setup.verify();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "pg_amcheck missed the broken page");
+    assert!(stderr.contains("pg_amcheck"), "{stderr}");
+    let scratch = std::fs::read_dir(setup.root.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".verify-"))
+        .count();
+    assert_eq!(scratch, 0, "a scratch copy stayed");
 }

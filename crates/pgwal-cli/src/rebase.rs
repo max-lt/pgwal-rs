@@ -59,11 +59,7 @@ pub fn run(args: RebaseArgs) -> Result<()> {
     if field(&data, "Database cluster state") != Some("shut down in recovery") {
         bail!("the copy is not shut down in recovery:\n{data}");
     }
-    let checksums = field(&data, "Data page checksum version").is_some_and(|v| v != "0");
-    if checksums {
-        pg.run("pg_checksums", &["--check", "-D", path(&args.pgdata)])
-            .context("the page checksums of the copy are wrong")?;
-    }
+    verify(&pg, &args.pgdata, &args.user)?;
     if control.redo == before {
         warn!(
             redo = %control.redo,
@@ -75,7 +71,6 @@ pub fn run(args: RebaseArgs) -> Result<()> {
         redo = %control.redo,
         replayed = %reached,
         timeline = control.timeline,
-        checksums_checked = checksums,
         "rebased"
     );
     println!("{}", control.redo);
@@ -87,28 +82,7 @@ pub fn run(args: RebaseArgs) -> Result<()> {
 fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
     let _hba = TrustLocal::install(&args.pgdata)?;
     let log = socket.join("postgres.log");
-    let opts = format!(
-        "-c listen_addresses= -k {} -p {PORT} -c hot_standby=on",
-        path(socket)
-    );
-    let started = pg.run(
-        "pg_ctl",
-        &[
-            "-D",
-            path(&args.pgdata),
-            "-l",
-            path(&log),
-            "-o",
-            &opts,
-            "-w",
-            "start",
-        ],
-    );
-    let server = Server {
-        pg,
-        pgdata: &args.pgdata,
-    };
-    started.with_context(|| format!("starting Postgres:\n{}", tail(&log)))?;
+    let server = start_server(pg, &args.pgdata, socket, &log)?;
 
     let stall = Duration::from_secs(args.stall_seconds);
     let mut last = (Lsn(0), Instant::now());
@@ -143,8 +117,140 @@ fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
     Ok(reached)
 }
 
+#[derive(Args, Debug)]
+pub struct VerifyArgs {
+    /// The copy to check. Postgres must not run on it.
+    #[arg(long)]
+    pgdata: PathBuf,
+    /// Directory of the Postgres binaries, of the major version of the copy.
+    /// Without it, they come from PATH.
+    #[arg(long, env = "PGWAL_PG_BIN")]
+    pg_bin: Option<PathBuf>,
+    /// A superuser of the copy.
+    #[arg(long, env = "PGUSER", default_value = "postgres")]
+    user: String,
+}
+
+pub fn run_verify(args: VerifyArgs) -> Result<()> {
+    let pg = Bin(args.pg_bin);
+    check_version(&pg, &args.pgdata)?;
+    verify(&pg, &args.pgdata, &args.user)
+}
+
+/// Checks a stopped copy: its page checksums when it has them, then
+/// `pg_amcheck` on the heap and the B-tree indexes of every database. The
+/// amcheck pass runs on a scratch copy, because a server on the copy itself
+/// would end its recovery and write WAL of its own.
+pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
+    if pgdata.join("postmaster.pid").exists() {
+        bail!(
+            "{} has a postmaster.pid: stop Postgres first",
+            pgdata.display()
+        );
+    }
+    let t = Instant::now();
+    let data = controldata(pg, pgdata)?;
+    let checksums = field(&data, "Data page checksum version").is_some_and(|v| v != "0");
+    if checksums {
+        pg.run("pg_checksums", &["--check", "-D", path(pgdata)])
+            .context("the page checksums of the copy are wrong")?;
+    }
+
+    let name = pgdata.file_name().context("a data directory has a name")?;
+    let scratch = pgdata.with_file_name(format!(
+        ".{}.verify-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let socket = PathBuf::from(format!("/tmp/pgwal-verify-{}", std::process::id()));
+    let result = (|| {
+        copy_dir(pgdata, &scratch)?;
+        for signal in ["standby.signal", "recovery.signal"] {
+            let _ = std::fs::remove_file(scratch.join(signal));
+        }
+        std::fs::write(scratch.join("pg_hba.conf"), "local all all trust\n")?;
+        std::fs::create_dir_all(&socket)?;
+        let log = socket.join("postgres.log");
+        let server = start_server(pg, &scratch, &socket, &log)?;
+        let amcheck = pg.run(
+            "pg_amcheck",
+            &[
+                "-h",
+                path(&socket),
+                "-p",
+                PORT,
+                "-U",
+                user,
+                "--all",
+                "--install-missing",
+                "--heapallindexed",
+            ],
+        );
+        server.stop()?;
+        amcheck.context("pg_amcheck found corruption in the copy")
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&socket);
+    result?;
+    info!(
+        checksums,
+        seconds = t.elapsed().as_secs_f64(),
+        "copy verified"
+    );
+    Ok(())
+}
+
+/// Starts Postgres on `pgdata`, on the private socket in `socket` only.
+fn start_server<'a>(
+    pg: &'a Bin,
+    pgdata: &'a Path,
+    socket: &Path,
+    log: &Path,
+) -> Result<Server<'a>> {
+    let opts = format!(
+        "-c listen_addresses= -k {} -p {PORT} -c hot_standby=on",
+        path(socket)
+    );
+    let started = pg.run(
+        "pg_ctl",
+        &[
+            "-D",
+            path(pgdata),
+            "-l",
+            path(log),
+            "-o",
+            &opts,
+            "-w",
+            "start",
+        ],
+    );
+    let server = Server { pg, pgdata };
+    started.with_context(|| format!("starting Postgres:\n{}", tail(log)))?;
+    Ok(server)
+}
+
+/// Copies a directory tree. `fs::copy` clones each file where the file
+/// system can, as APFS, btrfs and XFS do.
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    std::fs::set_permissions(to, std::fs::metadata(from)?.permissions())?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else if kind.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 /// The Postgres binaries: in a directory, or on PATH.
-struct Bin(Option<PathBuf>);
+pub struct Bin(Option<PathBuf>);
 
 impl Bin {
     fn command(&self, tool: &str) -> Command {

@@ -99,8 +99,18 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   directory. Without it, they come from `PATH`.
 - `--user` is a superuser of the copy, for the local connection that
   watches the replay. Its default is `postgres`.
-- When the copy has page checksums, `pg_checksums --check` checks it.
+- Then the command runs `pgwal verify` on the copy, and fails if the check
+  fails.
 - The command runs as the owner of the data directory, not as root.
+
+`pgwal verify` checks a stopped copy:
+
+- `pg_checksums --check`, when the copy has page checksums.
+- `pg_amcheck --all --heapallindexed` on the heap and the B-tree indexes of
+  every database. It runs on a scratch copy next to the copy, because a
+  server on the copy itself would end its recovery and write WAL of its own.
+  The scratch copy uses file clones where the file system has them, and goes
+  away at the end.
 
 `pgwal plan` reads archive keys on stdin and prints the ones that a restore
 or a rebase of a copy reads. Fetch only these from object storage:

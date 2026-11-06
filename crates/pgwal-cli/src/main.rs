@@ -45,6 +45,9 @@ enum Cmd {
     /// Move a copy of the data directory forward to the end of the archive,
     /// with a Postgres that stays in recovery and serves no client.
     Rebase(rebase::RebaseArgs),
+    /// Check a stopped copy of the data directory: page checksums, and
+    /// pg_amcheck on a scratch copy.
+    Verify(rebase::VerifyArgs),
 }
 
 #[derive(Args, Debug)]
@@ -98,6 +101,7 @@ async fn main() -> Result<()> {
         Cmd::Restore(args) => restore::run(args),
         Cmd::Plan(args) => restore::run_plan(args),
         Cmd::Rebase(args) => rebase::run(args),
+        Cmd::Verify(args) => rebase::run_verify(args),
     }
 }
 
