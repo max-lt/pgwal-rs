@@ -8,9 +8,15 @@ repository.workspace = true
 readme.workspace = true
 description = "Streams the WAL of a Postgres server over physical replication and uploads it by LSN range."
 
+[features]
+default = ["runtime"]
+# The receive loop, the local store and the uploader. Without it, only the
+# `wire` module builds, for targets without the tokio runtime (wasm32).
+runtime = ["tokio/full"]
+
 [dependencies]
 pgwal = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

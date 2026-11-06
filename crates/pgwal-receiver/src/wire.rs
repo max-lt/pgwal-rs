@@ -3,6 +3,9 @@
 //! Frames are decoded by hand: `postgres-protocol` cannot decode
 //! `CopyBothResponse`. The server end is not trusted, so every
 //! read is bounds-checked and frame sizes are capped.
+//!
+//! Without the `runtime` feature, reads have no idle timeout: the caller
+//! bounds the connection.
 
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,13 +30,17 @@ const DUPLICATE_OBJECT: &str = "42710";
 /// SQLSTATE `undefined_object`.
 const UNDEFINED_OBJECT: &str = "42704";
 
+/// SQLSTATEs of a START_REPLICATION whose WAL is gone: an invalidated slot
+/// (`object_not_in_prerequisite_state`), a removed segment (`undefined_file`).
+const WAL_GONE: [&str; 2] = ["55000", "58P01"];
+
 // Authentication request codes of the `R` message.
 const AUTH_OK: i32 = 0;
 const AUTH_SASL: i32 = 10;
 const AUTH_SASL_CONTINUE: i32 = 11;
 const AUTH_SASL_FINAL: i32 = 12;
 
-pub(crate) struct SystemInfo {
+pub struct SystemInfo {
     pub system_id: u64,
     pub timeline: u32,
     pub xlogpos: Lsn,
@@ -42,7 +49,7 @@ pub(crate) struct SystemInfo {
 /// `wal_end` is the server's view of its WAL end: its flush position in
 /// XLogData, what it has sent in a keepalive.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum CopyMessage {
+pub enum CopyMessage {
     XLogData {
         start: Lsn,
         wal_end: Lsn,
@@ -54,7 +61,7 @@ pub(crate) enum CopyMessage {
     },
 }
 
-pub(crate) struct Conn<S> {
+pub struct Conn<S> {
     stream: S,
     buf: BytesMut,
     /// Longest wait for the next bytes from the server.
@@ -156,6 +163,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         })
     }
 
+    /// `wal_segment_size` in bytes.
+    pub async fn wal_segment_size(&mut self) -> Result<u64, Error> {
+        parse_segment_size(&self.show("wal_segment_size").await?)
+    }
+
     pub async fn show(&mut self, setting: &str) -> Result<String, Error> {
         let row = self.single_row(&format!("SHOW {setting}")).await?;
         row.into_iter()
@@ -209,6 +221,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         Ok((col(0)?, col(1)?))
     }
 
+    /// The errors of missing WAL come back as [`Error::WalGone`].
     pub async fn start_replication(
         &mut self,
         slot: &str,
@@ -227,7 +240,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             match tag {
                 b'W' => return Ok(()),
                 b'E' => err = Some(db_error(body)),
-                b'Z' if err.is_some() => return Err(err.expect("checked")),
+                b'Z' => match err {
+                    Some(Error::Db { code, message }) if WAL_GONE.contains(&code.as_str()) => {
+                        return Err(Error::WalGone {
+                            requested: start,
+                            message,
+                        });
+                    }
+                    Some(e) => return Err(e),
+                    None => return Err(unexpected(tag, "START_REPLICATION")),
+                },
                 b'N' => {}
                 other => return Err(unexpected(other, "START_REPLICATION")),
             }
@@ -250,19 +272,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
     }
 
+    /// The stream, to close it.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
     pub fn has_buffered_frame(&self) -> bool {
         matches!(frame_len(&self.buf), Ok(Some(len)) if self.buf.len() > len)
     }
 
-    /// Reports the written and flushed positions. With `reply_requested`, the
-    /// server answers at once with a keepalive.
+    /// Reports the written and flushed positions at `now`. With
+    /// `reply_requested`, the server answers at once with a keepalive. The
+    /// caller gives the time: `SystemTime::now()` panics on wasm32.
     pub async fn send_status(
         &mut self,
         written: Lsn,
         flushed: Lsn,
         reply_requested: bool,
+        now: SystemTime,
     ) -> Result<(), Error> {
-        let now = SystemTime::now()
+        let now = now
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_micros() as i64 - PG_EPOCH_OFFSET_MICROS);
         self.stream
@@ -326,8 +355,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 }
                 self.buf.reserve(1 + len - self.buf.len());
             }
-            let read = tokio::time::timeout(self.idle_timeout, self.stream.read_buf(&mut self.buf));
-            match read.await {
+            #[cfg(feature = "runtime")]
+            let read =
+                tokio::time::timeout(self.idle_timeout, self.stream.read_buf(&mut self.buf)).await;
+            #[cfg(not(feature = "runtime"))]
+            let read = Ok::<_, ()>(self.stream.read_buf(&mut self.buf).await);
+            match read {
                 Ok(Ok(0)) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -347,6 +380,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
         }
     }
+}
+
+/// Parses `SHOW wal_segment_size` output, such as `16MB`.
+fn parse_segment_size(value: &str) -> Result<u64, Error> {
+    let bad = || Error::Protocol(format!("bad wal_segment_size {value:?}"));
+    let digits = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (n, unit) = value.split_at(digits);
+    let n: u64 = n.parse().map_err(|_| bad())?;
+    let size = match unit {
+        "" | "B" => n,
+        "kB" => n << 10,
+        "MB" => n << 20,
+        "GB" => n << 30,
+        _ => return Err(bad()),
+    };
+    if !size.is_power_of_two() || !(1 << 20..=1 << 30).contains(&size) {
+        return Err(bad());
+    }
+    Ok(size)
 }
 
 /// The frame length field (which counts itself, not the tag), once buffered.
@@ -476,6 +530,14 @@ fn unexpected(tag: u8, during: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_sizes() {
+        assert_eq!(parse_segment_size("16MB").unwrap(), 16 << 20);
+        assert_eq!(parse_segment_size("1GB").unwrap(), 1 << 30);
+        assert!(parse_segment_size("24MB").is_err());
+        assert!(parse_segment_size("16XB").is_err());
+    }
 
     #[test]
     fn parses_xlogdata_and_keepalive() {

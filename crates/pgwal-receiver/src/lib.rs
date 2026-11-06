@@ -10,13 +10,18 @@
 //! through `restore_command`.
 
 mod error;
+#[cfg(feature = "runtime")]
 mod store;
+#[cfg(feature = "runtime")]
 mod stream;
+#[cfg(feature = "runtime")]
 mod upload;
-mod wire;
+pub mod wire;
 
 pub use error::Error;
+#[cfg(feature = "runtime")]
 pub use stream::{StreamConfig, forget_slot, receive};
+#[cfg(feature = "runtime")]
 pub use upload::{WalSink, salvage};
 
 pub use pgwal::{Lsn, RangeKey};

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use pgwal::{Lsn, history_key, timeline_start};
@@ -14,10 +14,6 @@ use crate::error::Error;
 use crate::store::WalStore;
 use crate::upload::{Uploader, WalSink, read_watermark};
 use crate::wire::{Conn, CopyMessage};
-
-/// SQLSTATEs of a START_REPLICATION whose WAL is gone: an invalidated slot
-/// (`object_not_in_prerequisite_state`), a removed segment (`undefined_file`).
-const WAL_GONE: [&str; 2] = ["55000", "58P01"];
 
 /// Longest delay before a flush while WAL keeps arriving.
 const MAX_FLUSH_DELAY: Duration = Duration::from_millis(100);
@@ -75,7 +71,7 @@ where
     )
     .await?;
     let system = conn.identify_system().await?;
-    let seg_size = parse_segment_size(&conn.show("wal_segment_size").await?)?;
+    let seg_size = conn.wal_segment_size().await?;
     conn.ensure_physical_slot(&cfg.slot).await?;
 
     // A timeline above 1 starts at its switch point. Its history file goes to
@@ -109,7 +105,10 @@ where
             .unwrap_or(system.xlogpos),
     }
     .segment_start(seg_size);
-    if let Err(e) = start_or_gone(&mut conn, &cfg.slot, start, system.timeline).await {
+    if let Err(e) = conn
+        .start_replication(&cfg.slot, start, system.timeline)
+        .await
+    {
         // The first WAL of an old later timeline can be gone. Then the slot
         // position is the earliest WAL left.
         if !matches!(e, Error::WalGone { .. }) || resumed.is_some() || history.is_none() {
@@ -123,7 +122,8 @@ where
             .segment_start(seg_size);
         warn!(%start, %fallback, "the first WAL of the timeline is gone; its archive starts later");
         start = fallback;
-        start_or_gone(&mut conn, &cfg.slot, start, system.timeline).await?;
+        conn.start_replication(&cfg.slot, start, system.timeline)
+            .await?;
     }
     store.start_at(start);
     info!(slot = %cfg.slot, system_id = system.system_id, timeline = system.timeline, %start, "streaming WAL");
@@ -159,27 +159,6 @@ where
     Ok(uploaded)
 }
 
-/// START_REPLICATION, with the errors of missing WAL as [`Error::WalGone`].
-async fn start_or_gone<S>(
-    conn: &mut Conn<S>,
-    slot: &str,
-    start: Lsn,
-    timeline: u32,
-) -> Result<(), Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    match conn.start_replication(slot, start, timeline).await {
-        Err(Error::Db { code, message }) if WAL_GONE.contains(&code.as_str()) => {
-            Err(Error::WalGone {
-                requested: start,
-                message,
-            })
-        }
-        other => other,
-    }
-}
-
 async fn stream_into<S>(
     conn: &mut Conn<S>,
     store: &mut WalStore,
@@ -198,7 +177,8 @@ where
             () = &mut stop, if !drain.requested => {
                 drain.requested = true;
                 // The answer is a keepalive with the server's position.
-                conn.send_status(store.written(), flushed, true).await?;
+                conn.send_status(store.written(), flushed, true, SystemTime::now())
+                    .await?;
                 continue;
             }
             msg = conn.next_message() => msg?,
@@ -238,7 +218,10 @@ where
             flushed_tx.send_replace(flushed);
             // The server may have closed after our last status. The read side
             // decides how the stream ended.
-            if let Err(e) = conn.send_status(store.written(), flushed, false).await {
+            if let Err(e) = conn
+                .send_status(store.written(), flushed, false, SystemTime::now())
+                .await
+            {
                 debug!(error = %e, "status update not delivered");
             }
         }
@@ -312,38 +295,9 @@ fn valid_slot_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// Parses `SHOW wal_segment_size` output, such as `16MB`.
-fn parse_segment_size(value: &str) -> Result<u64, Error> {
-    let bad = || Error::Protocol(format!("bad wal_segment_size {value:?}"));
-    let digits = value
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(value.len());
-    let (n, unit) = value.split_at(digits);
-    let n: u64 = n.parse().map_err(|_| bad())?;
-    let size = match unit {
-        "" | "B" => n,
-        "kB" => n << 10,
-        "MB" => n << 20,
-        "GB" => n << 30,
-        _ => return Err(bad()),
-    };
-    if !size.is_power_of_two() || !(1 << 20..=1 << 30).contains(&size) {
-        return Err(bad());
-    }
-    Ok(size)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn segment_sizes() {
-        assert_eq!(parse_segment_size("16MB").unwrap(), 16 << 20);
-        assert_eq!(parse_segment_size("1GB").unwrap(), 1 << 30);
-        assert!(parse_segment_size("24MB").is_err());
-        assert!(parse_segment_size("16XB").is_err());
-    }
 
     #[test]
     fn slot_names() {
