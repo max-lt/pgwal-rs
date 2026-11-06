@@ -11,12 +11,12 @@ use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod archive;
 mod rebase;
 mod restore;
 mod sink;
 mod tls;
 
-use sink::DirSink;
 use tls::SslMode;
 
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
@@ -76,9 +76,11 @@ struct ReceiveArgs {
     /// Local store of the received WAL. One receiver at a time can use it.
     #[arg(long)]
     dir: PathBuf,
-    /// Directory that receives the archived objects.
+    /// Where the archived objects go: a directory, or `s3://bucket/prefix/`.
     #[arg(long)]
-    archive: PathBuf,
+    archive: String,
+    #[command(flatten)]
+    s3: archive::S3Args,
     /// Seconds between two uploads. A loss of this host loses at most that
     /// much WAL.
     #[arg(long, default_value_t = 2)]
@@ -98,9 +100,9 @@ async fn main() -> Result<()> {
         .init();
     match Cli::parse().cmd {
         Cmd::Receive(args) => run_receive(args).await,
-        Cmd::Restore(args) => restore::run(args),
+        Cmd::Restore(args) => restore::run(args).await,
         Cmd::Plan(args) => restore::run_plan(args),
-        Cmd::Rebase(args) => rebase::run(args),
+        Cmd::Rebase(args) => rebase::run(args).await,
         Cmd::Verify(args) => rebase::run_verify(args),
     }
 }
@@ -122,7 +124,7 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
         upload_every: Duration::from_secs(args.upload_every),
         idle_timeout: Duration::from_secs(args.idle_timeout),
     };
-    let sink: Arc<dyn WalSink> = Arc::new(DirSink::new(args.archive));
+    let sink: Arc<dyn WalSink> = archive::Archive::open(&args.archive, &args.s3)?.sink();
 
     let (stop_tx, mut stop) = watch::channel(false);
     tokio::spawn(async move {

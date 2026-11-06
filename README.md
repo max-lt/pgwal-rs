@@ -44,6 +44,34 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
 - The command reconnects after an error. It stops on Ctrl-C, after it uploads
   the WAL it received.
 
+### S3 archives
+
+`--archive` takes a directory or `s3://bucket/prefix/`, in `receive`,
+`restore` and `rebase`.
+
+```sh
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+pgwal receive --host db.example --user replicator --dir /var/lib/pgwal/store \
+  --archive s3://wal/db1/ --s3-endpoint https://<account>.r2.cloudflarestorage.com --s3-region auto
+```
+
+- The keys come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` only.
+- `--s3-endpoint` (or `AWS_ENDPOINT_URL`) is the store. Without it, the
+  command uses AWS in `--s3-region` (or `AWS_REGION`, default `us-east-1`).
+- `--s3-ca-file` (or `AWS_CA_BUNDLE`) adds a PEM file of CAs to trust, for a
+  store with a private CA.
+- Paths are in the path style: `/bucket/key`.
+- Every request signs the SHA-256 of its body, so the store refuses a body
+  that changed on the way.
+- Every upload carries `If-None-Match: *`, so no object is overwritten. A key
+  names one LSN range of one timeline of one system. When the key exists, the
+  command reads the object back: the same bytes count as uploaded, other
+  bytes are an error.
+- A restore and a rebase fetch only the objects that the copy needs, 64 at a
+  time at most.
+- The S3 client is the `s3` feature of `pgwal-receiver`, on in the `pgwal`
+  command.
+
 ### Restore
 
 A restore needs a copy of the data directory, taken while `pgwal receive`
@@ -130,6 +158,15 @@ aws s3 ls --recursive s3://bucket/wal/ | awk '{print $4}' \
 
 Some tests start Postgres servers. Set `PGWAL_PG_BIN` to the directory of the
 Postgres binaries. Without them, these tests skip.
+
+The S3 tests run against a real store, under a prefix of their own that they
+delete:
+
+```sh
+PGWAL_TEST_S3_ENDPOINT=https://s3.example PGWAL_TEST_S3_BUCKET=pgwal-test \
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+  cargo test -p pgwal-receiver --features s3 --test s3
+```
 
 ## License
 

@@ -8,6 +8,11 @@ repository.workspace = true
 readme.workspace = true
 description = "The pgwal command: archives the WAL of a Postgres server."
 
+[features]
+default = ["s3"]
+# s3:// archives: SigV4, If-None-Match, HTTPS with rustls and ring.
+s3 = ["pgwal-receiver/s3"]
+
 [[bin]]
 name = "pgwal"
 path = "src/main.rs"
@@ -15,6 +20,7 @@ path = "src/main.rs"
 [dependencies]
 pgwal = { workspace = true }
 pgwal-receiver = { workspace = true }
+futures-util = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }

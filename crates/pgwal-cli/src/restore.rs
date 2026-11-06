@@ -1,19 +1,30 @@
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use futures_util::{StreamExt, TryStreamExt};
 use pgwal::{
     BackupLabel, ControlFile, Lsn, Recovery, history_key, plan, request_archive_recovery,
     request_standby, segment_size, write_history, write_segment,
 };
 use tracing::{info, warn};
 
+use crate::archive::{Archive, S3Args};
+
+/// Segments fetched at the same time, and objects of one segment. They bound
+/// a restore to 64 reads in flight and about 64 MiB of segments in memory.
+const SEGMENTS_IN_FLIGHT: usize = 4;
+const OBJECTS_IN_FLIGHT: usize = 16;
+
 #[derive(Args, Debug)]
 pub struct RestoreArgs {
-    /// Directory of the archived objects, as `pgwal receive --archive` writes
-    /// it.
+    /// The archive, as `pgwal receive --archive` writes it: a directory, or
+    /// `s3://bucket/prefix/`.
     #[arg(long)]
-    archive: PathBuf,
+    archive: String,
+    #[command(flatten)]
+    s3: S3Args,
     /// A copy of the data directory: a base backup or a snapshot. Postgres
     /// must not run on it.
     #[arg(long)]
@@ -30,8 +41,9 @@ pub struct RestoreArgs {
 
 /// Writes the archived WAL that follows the copy into its `pg_wal`. The
 /// next start of Postgres replays it. Prints the LSN where the replay ends.
-pub fn run(args: RestoreArgs) -> Result<()> {
-    let end = apply(&args.archive, &args.pgdata, args.accept_gap, args.standby)?;
+pub async fn run(args: RestoreArgs) -> Result<()> {
+    let archive = Archive::open(&args.archive, &args.s3)?;
+    let end = apply(&archive, &args.pgdata, args.accept_gap, args.standby).await?;
     println!("{end}");
     Ok(())
 }
@@ -115,7 +127,12 @@ fn replay_start(pgdata: &Path) -> Result<Start> {
 
 /// Writes the archived WAL that follows the copy in `pgdata` into its
 /// `pg_wal`, and returns the LSN where the replay ends.
-pub fn apply(archive: &Path, pgdata: &Path, accept_gap: bool, standby: bool) -> Result<Lsn> {
+pub async fn apply(
+    archive: &Archive,
+    pgdata: &Path,
+    accept_gap: bool,
+    standby: bool,
+) -> Result<Lsn> {
     if pgdata.join("postmaster.pid").exists() {
         bail!(
             "{} has a postmaster.pid: stop Postgres, or remove the file of a copy",
@@ -131,7 +148,7 @@ pub fn apply(archive: &Path, pgdata: &Path, accept_gap: bool, standby: bool) -> 
         seg_size,
     } = replay_start(pgdata)?;
 
-    let keys = archive_keys(archive)?;
+    let keys = archive.keys().await?;
     let plan = plan(keys.iter().map(String::as_str), &from, seg_size);
     if let Some(gap) = plan.gap {
         if !accept_gap {
@@ -148,20 +165,28 @@ pub fn apply(archive: &Path, pgdata: &Path, accept_gap: bool, standby: bool) -> 
 
     for timeline in &plan.histories {
         let key = history_key(control.system_id, *timeline);
-        write_history(&pg_wal, *timeline, &read_object(archive, &key)?)?;
+        write_history(&pg_wal, *timeline, &archive.read(&key).await?)?;
     }
-    for (timeline, segno, keys) in &plan.segments {
-        let objects = keys
-            .iter()
-            .map(|key| {
-                let wal = read_object(archive, &key.to_string())?;
-                if wal.len() as u64 != key.end.0 - key.start.0 {
-                    bail!("archived object {key} holds {} bytes", wal.len());
-                }
-                Ok((key.start, key.end, wal))
+    let mut segments = pin!(
+        futures_util::stream::iter(&plan.segments)
+            .map(|(timeline, segno, keys)| async move {
+                let objects: Vec<_> = futures_util::stream::iter(keys)
+                    .map(|key| async move {
+                        let wal = archive.read(&key.to_string()).await?;
+                        if wal.len() as u64 != key.end.0 - key.start.0 {
+                            bail!("archived object {key} holds {} bytes", wal.len());
+                        }
+                        Ok((key.start, key.end, wal))
+                    })
+                    .buffered(OBJECTS_IN_FLIGHT)
+                    .try_collect()
+                    .await?;
+                anyhow::Ok((*timeline, *segno, objects))
             })
-            .collect::<Result<Vec<_>>>()?;
-        write_segment(&pg_wal, *timeline, *segno, seg_size, &objects)?;
+            .buffered(SEGMENTS_IN_FLIGHT)
+    );
+    while let Some((timeline, segno, objects)) = segments.try_next().await? {
+        write_segment(&pg_wal, timeline, segno, seg_size, &objects)?;
     }
 
     // A base backup replays as an archive recovery, then promotes.
@@ -190,34 +215,4 @@ pub fn apply(archive: &Path, pgdata: &Path, accept_gap: bool, standby: bool) -> 
         "WAL written to pg_wal; start Postgres to replay it"
     );
     Ok(end.unwrap_or(from.redo))
-}
-
-/// The keys of the archive: the file paths under `root`. Names that start
-/// with `.` are files that an upload has not finished.
-fn archive_keys(root: &Path) -> Result<Vec<String>> {
-    let mut keys = Vec::new();
-    let mut dirs = vec![PathBuf::new()];
-    while let Some(dir) = dirs.pop() {
-        let entries = std::fs::read_dir(root.join(&dir))
-            .with_context(|| format!("reading {}", root.join(&dir).display()))?;
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name.starts_with('.') {
-                continue;
-            }
-            let path = dir.join(name);
-            if entry.file_type()?.is_dir() {
-                dirs.push(path);
-            } else if let Some(key) = path.to_str() {
-                keys.push(key.to_owned());
-            }
-        }
-    }
-    Ok(keys)
-}
-
-fn read_object(root: &Path, key: &str) -> Result<Vec<u8>> {
-    std::fs::read(root.join(key)).with_context(|| format!("reading archived object {key}"))
 }

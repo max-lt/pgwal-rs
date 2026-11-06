@@ -7,6 +7,7 @@ use clap::Args;
 use pgwal::{ControlFile, Lsn};
 use tracing::{info, warn};
 
+use crate::archive::{Archive, S3Args};
 use crate::restore;
 
 /// Port of the private socket. The server listens on no TCP port.
@@ -15,10 +16,12 @@ const POLL: Duration = Duration::from_millis(200);
 
 #[derive(Args, Debug)]
 pub struct RebaseArgs {
-    /// Directory of the archived objects, as `pgwal receive --archive` writes
-    /// it.
+    /// The archive, as `pgwal receive --archive` writes it: a directory, or
+    /// `s3://bucket/prefix/`.
     #[arg(long)]
-    archive: PathBuf,
+    archive: String,
+    #[command(flatten)]
+    s3: S3Args,
     /// The copy to move forward, in place: a base backup, or the output of
     /// an earlier rebase. Postgres must not run on it.
     #[arg(long)]
@@ -41,10 +44,16 @@ pub struct RebaseArgs {
 /// and listens on a private socket only, then stops it cleanly. The copy is
 /// then a base backup at the last checkpoint of the primary in the archive.
 /// Prints its redo point.
-pub fn run(args: RebaseArgs) -> Result<()> {
+pub async fn run(args: RebaseArgs) -> Result<()> {
     let pg = Bin(args.pg_bin.clone());
     check_version(&pg, &args.pgdata)?;
-    let end = restore::apply(&args.archive, &args.pgdata, false, true)?;
+    let archive = Archive::open(&args.archive, &args.s3)?;
+    let t = Instant::now();
+    let end = restore::apply(&archive, &args.pgdata, false, true).await?;
+    info!(
+        seconds = t.elapsed().as_secs_f64(),
+        "archive written to pg_wal"
+    );
     let before = ControlFile::read(&args.pgdata)?.redo;
 
     let socket = PathBuf::from(format!("/tmp/pgwal-rebase-{}", std::process::id()));
