@@ -157,6 +157,23 @@ async fn connect(sock: &Path) -> tokio_postgres::Client {
     client
 }
 
+/// `pg_ctl -w start` returns once a restored copy is consistent, before the
+/// replay ends.
+async fn wait_promoted(client: &tokio_postgres::Client) {
+    for _ in 0..300 {
+        let in_recovery: bool = client
+            .query_one("SELECT pg_is_in_recovery()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        if !in_recovery {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the restored server did not promote");
+}
+
 async fn wait_for_slot(client: &tokio_postgres::Client, active: bool) {
     for _ in 0..100 {
         let now: Option<bool> = client
@@ -333,6 +350,7 @@ async fn base_backup_plus_uploaded_wal_restores_every_row_across_a_reconnect() {
     restore_from(&backup, &restored, root);
     start(&bin, &backup, root, &root.join("restore.log"));
     let client = connect(root).await;
+    wait_promoted(&client).await;
     let (rows, sum): (i64, i64) = client
         .query_one("SELECT count(*), sum(i)::bigint FROM t", &[])
         .await
