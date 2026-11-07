@@ -557,6 +557,32 @@ async fn a_stop_on_a_lagging_server_waits_for_the_announced_end() {
     );
 }
 
+/// A server under load announces a later WAL end in each XLogData. The
+/// receiver stops at the end announced before the answer, or a stop under a
+/// steady load never ends.
+#[tokio::test]
+async fn a_stop_ignores_the_wal_end_announced_after_the_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server, stop) = spawn_stoppable(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let wal = pattern(8192, 3);
+    let (sent, end) = (Lsn(SEG + 4096), Lsn(SEG + 8192));
+    server.stream_announcing(Lsn(SEG), &wal[..4096], end).await;
+    server.await_flush(sent).await;
+
+    stop.send(()).unwrap();
+    server.await_reply_request().await;
+    server.keepalive(sent, false).await;
+    server
+        .stream_announcing(sent, &wal[4096..], Lsn(SEG + 65536))
+        .await;
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    sink.assert_tiles(Lsn(SEG), end);
+}
+
 /// With nothing local on a later timeline, the stream starts at the segment
 /// of the switch point, not at the slot, and the history file reaches the
 /// sink.

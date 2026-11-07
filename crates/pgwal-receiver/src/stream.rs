@@ -239,7 +239,9 @@ where
                 data,
             } => {
                 store.write(start, &data).await?;
-                drain.target = drain.target.max(wal_end);
+                if !drain.answered {
+                    drain.target = drain.target.max(wal_end);
+                }
                 false
             }
             CopyMessage::Keepalive {
@@ -296,7 +298,7 @@ where
 struct Drain {
     requested: bool,
     answered: bool,
-    /// The highest WAL end the server announced.
+    /// The highest WAL end the server announced up to its answer.
     target: Lsn,
 }
 
