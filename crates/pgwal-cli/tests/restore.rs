@@ -184,11 +184,7 @@ impl Setup {
             .unwrap()
     }
 
-    /// Takes a base backup without WAL, writes rows across several segments,
-    /// archives all of it and stops the server. Returns the archive keys.
-    async fn archived_backup(&self) -> Vec<String> {
-        let mut receiver = self.receiver();
-        let client = self.client().await;
+    async fn wait_for_slot(&self, client: &tokio_postgres::Client) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while client
             .query_opt(
@@ -202,6 +198,25 @@ impl Setup {
             assert!(Instant::now() < deadline, "the slot never became active");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// Stops the server, then the receiver once it has archived the final
+    /// WAL: a clean shutdown waits for the receiver to confirm it.
+    fn stop_with(&self, mut receiver: Child) {
+        self.stop("data");
+        Command::new("kill")
+            .args(["-INT", &receiver.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(receiver.wait().unwrap().success(), "pgwal receive failed");
+    }
+
+    /// Takes a base backup without WAL, writes rows across several segments,
+    /// archives all of it and stops the server. Returns the archive keys.
+    async fn archived_backup(&self) -> Vec<String> {
+        let receiver = self.receiver();
+        let client = self.client().await;
+        self.wait_for_slot(&client).await;
         run(
             &self.bin,
             "pg_basebackup",
@@ -245,13 +260,7 @@ impl Setup {
             .get(0);
         std::fs::write(self.path("t.path"), file).unwrap();
         drop(client);
-        // A clean shutdown waits for the receiver to confirm the final WAL.
-        self.stop("data");
-        Command::new("kill")
-            .args(["-INT", &receiver.id().to_string()])
-            .status()
-            .unwrap();
-        assert!(receiver.wait().unwrap().success(), "pgwal receive failed");
+        self.stop_with(receiver);
         let mut keys = Vec::new();
         let mut dirs = vec![self.path("archive")];
         while let Some(dir) = dirs.pop() {
@@ -302,6 +311,93 @@ async fn restore_replays_the_archive_onto_a_base_backup() {
     };
     let setup = Setup::new(bin);
     setup.archived_backup().await;
+
+    let out = setup.restore(&[]);
+    assert!(
+        out.status.success(),
+        "pgwal restore failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    setup.start("backup");
+    let (rows, sum): (i64, i64) = setup
+        .promoted_client()
+        .await
+        .query_one("SELECT count(*), sum(i)::bigint FROM t", &[])
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .unwrap();
+    assert_eq!((rows, sum), (ROWS, ROWS * (ROWS + 1) / 2));
+}
+
+/// `pgwal backup` writes a base backup into the archive while rows arrive,
+/// `pgwal fetch` writes it into an empty directory, and a restore of it has
+/// every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn backup_then_fetch_then_restore_has_every_row() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let setup = Setup::new(bin);
+    let receiver = setup.receiver();
+    let client = setup.client().await;
+    setup.wait_for_slot(&client).await;
+    let insert = async |from: i64, to: i64| {
+        client
+            .execute(
+                "INSERT INTO t SELECT generate_series($1::bigint, $2::bigint)",
+                &[&from, &to],
+            )
+            .await
+            .unwrap();
+    };
+    client
+        .batch_execute("CREATE TABLE t (i bigint)")
+        .await
+        .unwrap();
+    insert(1, ROWS / 2).await;
+    let port = setup.port.to_string();
+    let (root, archive) = (setup.root.path(), setup.path("archive"));
+    let out = pgwal(&[
+        "backup",
+        "--host",
+        path(root),
+        "--port",
+        &port,
+        "--archive",
+        path(&archive),
+    ]);
+    assert!(
+        out.status.success(),
+        "pgwal backup failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let taken = String::from_utf8(out.stdout).unwrap();
+    insert(ROWS / 2 + 1, ROWS).await;
+    drop(client);
+    setup.stop_with(receiver);
+
+    let copy = setup.path("backup");
+    let fetch = || {
+        pgwal(&[
+            "fetch",
+            "--archive",
+            path(&archive),
+            "--pgdata",
+            path(&copy),
+        ])
+    };
+    let out = fetch();
+    assert!(
+        out.status.success(),
+        "pgwal fetch failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let start = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(taken.split_whitespace().next(), Some(start.trim()));
+    assert!(copy.join("backup_manifest").exists());
+    assert!(!fetch().status.success(), "a fetch into a full directory");
+    run(&setup.bin, "pg_verifybackup", &["-n", path(&copy)]);
 
     let out = setup.restore(&[]);
     assert!(

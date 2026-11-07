@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use pgwal_receiver::{Confirm, Error, Lsn, StreamConfig, WalSink, receive};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
@@ -12,6 +13,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod archive;
+mod backup;
 mod rebase;
 mod restore;
 mod sink;
@@ -37,6 +39,12 @@ struct Cli {
 enum Cmd {
     /// Stream the WAL of a server over physical replication into an archive.
     Receive(ReceiveArgs),
+    /// Take a base backup without WAL into an archive, while pgwal receive
+    /// archives the WAL of the server.
+    Backup(backup::BackupArgs),
+    /// Write the latest base backup of an archive into an empty data
+    /// directory.
+    Fetch(backup::FetchArgs),
     /// Write the archived WAL that follows a base backup or a snapshot into
     /// its pg_wal.
     Restore(restore::RestoreArgs),
@@ -50,17 +58,17 @@ enum Cmd {
     Verify(rebase::VerifyArgs),
 }
 
+/// Where to reach the server, as a role with the REPLICATION attribute.
 #[derive(Args, Debug)]
-struct ReceiveArgs {
+pub struct ConnArgs {
     /// Server host, or the directory of its Unix socket when it starts with
     /// `/`. The password comes from PGPASSWORD only.
     #[arg(long, env = "PGHOST", default_value = "localhost")]
     host: String,
     #[arg(long, env = "PGPORT", default_value_t = 5432)]
     port: u16,
-    /// A role with the REPLICATION attribute.
     #[arg(long, env = "PGUSER", default_value = "postgres")]
-    user: String,
+    pub user: String,
     /// TLS to the server. It applies to TCP only.
     #[arg(long, env = "PGSSLMODE", value_enum, default_value_t = SslMode::Disable)]
     sslmode: SslMode,
@@ -68,6 +76,40 @@ struct ReceiveArgs {
     /// the Mozilla roots.
     #[arg(long, env = "PGSSLROOTCERT")]
     sslrootcert: Option<PathBuf>,
+}
+
+pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+
+impl ConnArgs {
+    pub fn tls(&self) -> Result<Option<TlsConnector>> {
+        if self.host.starts_with('/') && self.sslmode != SslMode::Disable {
+            bail!(
+                "--sslmode applies to TCP only, not to the Unix socket in {}",
+                self.host
+            );
+        }
+        tls::connector(self.sslmode, self.sslrootcert.as_deref())
+    }
+
+    pub async fn connect(&self, tls: Option<&TlsConnector>) -> std::io::Result<Box<dyn Io>> {
+        if self.host.starts_with('/') {
+            let socket = PathBuf::from(&self.host).join(format!(".s.PGSQL.{}", self.port));
+            return Ok(Box::new(UnixStream::connect(socket).await?));
+        }
+        let stream = TcpStream::connect((self.host.as_str(), self.port)).await?;
+        stream.set_nodelay(true)?;
+        Ok(match tls {
+            Some(tls) => Box::new(tls::connect(stream, tls, &self.host).await?),
+            None => Box::new(stream),
+        })
+    }
+}
+
+#[derive(Args, Debug)]
+struct ReceiveArgs {
+    #[command(flatten)]
+    conn: ConnArgs,
     /// Physical replication slot, created on first use.
     #[arg(long, default_value = "pgwal")]
     slot: String,
@@ -100,6 +142,8 @@ async fn main() -> Result<()> {
         .init();
     match Cli::parse().cmd {
         Cmd::Receive(args) => run_receive(args).await,
+        Cmd::Backup(args) => backup::run(args).await,
+        Cmd::Fetch(args) => backup::run_fetch(args).await,
         Cmd::Restore(args) => restore::run(args).await,
         Cmd::Plan(args) => restore::run_plan(args),
         Cmd::Rebase(args) => rebase::run(args).await,
@@ -108,16 +152,10 @@ async fn main() -> Result<()> {
 }
 
 async fn run_receive(args: ReceiveArgs) -> Result<()> {
-    if args.host.starts_with('/') && args.sslmode != SslMode::Disable {
-        bail!(
-            "--sslmode applies to TCP only, not to the Unix socket in {}",
-            args.host
-        );
-    }
-    let tls = tls::connector(args.sslmode, args.sslrootcert.as_deref())?;
+    let tls = args.conn.tls()?;
     let cfg = StreamConfig {
         slot: args.slot,
-        user: args.user,
+        user: args.conn.user.clone(),
         password: std::env::var("PGPASSWORD").ok(),
         application_name: args.application_name,
         dir: args.dir,
@@ -143,16 +181,7 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
                 let _ = stop.wait_for(|stopped| *stopped).await;
             }
         };
-        match receive_once(
-            &args.host,
-            args.port,
-            tls.as_ref(),
-            &cfg,
-            sink.clone(),
-            stopped,
-        )
-        .await
-        {
+        match receive_once(&args.conn, tls.as_ref(), &cfg, sink.clone(), stopped).await {
             Ok(lsn) if *stop.borrow() => {
                 info!(%lsn, "archived");
                 return Ok(());
@@ -176,22 +205,12 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
 }
 
 async fn receive_once(
-    host: &str,
-    port: u16,
+    conn: &ConnArgs,
     tls: Option<&TlsConnector>,
     cfg: &StreamConfig,
     sink: Arc<dyn WalSink>,
     stop: impl Future<Output = ()>,
 ) -> Result<Lsn, Error> {
-    if host.starts_with('/') {
-        let socket = PathBuf::from(host).join(format!(".s.PGSQL.{port}"));
-        receive(UnixStream::connect(socket).await?, cfg, sink, stop).await
-    } else {
-        let stream = TcpStream::connect((host, port)).await?;
-        stream.set_nodelay(true)?;
-        match tls {
-            Some(tls) => receive(tls::connect(stream, tls, host).await?, cfg, sink, stop).await,
-            None => receive(stream, cfg, sink, stop).await,
-        }
-    }
+    let stream = conn.connect(tls).await?;
+    receive(stream, cfg, sink, stop).await
 }

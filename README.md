@@ -109,26 +109,39 @@ pg_ctl -D /restore/data start
 
 ### Base backups in the archive
 
-`pgwal_receiver::base_backup` takes a base backup over the replication
-protocol, without its WAL, and writes it to a `WalSink`. The `pgwal` command
-has no subcommand for it.
+`pgwal backup` takes a base backup over the replication protocol, without
+its WAL, and writes it to the archive. `pgwal fetch` writes the latest one
+into an empty data directory.
 
-- The backup starts with a fast checkpoint on the server.
+```sh
+# While pgwal receive runs, once or on a schedule:
+pgwal backup --host db.example --user replicator --archive s3://wal/db1/
+
+# At restore time:
+pgwal fetch --archive s3://wal/db1/ --pgdata /restore/data
+pgwal restore --archive s3://wal/db1/ --pgdata /restore/data
+pg_ctl -D /restore/data start
+```
+
+- The backup starts with a fast checkpoint on the server. `pgwal backup`
+  prints the start and end LSN.
+- A restore needs the archived WAL from the start to the end. Run
+  `pgwal backup` while `pgwal receive` streams the slot: the slot keeps that
+  WAL on the server until the archive has it.
 - The objects go under `{system_id}/base/{start}/`, with the start LSN in 16
-  hex digits.
-- Each file goes in parts of at most 16 MiB: `base.tar.000000`,
+  hex digits. Each file goes in parts of at most 16 MiB: `base.tar.000000`,
   `base.tar.000001`, and so on. A tablespace is `<oid>.tar`. The manifest is
   `backup_manifest`.
 - The `done` object goes last. It gives the start and end LSN, the timeline,
   the part count of each file, and the tablespaces. A backup without `done`
   is incomplete.
-- A restore needs the archived WAL from the start to the end. Take the backup
-  while `receive` streams the slot: the slot keeps that WAL on the server
-  until the archive has it.
-- To make a data directory, join the parts of each file in order, extract
-  `base.tar` into an empty directory with mode 700, and put `backup_manifest`
-  in it. `pg_verifybackup -n` checks the files. Then `pgwal restore` writes
-  the WAL.
+- `pgwal fetch` takes the latest backup whose WAL the archive holds up to
+  its end, and prints its start LSN. With backups of more than one cluster
+  in the archive, `--system-id` selects one.
+- `pgwal fetch` unpacks `base.tar` as the parts arrive, and puts
+  `backup_manifest` in the directory. `pg_verifybackup -n` checks the files.
+- `pgwal fetch` refuses a backup with tablespaces.
+- The library function is `pgwal_receiver::base_backup`.
 
 ### Rebase
 
