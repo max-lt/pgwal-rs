@@ -27,14 +27,18 @@ pub struct BackupConfig {
     /// Longest silence accepted from the server. It must cover the
     /// checkpoint at the start of the backup.
     pub idle_timeout: Duration,
+    /// The slot of [`receive`](crate::receive). It keeps the WAL of the
+    /// backup on the server until the archive has it.
+    pub slot: String,
 }
 
 /// Takes a base backup of the server behind `stream`, without its WAL, and
 /// writes it to `sink`.
 ///
 /// A restore needs the WAL from `start` to `end` of the result. Take the
-/// backup while [`receive`](crate::receive) streams the slot: the slot keeps
-/// that WAL on the server until the archive has it.
+/// backup while [`receive`](crate::receive) streams `cfg.slot`. Without the
+/// slot, or with a slot that holds no WAL, the backup does not start: the
+/// error is [`Error::Config`].
 ///
 /// The `done` object goes last. On an error, the parts written so far stay
 /// in the sink without it.
@@ -55,6 +59,12 @@ where
     )
     .await?;
     let system = conn.identify_system().await?;
+    if conn.slot_restart_lsn(&cfg.slot).await?.is_none() {
+        return Err(Error::Config(format!(
+            "slot {} does not exist or holds no WAL: the WAL of a backup could leave the server",
+            cfg.slot
+        )));
+    }
     let begun = conn.start_base_backup().await?;
     info!(start = %begun.start, timeline = begun.timeline, "base backup started");
 

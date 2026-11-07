@@ -127,7 +127,9 @@ pg_ctl -D /restore/data start
   prints the start and end LSN.
 - A restore needs the archived WAL from the start to the end. Run
   `pgwal backup` while `pgwal receive` streams the slot: the slot keeps that
-  WAL on the server until the archive has it.
+  WAL on the server until the archive has it. `--slot` names the slot
+  (default `pgwal`). Without it, or with a slot that holds no WAL, the
+  backup does not start.
 - The objects go under `{system_id}/base/{start}/`, with the start LSN in 16
   hex digits. Each file goes in parts of at most 16 MiB: `base.tar.000000`,
   `base.tar.000001`, and so on. A tablespace is `<oid>.tar`. The manifest is

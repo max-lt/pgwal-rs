@@ -22,6 +22,9 @@ const PARTS_AHEAD: usize = 2;
 pub struct BackupArgs {
     #[command(flatten)]
     conn: ConnArgs,
+    /// The slot of `pgwal receive`. Without it, the backup does not start.
+    #[arg(long, default_value = "pgwal")]
+    slot: String,
     #[arg(long, default_value = "pgwal_backup")]
     application_name: String,
     /// The archive of `pgwal receive`: a directory, or `s3://bucket/prefix/`.
@@ -44,6 +47,7 @@ pub async fn run(args: BackupArgs) -> Result<()> {
         password: std::env::var("PGPASSWORD").ok(),
         application_name: args.application_name,
         idle_timeout: Duration::from_secs(args.idle_timeout),
+        slot: args.slot,
     };
     let stream = args.conn.connect(tls.as_ref()).await?;
     let backup = base_backup(stream, &cfg, sink).await?;

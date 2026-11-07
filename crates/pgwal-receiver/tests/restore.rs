@@ -438,9 +438,17 @@ async fn a_base_backup_in_the_sink_restores_every_row() {
             password: None,
             application_name: "pgwal_backup".into(),
             idle_timeout: Duration::from_secs(60),
+            slot: "missing".into(),
         };
         let sink = Arc::new(DirSink(objects.clone()));
         let socket = root.join(".s.PGSQL.5432");
+        let stream = UnixStream::connect(&socket).await.unwrap();
+        let err = base_backup(stream, &cfg, sink.clone()).await.unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        let cfg = BackupConfig {
+            slot: SLOT.into(),
+            ..cfg
+        };
         tokio::spawn(
             async move { base_backup(UnixStream::connect(socket).await?, &cfg, sink).await },
         )
