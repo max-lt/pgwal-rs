@@ -150,6 +150,28 @@ impl Setup {
         }
     }
 
+    /// A client once a restored server has promoted. `pg_ctl start` returns
+    /// once the copy is consistent, and the replay goes on after it.
+    async fn promoted_client(&self) -> tokio_postgres::Client {
+        let client = self.client().await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let in_recovery: bool = client
+                .query_one("SELECT pg_is_in_recovery()", &[])
+                .await
+                .unwrap()
+                .get(0);
+            if !in_recovery {
+                return client;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the restored server did not promote"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     fn receiver(&self) -> Child {
         Command::new(env!("CARGO_BIN_EXE_pgwal"))
             .args(["receive", "--host", path(self.root.path())])
@@ -288,19 +310,14 @@ async fn restore_replays_the_archive_onto_a_base_backup() {
         String::from_utf8_lossy(&out.stderr)
     );
     setup.start("backup");
-    let client = setup.client().await;
-    let (rows, sum): (i64, i64) = client
+    let (rows, sum): (i64, i64) = setup
+        .promoted_client()
+        .await
         .query_one("SELECT count(*), sum(i)::bigint FROM t", &[])
         .await
         .map(|row| (row.get(0), row.get(1)))
         .unwrap();
     assert_eq!((rows, sum), (ROWS, ROWS * (ROWS + 1) / 2));
-    let in_recovery: bool = client
-        .query_one("SELECT pg_is_in_recovery()", &[])
-        .await
-        .unwrap()
-        .get(0);
-    assert!(!in_recovery, "the restored server did not promote");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -393,7 +410,7 @@ async fn a_standby_restore_makes_a_new_base_backup() {
     );
     setup.start("backup");
     let (rows, sum): (i64, i64) = setup
-        .client()
+        .promoted_client()
         .await
         .query_one("SELECT count(*), sum(i)::bigint FROM t", &[])
         .await
@@ -485,7 +502,7 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
     );
     setup.start("backup");
     let (rows, sum): (i64, i64) = setup
-        .client()
+        .promoted_client()
         .await
         .query_one("SELECT count(*), sum(i)::bigint FROM t", &[])
         .await
