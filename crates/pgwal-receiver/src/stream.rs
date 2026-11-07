@@ -36,6 +36,20 @@ pub struct StreamConfig {
     /// this must be longer than that half, and the server must not set
     /// `wal_sender_timeout` to 0.
     pub idle_timeout: Duration,
+    /// When the server may drop the WAL it sent.
+    pub confirm: Confirm,
+}
+
+/// The position the receiver reports to the server as flushed. The slot keeps
+/// the WAL after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Confirm {
+    /// Once the WAL is fsynced in the local store. A loss of the host loses
+    /// the WAL of one upload interval.
+    Flushed,
+    /// Once the WAL is in the sink. A receiver on another host with an empty
+    /// store starts at the slot and loses nothing.
+    Uploaded,
 }
 
 /// Streams WAL from the server behind `stream` into `cfg.dir`, uploads it to
@@ -146,9 +160,14 @@ where
     )
     .await?;
     let (flushed_tx, flushed_rx) = watch::channel(start);
-    let upload = tokio::spawn(uploader.run(flushed_rx, cfg.upload_every));
+    let (uploaded_tx, uploaded_rx) = watch::channel(uploader.uploaded);
+    let upload = tokio::spawn(uploader.run(flushed_rx, cfg.upload_every, uploaded_tx));
 
-    let streamed = stream_into(&mut conn, &mut store, &flushed_tx, stop).await;
+    let confirmed = Confirmed {
+        confirm: cfg.confirm,
+        uploaded: uploaded_rx,
+    };
+    let streamed = stream_into(&mut conn, &mut store, &flushed_tx, confirmed, stop).await;
     // Closing the channel makes the uploader send the rest and stop, even when
     // the stream failed. The store lock stays held until it has stopped.
     drop(flushed_tx);
@@ -159,10 +178,34 @@ where
     Ok(uploaded)
 }
 
+/// The flushed position the server sees, and the uploads it can wait for.
+struct Confirmed {
+    confirm: Confirm,
+    uploaded: watch::Receiver<Lsn>,
+}
+
+impl Confirmed {
+    fn of(&self, flushed: Lsn) -> Lsn {
+        match self.confirm {
+            Confirm::Flushed => flushed,
+            Confirm::Uploaded => flushed.min(*self.uploaded.borrow()),
+        }
+    }
+
+    /// Resolves when an upload moves the confirmed position. Never resolves
+    /// with [`Confirm::Flushed`], or once the uploader has stopped.
+    async fn moved(&mut self) {
+        if self.confirm == Confirm::Flushed || self.uploaded.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 async fn stream_into<S>(
     conn: &mut Conn<S>,
     store: &mut WalStore,
     flushed_tx: &watch::Sender<Lsn>,
+    mut confirmed: Confirmed,
     stop: impl Future<Output = ()>,
 ) -> Result<Lsn, Error>
 where
@@ -177,7 +220,12 @@ where
             () = &mut stop, if !drain.requested => {
                 drain.requested = true;
                 // The answer is a keepalive with the server's position.
-                conn.send_status(store.written(), flushed, true, SystemTime::now())
+                conn.send_status(store.written(), confirmed.of(flushed), true, SystemTime::now())
+                    .await?;
+                continue;
+            }
+            () = confirmed.moved() => {
+                conn.send_status(store.written(), confirmed.of(flushed), false, SystemTime::now())
                     .await?;
                 continue;
             }
@@ -219,7 +267,12 @@ where
             // The server may have closed after our last status. The read side
             // decides how the stream ended.
             if let Err(e) = conn
-                .send_status(store.written(), flushed, false, SystemTime::now())
+                .send_status(
+                    store.written(),
+                    confirmed.of(flushed),
+                    false,
+                    SystemTime::now(),
+                )
                 .await
             {
                 debug!(error = %e, "status update not delivered");

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
-use pgwal_receiver::{Error, Lsn, StreamConfig, WalSink, receive};
+use pgwal_receiver::{Confirm, Error, Lsn, StreamConfig, WalSink, receive};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
@@ -123,6 +123,7 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
         dir: args.dir,
         upload_every: Duration::from_secs(args.upload_every),
         idle_timeout: Duration::from_secs(args.idle_timeout),
+        confirm: Confirm::Flushed,
     };
     let sink: Arc<dyn WalSink> = archive::Archive::open(&args.archive, &args.s3)?.sink();
 

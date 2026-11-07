@@ -104,7 +104,7 @@ pub(crate) struct Uploader {
     timeline: u32,
     seg_size: u64,
     sink: Arc<dyn WalSink>,
-    uploaded: Lsn,
+    pub(crate) uploaded: Lsn,
     max_object: u64,
     /// At most one compaction runs next to the uploads: it bounds the memory
     /// to one segment.
@@ -152,11 +152,13 @@ impl Uploader {
     }
 
     /// Uploads every `every` until `flushed` closes, then uploads the rest.
-    /// Returns the LSN up to which the sink holds the WAL.
+    /// Publishes each new upload end in `uploaded`, and returns the LSN up to
+    /// which the sink holds the WAL.
     pub async fn run(
         mut self,
         mut flushed: watch::Receiver<Lsn>,
         every: Duration,
+        uploaded: watch::Sender<Lsn>,
     ) -> Result<Lsn, Error> {
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -168,7 +170,13 @@ impl Uploader {
             }
             let upto = *flushed.borrow();
             // The stream keeps going on a failed upload; the next tick retries.
-            match self.upload_to(upto).await {
+            let result = self.upload_to(upto).await;
+            uploaded.send_if_modified(|lsn| {
+                let moved = *lsn != self.uploaded;
+                *lsn = self.uploaded;
+                moved
+            });
+            match result {
                 Ok(()) if failing => {
                     failing = false;
                     info!(uploaded = %self.uploaded, "WAL upload recovered");
@@ -542,11 +550,11 @@ mod tests {
         let (_store, _, flushed) = filled_store(tmp.path()).await;
         let sink = Arc::new(MemSink::default());
         let (tx, rx) = watch::channel(Lsn(SEG));
-        let run = tokio::spawn(
-            uploader(tmp.path(), &sink)
-                .await
-                .run(rx, Duration::from_secs(3600)),
-        );
+        let run = tokio::spawn(uploader(tmp.path(), &sink).await.run(
+            rx,
+            Duration::from_secs(3600),
+            watch::channel(Lsn(0)).0,
+        ));
         tx.send_replace(flushed);
         drop(tx);
         let uploaded = tokio::time::timeout(Duration::from_secs(5), run)

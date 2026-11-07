@@ -1,9 +1,10 @@
 //! Streams the WAL of a server over physical replication and uploads it to a sink,
 //! as objects keyed by LSN range.
 //!
-//! The receiver confirms a flush to Postgres once the WAL is fsynced on local
-//! disk, not once it is in the sink. A loss of the receiver's host therefore
-//! loses at most the WAL of one upload interval.
+//! By default the receiver confirms a flush to Postgres once the WAL is
+//! fsynced on local disk, not once it is in the sink. A loss of the receiver's
+//! host then loses at most the WAL of one upload interval. With
+//! [`Confirm::Uploaded`], it confirms once the WAL is in the sink.
 //!
 //! To restore, rebuild each segment with [`pgwal::assemble_segment`] from the
 //! objects whose keys [`RangeKey::parse`] reads, and give the segments to Postgres
@@ -22,7 +23,7 @@ pub mod wire;
 
 pub use error::Error;
 #[cfg(feature = "runtime")]
-pub use stream::{StreamConfig, forget_slot, receive};
+pub use stream::{Confirm, StreamConfig, forget_slot, receive};
 #[cfg(feature = "runtime")]
 pub use upload::{WalSink, salvage};
 

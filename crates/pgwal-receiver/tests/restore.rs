@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pgwal::{ControlFile, assemble_segment, segment_file_name};
-use pgwal_receiver::{Error, Lsn, RangeKey, StreamConfig, WalSink, forget_slot, receive};
+use pgwal_receiver::{Confirm, Error, Lsn, RangeKey, StreamConfig, WalSink, forget_slot, receive};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 use tokio_postgres::NoTls;
@@ -184,6 +184,7 @@ fn spawn_receiver(root: &Path, wal: &Path, objects: &Path) -> JoinHandle<Result<
         dir: wal.to_path_buf(),
         upload_every: Duration::from_millis(100),
         idle_timeout: Duration::from_secs(60),
+        confirm: Confirm::Flushed,
     };
     let sink = Arc::new(DirSink(objects.to_path_buf()));
     let socket = root.join(".s.PGSQL.5432");
@@ -423,6 +424,7 @@ fn stream_config(wal: &Path) -> StreamConfig {
         dir: wal.to_path_buf(),
         upload_every: Duration::from_millis(100),
         idle_timeout: Duration::from_secs(60),
+        confirm: Confirm::Flushed,
     }
 }
 

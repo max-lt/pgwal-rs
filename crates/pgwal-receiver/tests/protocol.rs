@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pgwal::assemble_segment;
-use pgwal_receiver::{Error, Lsn, RangeKey, StreamConfig, WalSink, receive, salvage};
+use pgwal_receiver::{Confirm, Error, Lsn, RangeKey, StreamConfig, WalSink, receive, salvage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -77,6 +77,31 @@ impl MemSink {
     }
 }
 
+/// A [`MemSink`] that refuses writes until it is opened.
+#[derive(Default)]
+struct GateSink {
+    open: std::sync::atomic::AtomicBool,
+    inner: MemSink,
+}
+
+#[async_trait]
+impl WalSink for GateSink {
+    async fn put(&self, key: &str, wal: Bytes) -> io::Result<()> {
+        if !self.open.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::other("object store down"));
+        }
+        self.inner.put(key, wal).await
+    }
+
+    async fn list(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.inner.list(dir).await
+    }
+
+    async fn delete(&self, keys: &[String]) -> io::Result<()> {
+        self.inner.delete(keys).await
+    }
+}
+
 /// An object store that is down.
 struct DownSink;
 
@@ -104,6 +129,7 @@ fn config(dir: &Path) -> StreamConfig {
         dir: dir.to_path_buf(),
         upload_every: Duration::from_millis(20),
         idle_timeout: Duration::from_secs(5),
+        confirm: Confirm::Flushed,
     }
 }
 
@@ -398,6 +424,36 @@ async fn streams_across_segments_confirms_the_flush_and_uploads() {
 }
 
 #[tokio::test]
+async fn confirm_uploaded_holds_the_flush_until_the_sink_has_the_wal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(GateSink::default());
+    let cfg = StreamConfig {
+        confirm: Confirm::Uploaded,
+        ..config(tmp.path())
+    };
+    let (client, server) = tokio::io::duplex(4 << 20);
+    let dyn_sink: Arc<dyn WalSink> = sink.clone();
+    let task =
+        tokio::spawn(async move { receive(client, &cfg, dyn_sink, std::future::pending()).await });
+    let mut server = Walsender {
+        io: server,
+        buf: BytesMut::new(),
+    };
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let end = server.stream(Lsn(SEG), &pattern(0x40000, 5)).await;
+    server.keepalive(end, true).await;
+    // The WAL is fsynced before this status, but not uploaded.
+    assert_eq!(server.status().await.0, Lsn(SEG));
+
+    sink.open.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.await_flush(end).await;
+    server.end().await;
+    assert_eq!(finish(task).await.unwrap(), end);
+    sink.inner.assert_tiles(Lsn(SEG), end);
+}
+
+#[tokio::test]
 async fn resumes_at_the_unfinished_segment_without_uploading_twice() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(MemSink::default());
@@ -624,6 +680,7 @@ async fn a_silent_server_times_out() {
     let sink = Arc::new(MemSink::default());
     let cfg = StreamConfig {
         idle_timeout: Duration::from_millis(300),
+        confirm: Confirm::Flushed,
         ..config(tmp.path())
     };
     let (task, mut server) = spawn_receiver(cfg, &sink);
