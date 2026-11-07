@@ -10,6 +10,8 @@
 //! objects whose keys [`RangeKey::parse`] reads, and give the segments to Postgres
 //! through `restore_command`.
 
+#[cfg(feature = "runtime")]
+mod backup;
 mod error;
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -21,10 +23,12 @@ mod stream;
 mod upload;
 pub mod wire;
 
+#[cfg(feature = "runtime")]
+pub use backup::{BackupConfig, base_backup};
 pub use error::Error;
 #[cfg(feature = "runtime")]
 pub use stream::{Confirm, StreamConfig, forget_slot, receive};
 #[cfg(feature = "runtime")]
 pub use upload::{WalSink, salvage};
 
-pub use pgwal::{Lsn, RangeKey};
+pub use pgwal::{ArchivedBackup, Lsn, RangeKey};

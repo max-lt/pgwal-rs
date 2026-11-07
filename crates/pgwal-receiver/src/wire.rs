@@ -34,6 +34,11 @@ const UNDEFINED_OBJECT: &str = "42704";
 /// (`object_not_in_prerequisite_state`), a removed segment (`undefined_file`).
 const WAL_GONE: [&str; 2] = ["55000", "58P01"];
 
+/// `WAIT false`: the WAL comes from the stream of the slot, not from the
+/// `archive_command` of the server.
+const BASE_BACKUP: &str = "BASE_BACKUP (LABEL 'pgwal', CHECKPOINT 'fast', WAIT false, \
+                           MANIFEST 'yes', TABLESPACE_MAP true)";
+
 // Authentication request codes of the `R` message.
 const AUTH_OK: i32 = 0;
 const AUTH_SASL: i32 = 10;
@@ -59,6 +64,24 @@ pub enum CopyMessage {
         wal_end: Lsn,
         reply_requested: bool,
     },
+}
+
+pub struct BackupStart {
+    pub start: Lsn,
+    pub timeline: u32,
+    /// `(oid, location)` of each tablespace outside the data directory.
+    pub tablespaces: Vec<(u32, String)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackupMessage {
+    /// A tar file starts: `base.tar` for the data directory, `<oid>.tar` for
+    /// a tablespace.
+    Archive { name: String },
+    /// The backup manifest starts.
+    Manifest,
+    /// The next bytes of the file that started last.
+    Data(Bytes),
 }
 
 pub struct Conn<S> {
@@ -307,6 +330,104 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         Ok(())
     }
 
+    /// Starts a base backup without WAL, after a fast checkpoint. Read the
+    /// files with [`Conn::next_backup_message`], then the end with
+    /// [`Conn::finish_base_backup`].
+    pub async fn start_base_backup(&mut self) -> Result<BackupStart, Error> {
+        self.send_query(BASE_BACKUP).await?;
+        let mut sets: Vec<Vec<Vec<Option<String>>>> = Vec::new();
+        loop {
+            let (tag, body) = self.read_frame().await?;
+            match tag {
+                b'T' => sets.push(Vec::new()),
+                b'D' => sets
+                    .last_mut()
+                    .ok_or_else(|| protocol("BASE_BACKUP: DataRow before RowDescription"))?
+                    .push(data_row(body)?),
+                b'C' | b'N' => {}
+                b'H' => break,
+                b'E' => return Err(db_error(body)),
+                other => return Err(unexpected(other, "BASE_BACKUP")),
+            }
+        }
+        let [begin, spaces] = &sets[..] else {
+            return Err(protocol(format!(
+                "BASE_BACKUP: {} result sets before the copy, not 2",
+                sets.len()
+            )));
+        };
+        let (start, timeline) = position(begin)?;
+        // The data directory is the row without an oid.
+        let mut tablespaces = Vec::new();
+        for row in spaces {
+            let (Some(Some(oid)), Some(Some(location))) = (row.first(), row.get(1)) else {
+                continue;
+            };
+            if location.contains('\n') {
+                return Err(protocol("BASE_BACKUP: tablespace location with a newline"));
+            }
+            let oid = oid
+                .parse()
+                .map_err(|_| protocol("BASE_BACKUP: bad tablespace oid"))?;
+            tablespaces.push((oid, location.clone()));
+        }
+        Ok(BackupStart {
+            start,
+            timeline,
+            tablespaces,
+        })
+    }
+
+    /// The next message of a base backup, or `None` at the end of the copy.
+    pub async fn next_backup_message(&mut self) -> Result<Option<BackupMessage>, Error> {
+        loop {
+            let (tag, mut body) = self.read_frame().await?;
+            match tag {
+                b'd' => match take_u8(&mut body)? {
+                    b'n' => return archive_name(&mut body).map(Some),
+                    b'm' => return Ok(Some(BackupMessage::Manifest)),
+                    b'd' => return Ok(Some(BackupMessage::Data(body.freeze()))),
+                    b'p' => {}
+                    other => return Err(unexpected(other, "BASE_BACKUP CopyData")),
+                },
+                b'c' => return Ok(None),
+                b'E' => return Err(db_error(body)),
+                b'N' => {}
+                other => return Err(unexpected(other, "BASE_BACKUP copy")),
+            }
+        }
+    }
+
+    /// The end position and timeline of the backup.
+    pub async fn finish_base_backup(&mut self) -> Result<(Lsn, u32), Error> {
+        let mut sets: Vec<Vec<Vec<Option<String>>>> = Vec::new();
+        let mut err = None;
+        loop {
+            let (tag, body) = self.read_frame().await?;
+            match tag {
+                b'T' => sets.push(Vec::new()),
+                b'D' => sets
+                    .last_mut()
+                    .ok_or_else(|| protocol("BASE_BACKUP: DataRow before RowDescription"))?
+                    .push(data_row(body)?),
+                b'E' => err = Some(db_error(body)),
+                b'Z' => break,
+                b'C' | b'N' => {}
+                other => return Err(unexpected(other, "BASE_BACKUP end")),
+            }
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+        match &sets[..] {
+            [end] => position(end),
+            _ => Err(protocol(format!(
+                "BASE_BACKUP: {} result sets after the copy, not 1",
+                sets.len()
+            ))),
+        }
+    }
+
     async fn single_row(&mut self, sql: &str) -> Result<Vec<Option<String>>, Error> {
         let mut rows = self.simple_query(sql).await?;
         if rows.len() != 1 {
@@ -489,6 +610,38 @@ fn db_error(mut body: BytesMut) -> Error {
     Error::Db { code, message }
 }
 
+/// The `(LSN, timeline)` row that BASE_BACKUP sends at its start and end.
+fn position(rows: &[Vec<Option<String>>]) -> Result<(Lsn, u32), Error> {
+    let [row] = rows else {
+        return Err(protocol("BASE_BACKUP: expected one position row"));
+    };
+    let (Some(Some(lsn)), Some(Some(timeline))) = (row.first(), row.get(1)) else {
+        return Err(protocol("BASE_BACKUP: missing position column"));
+    };
+    Ok((
+        lsn.parse().map_err(|e| protocol(format!("{e}")))?,
+        timeline
+            .parse()
+            .map_err(|_| protocol("BASE_BACKUP: bad timeline"))?,
+    ))
+}
+
+/// The name of a new archive goes into object keys: only `base.tar` and
+/// `<oid>.tar` pass.
+fn archive_name(body: &mut BytesMut) -> Result<BackupMessage, Error> {
+    let end = body
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| protocol("BASE_BACKUP: unterminated archive name"))?;
+    let name = String::from_utf8_lossy(&body.split_to(end)).into_owned();
+    let oid = name.strip_suffix(".tar").unwrap_or_default();
+    let tablespace = !oid.is_empty() && oid.bytes().all(|b| b.is_ascii_digit());
+    if name != "base.tar" && !tablespace {
+        return Err(protocol(format!("BASE_BACKUP: archive name {name:?}")));
+    }
+    Ok(BackupMessage::Archive { name })
+}
+
 fn need(body: &BytesMut, n: usize) -> Result<(), Error> {
     if body.len() < n {
         return Err(protocol("truncated message"));
@@ -581,6 +734,26 @@ mod tests {
         huge.put_u8(b'd');
         huge.put_u32(u32::MAX);
         assert!(frame_len(&huge).is_err());
+    }
+
+    #[test]
+    fn archive_names_are_checked() {
+        let name = |n: &[u8]| archive_name(&mut BytesMut::from(n));
+        assert_eq!(
+            name(b"16385.tar\0/srv/ts\0").unwrap(),
+            BackupMessage::Archive {
+                name: "16385.tar".into()
+            }
+        );
+        assert!(name(b"base.tar\0\0").is_ok());
+        for bad in [
+            &b"../x.tar\0\0"[..],
+            b".tar\0\0",
+            b"base.tar.gz\0\0",
+            b"base.tar",
+        ] {
+            assert!(name(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

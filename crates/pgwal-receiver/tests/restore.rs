@@ -14,8 +14,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use pgwal::{ControlFile, assemble_segment, segment_file_name};
-use pgwal_receiver::{Confirm, Error, Lsn, RangeKey, StreamConfig, WalSink, forget_slot, receive};
+use pgwal::{ControlFile, assemble_segment, backup_done_key, backup_part_key, segment_file_name};
+use pgwal_receiver::{
+    ArchivedBackup, BackupConfig, Confirm, Error, Lsn, RangeKey, StreamConfig, WalSink,
+    base_backup, forget_slot, receive,
+};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 use tokio_postgres::NoTls;
@@ -55,12 +58,15 @@ impl WalSink for DirSink {
 
 type Ranges = Vec<(Lsn, Lsn, Bytes)>;
 
-/// Rebuilds Postgres segment files in `out` from the objects in `objects`.
+/// Rebuilds Postgres segment files in `out` from the WAL objects in
+/// `objects`.
 fn materialize(objects: &Path, out: &Path) {
     let mut segments: BTreeMap<(u32, u64), Ranges> = BTreeMap::new();
     for file in files_under(objects) {
         let key = file.strip_prefix(objects).unwrap().to_str().unwrap();
-        let key = RangeKey::parse(key).unwrap();
+        let Some(key) = RangeKey::parse(key) else {
+            continue;
+        };
         let wal = Bytes::from(std::fs::read(&file).unwrap());
         segments
             .entry((key.timeline, key.start.segment_no(SEG)))
@@ -360,6 +366,119 @@ async fn base_backup_plus_uploaded_wal_restores_every_row_across_a_reconnect() {
     assert_eq!(sum, 2 * ROWS * (2 * ROWS + 1) / 2);
     drop(client);
     stop(&bin, &backup);
+}
+
+/// Writes the files of `backup` into `out`, and unpacks `base.tar` there.
+fn unpack(backup: &ArchivedBackup, objects: &Path, out: &Path) {
+    std::fs::create_dir(out).unwrap();
+    std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (name, parts) in &backup.streams {
+        let mut file = Vec::new();
+        for part in 0..*parts {
+            let key = backup_part_key(backup.system_id, backup.start, name, part);
+            file.extend(std::fs::read(objects.join(key)).unwrap());
+        }
+        std::fs::write(out.join(name), file).unwrap();
+    }
+    let tar = out.join("base.tar");
+    let status = Command::new("tar")
+        .args(["-xf", path(&tar), "-C", path(out)])
+        .status()
+        .unwrap();
+    assert!(status.success(), "tar -xf failed");
+    std::fs::remove_file(tar).unwrap();
+}
+
+/// `base_backup` writes the backup next to the WAL of the slot, while rows
+/// arrive. `pg_verifybackup` accepts the copy, and the restore has every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_base_backup_in_the_sink_restores_every_row() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let tmp = tempfile::Builder::new()
+        .prefix("brb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = tmp.path();
+    let (data, copy) = (root.join("data"), root.join("copy"));
+    let (wal, objects, restored) = (
+        root.join("wal"),
+        root.join("objects"),
+        root.join("restored"),
+    );
+    run(
+        &bin,
+        "initdb",
+        &[
+            "-D",
+            path(&data),
+            "-U",
+            "postgres",
+            "-A",
+            "trust",
+            "--no-sync",
+            "--no-instructions",
+        ],
+    );
+    start(&bin, &data, root, &root.join("primary.log"));
+    let receiver = spawn_receiver(root, &wal, &objects);
+    let client = connect(root).await;
+    wait_for_slot(&client, true).await;
+    client
+        .batch_execute("CREATE TABLE t (i bigint)")
+        .await
+        .unwrap();
+    insert(&client, 1, ROWS).await;
+
+    let backup = {
+        let cfg = BackupConfig {
+            user: "postgres".into(),
+            password: None,
+            application_name: "pgwal_backup".into(),
+            idle_timeout: Duration::from_secs(60),
+        };
+        let sink = Arc::new(DirSink(objects.clone()));
+        let socket = root.join(".s.PGSQL.5432");
+        tokio::spawn(
+            async move { base_backup(UnixStream::connect(socket).await?, &cfg, sink).await },
+        )
+    };
+    insert(&client, ROWS + 1, 2 * ROWS).await;
+    let backup = backup.await.unwrap().unwrap();
+    insert(&client, 2 * ROWS + 1, 3 * ROWS).await;
+    drop(client);
+    stop(&bin, &data);
+    let uploaded = finish(receiver).await.unwrap();
+    assert!(uploaded >= backup.end, "{uploaded} < {}", backup.end);
+
+    let done = objects.join(backup_done_key(backup.system_id, backup.start));
+    let done = std::fs::read_to_string(done).unwrap();
+    assert_eq!(ArchivedBackup::parse(&done).as_ref(), Some(&backup));
+    let base_parts = backup.streams.iter().find(|(name, _)| name == "base.tar");
+    assert!(
+        base_parts.is_some_and(|(_, parts)| *parts > 1),
+        "{:?}",
+        backup.streams
+    );
+
+    unpack(&backup, &objects, &copy);
+    run(&bin, "pg_verifybackup", &["-n", path(&copy)]);
+    materialize(&objects, &restored);
+    restore_from(&copy, &restored, root);
+    start(&bin, &copy, root, &root.join("restore.log"));
+    let client = connect(root).await;
+    wait_promoted(&client).await;
+    let (rows, sum): (i64, i64) = client
+        .query_one("SELECT count(*), sum(i)::bigint FROM t", &[])
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .unwrap();
+    assert_eq!(rows, 3 * ROWS);
+    assert_eq!(sum, 3 * ROWS * (3 * ROWS + 1) / 2);
+    drop(client);
+    stop(&bin, &copy);
 }
 
 /// `pg_controldata` output as `label -> value`.

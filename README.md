@@ -11,9 +11,9 @@ point is the upload interval, not one 16 MiB segment.
 - `pgwal`: the WAL archive format, `pg_control`, the replay plan and the
   segment writer. It uses `std` only.
 - `pgwal-receiver`: the replication stream, the local store, the uploader,
-  salvage and compaction. A sink implements the `WalSink` trait. Without
-  the default `runtime` feature, only the protocol module `wire` builds,
-  for hosts without tokio such as wasm32.
+  salvage, compaction and base backups. A sink implements the `WalSink`
+  trait. Without the default `runtime` feature, only the protocol module
+  `wire` builds, for hosts without tokio such as wasm32.
 - `pgwal-cli`: the `pgwal` command.
 - `pgwal-worker`: a receiver in a Cloudflare Durable Object, for one
   database. It is not published on crates.io. See its
@@ -106,6 +106,29 @@ pg_ctl -D /restore/data start
   promote. A copy of the data directory after a clean stop is a new base backup,
   on the timeline of the archive. Its replay starts at the last checkpoint
   of the primary in the archive.
+
+### Base backups in the archive
+
+`pgwal_receiver::base_backup` takes a base backup over the replication
+protocol, without its WAL, and writes it to a `WalSink`. The `pgwal` command
+has no subcommand for it.
+
+- The backup starts with a fast checkpoint on the server.
+- The objects go under `{system_id}/base/{start}/`, with the start LSN in 16
+  hex digits.
+- Each file goes in parts of at most 16 MiB: `base.tar.000000`,
+  `base.tar.000001`, and so on. A tablespace is `<oid>.tar`. The manifest is
+  `backup_manifest`.
+- The `done` object goes last. It gives the start and end LSN, the timeline,
+  the part count of each file, and the tablespaces. A backup without `done`
+  is incomplete.
+- A restore needs the archived WAL from the start to the end. Take the backup
+  while `receive` streams the slot: the slot keeps that WAL on the server
+  until the archive has it.
+- To make a data directory, join the parts of each file in order, extract
+  `base.tar` into an empty directory with mode 700, and put `backup_manifest`
+  in it. `pg_verifybackup -n` checks the files. Then `pgwal restore` writes
+  the WAL.
 
 ### Rebase
 
