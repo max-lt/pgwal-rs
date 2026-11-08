@@ -522,3 +522,39 @@ async fn a_lost_slot_still_gets_the_store_into_the_archive() {
         "the WAL of the store did not reach the archive"
     );
 }
+
+/// A slot made beforehand with `pg_create_physical_replication_slot` and its
+/// defaults has no WAL reserved. The first run streams from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_made_with_sql_streams() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let cluster = Cluster::start(bin, None);
+    let client = cluster.client().await;
+    client
+        .batch_execute("SELECT pg_create_physical_replication_slot('pgwal')")
+        .await
+        .unwrap();
+    let pgwal = cluster.receiver(&[]);
+    client
+        .batch_execute("CREATE TABLE t AS SELECT g FROM generate_series(1, 1000) g")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while objects_under(&cluster.path("archive")) == 0 {
+        assert!(Instant::now() < deadline, "no object reached the archive");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let restart: Option<String> = client
+        .query_one(
+            "SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name = 'pgwal'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(restart.is_some(), "the slot reserves no WAL");
+    assert!(pgwal.interrupt().success());
+}

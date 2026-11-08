@@ -43,7 +43,8 @@ where
     let system = conn.identify_system().await?;
     if conn.slot_restart_lsn(slot).await?.is_none() {
         return Err(Error::Config(format!(
-            "slot {slot} does not exist or holds no WAL: the WAL of a backup could leave the server"
+            "slot {slot} does not exist or holds no WAL: the WAL of a backup could leave the \
+             server. pgwal receive reserves the WAL of the slot when it streams"
         )));
     }
     let begun = conn.start_base_backup().await?;

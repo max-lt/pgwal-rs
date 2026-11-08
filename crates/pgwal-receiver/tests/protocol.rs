@@ -1098,12 +1098,39 @@ async fn a_store_past_the_switch_falls_back_to_the_slot_of_the_new_server() {
     assert_eq!(finish(task).await.unwrap(), end);
 }
 
+/// A slot made with `pg_create_physical_replication_slot` and its defaults
+/// has no WAL reserved. With no WAL of the system anywhere, the stream
+/// starts at the server position.
+#[tokio::test]
+async fn a_new_slot_with_no_wal_reserved_starts_at_the_server_position() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.expect_query().await; // READ_REPLICATION_SLOT
+    server.row(&[Some("physical"), None, None]).await;
+    let query = server.expect_query().await;
+    assert!(query.contains(" 0/2000000 "), "{query}");
+    server.send(b'W', &[0, 0, 0]).await;
+    let end = server.stream(Lsn(0x200_0000), &pattern(4096, 3)).await;
+    server.await_flush(end).await;
+    server.end().await;
+    assert_eq!(finish(task).await.unwrap(), end);
+}
+
 /// Postgres 16 and 17 stream from an invalidated slot, which keeps no WAL
-/// and has no restart position. The receiver refuses it.
+/// and has no restart position. With WAL of the system in the sink, the
+/// archive can have a gap: the receiver refuses it.
 #[tokio::test]
 async fn a_slot_with_no_restart_position_is_wal_gone() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(MemSink::default());
+    sink.put(
+        "7401/00000001/0000000000100000-0000000000101000",
+        Bytes::new(),
+    )
+    .await
+    .unwrap();
     let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
     server.open().await;
     assert_eq!(

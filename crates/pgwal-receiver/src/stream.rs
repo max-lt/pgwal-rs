@@ -151,20 +151,39 @@ where
     Ok(uploaded)
 }
 
-/// The restart position of the slot. WalGone for a slot with none.
-async fn slot_position<S>(conn: &mut Conn<S>, slot: &str, xlogpos: Lsn) -> Result<Lsn, Error>
+/// The restart position of the slot. A slot with none was invalidated, and
+/// Postgres 16 and 17 still stream from it with no WAL kept: WalGone. Or it
+/// was made without reserved WAL, as `pg_create_physical_replication_slot`
+/// makes it by default. With no WAL of the system in the store or the sink,
+/// no WAL can be missing: the stream starts at the server position.
+async fn slot_position<S>(
+    conn: &mut Conn<S>,
+    cfg: &StreamConfig,
+    system: &SystemInfo,
+    sink: &dyn WalSink,
+) -> Result<Lsn, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // The receiver creates its slot with its WAL reserved. A slot with no
-    // restart position was invalidated, and Postgres 16 and 17 still stream
-    // from it, with no WAL kept.
-    conn.slot_restart_lsn(slot)
-        .await?
-        .ok_or_else(|| Error::WalGone {
-            requested: xlogpos,
-            message: format!("slot {slot} holds no WAL: it was invalidated"),
-        })
+    if let Some(lsn) = conn.slot_restart_lsn(&cfg.slot).await? {
+        return Ok(lsn);
+    }
+    let new = read_flushed(&cfg.dir).await?.is_none()
+        && sink
+            .list(&ArchiveKey::wal_prefix(system.system_id))
+            .await?
+            .is_empty();
+    if new {
+        info!(slot = %cfg.slot, "the slot holds no WAL yet; the stream starts at the server position");
+        return Ok(system.xlogpos);
+    }
+    Err(Error::WalGone {
+        requested: system.xlogpos,
+        message: format!(
+            "slot {} holds no WAL: it was invalidated, or made without reserved WAL",
+            cfg.slot
+        ),
+    })
 }
 
 /// The end of the WAL of `timeline` in the sink.
@@ -349,7 +368,7 @@ where
         // 17 stream from an invalidated slot too.
         let slot_at = match slot_cache {
             Some(lsn) => lsn,
-            None => *slot_cache.insert(slot_position(conn, &cfg.slot, system.xlogpos).await?),
+            None => *slot_cache.insert(slot_position(conn, cfg, system, sink.as_ref()).await?),
         };
         // What the store or the watermark holds moves the start forward,
         // and a start keeps its fallback.
