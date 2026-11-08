@@ -75,10 +75,16 @@ pub enum AfterReplay {
 /// Makes the next start of Postgres an archive recovery that reads the WAL
 /// already in `pg_wal`. Safe to call twice.
 pub fn request_recovery(data_dir: &Path, after: AfterReplay) -> io::Result<()> {
-    let signal = match after {
-        AfterReplay::Promote => "recovery.signal",
-        AfterReplay::StayStandby => "standby.signal",
+    // Postgres takes standby.signal over recovery.signal, and a copy of a
+    // standby holds one.
+    let (signal, other) = match after {
+        AfterReplay::Promote => ("recovery.signal", "standby.signal"),
+        AfterReplay::StayStandby => ("standby.signal", "recovery.signal"),
     };
+    match std::fs::remove_file(data_dir.join(other)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     std::fs::write(data_dir.join(signal), b"")?;
     // Postgres reads the WAL in pg_wal when the restore command fails.
     const RESTORE_COMMAND: &str = "restore_command = 'false'";
@@ -136,5 +142,8 @@ mod tests {
         );
         request_recovery(dir.path(), AfterReplay::StayStandby).unwrap();
         assert!(dir.path().join("standby.signal").exists());
+        assert!(!dir.path().join("recovery.signal").exists());
+        request_recovery(dir.path(), AfterReplay::Promote).unwrap();
+        assert!(!dir.path().join("standby.signal").exists());
     }
 }
