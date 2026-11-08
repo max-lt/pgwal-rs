@@ -86,22 +86,41 @@ pub fn request_recovery(data_dir: &Path, after: AfterReplay) -> io::Result<()> {
         _ => {}
     }
     std::fs::write(data_dir.join(signal), b"")?;
-    // Postgres reads the WAL in pg_wal when the restore command fails.
-    const RESTORE_COMMAND: &str = "restore_command = 'false'";
+    // Postgres reads the WAL in pg_wal when the restore command fails. A
+    // standby of a copy made with pg_basebackup -R, or of a standby, would
+    // stream from the live primary: the later lines win.
+    let settings: &[&str] = match after {
+        AfterReplay::Promote => &["restore_command = 'false'"],
+        AfterReplay::StayStandby => &[
+            "restore_command = 'false'",
+            "primary_conninfo = ''",
+            "primary_slot_name = ''",
+        ],
+    };
     let path = data_dir.join("postgresql.auto.conf");
     let mut text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
-    if text.lines().any(|line| line.trim() == RESTORE_COMMAND) {
-        return Ok(());
-    }
-    if !text.is_empty() && !text.ends_with('\n') {
+    let before = text.len();
+    for setting in settings {
+        let name = setting.split('=').next().unwrap_or_default().trim();
+        let last = text
+            .lines()
+            .rfind(|line| line.split('=').next().is_some_and(|n| n.trim() == name));
+        if last.is_some_and(|line| line.trim() == *setting) {
+            continue;
+        }
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(setting);
         text.push('\n');
     }
-    text.push_str(RESTORE_COMMAND);
-    text.push('\n');
+    if text.len() == before {
+        return Ok(());
+    }
     std::fs::write(path, text)
 }
 
@@ -143,9 +162,20 @@ mod tests {
             std::fs::read_to_string(dir.path().join("postgresql.auto.conf")).unwrap(),
             "restore_command = 'false'\n"
         );
+        std::fs::write(
+            dir.path().join("postgresql.auto.conf"),
+            "primary_conninfo = 'host=db1'\n",
+        )
+        .unwrap();
+        request_recovery(dir.path(), AfterReplay::StayStandby).unwrap();
         request_recovery(dir.path(), AfterReplay::StayStandby).unwrap();
         assert!(dir.path().join("standby.signal").exists());
         assert!(!dir.path().join("recovery.signal").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("postgresql.auto.conf")).unwrap(),
+            "primary_conninfo = 'host=db1'\nrestore_command = 'false'\n\
+             primary_conninfo = ''\nprimary_slot_name = ''\n"
+        );
         request_recovery(dir.path(), AfterReplay::Promote).unwrap();
         assert!(!dir.path().join("standby.signal").exists());
 
