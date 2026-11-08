@@ -135,12 +135,16 @@ impl WalStore {
             return Ok(self.written);
         }
         if let Some((_, file)) = &mut self.open {
+            // A tokio write ends on a blocking thread after write_all
+            // returns, and only a flush gives its error: a sync drops it.
+            file.flush().await?;
             file.sync_data().await?;
         }
         self.flushed_file.seek(io::SeekFrom::Start(0)).await?;
         self.flushed_file
             .write_all(&encode_flushed(self.timeline, self.written))
             .await?;
+        self.flushed_file.flush().await?;
         self.flushed_file.sync_data().await?;
         self.recorded = self.written;
         Ok(self.written)
@@ -169,9 +173,10 @@ impl WalStore {
     }
 
     async fn finish_segment(&mut self) -> Result<(), Error> {
-        let Some((segno, file)) = self.open.take() else {
+        let Some((segno, mut file)) = self.open.take() else {
             return Ok(());
         };
+        file.flush().await?;
         file.sync_data().await?;
         fs::rename(self.partial_path(segno), self.path(segno)).await?;
         sync_dir(&self.dir).await?;
@@ -332,6 +337,7 @@ pub(crate) async fn write_durably(dir: &Path, name: &str, contents: &[u8]) -> io
     let tmp = dir.join(format!("{name}.tmp"));
     let mut file = File::create(&tmp).await?;
     file.write_all(contents).await?;
+    file.flush().await?;
     file.sync_all().await?;
     fs::rename(&tmp, dir.join(name)).await?;
     sync_dir(dir).await

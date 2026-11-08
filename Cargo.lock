@@ -766,6 +766,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "libc",
  "pgwal",
  "postgres-protocol",
  "quick-xml",

@@ -54,6 +54,7 @@ sha2 = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-postgres = { workspace = true }

@@ -34,6 +34,8 @@ impl WalSink for DirSink {
         let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
         let mut file = fs::File::create(&tmp).await?;
         file.write_all(&data).await?;
+        // The write ends on a blocking thread: only a flush gives its error.
+        file.flush().await?;
         file.sync_all().await?;
         fs::rename(&tmp, &path).await?;
         fs::File::open(dir).await?.sync_all().await
