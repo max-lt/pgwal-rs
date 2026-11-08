@@ -555,14 +555,15 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
     let label = pgwal::BackupLabel::read(&backup).unwrap().unwrap();
     let hba = std::fs::read(backup.join("pg_hba.conf")).unwrap();
     // The private servers of rebase and verify must not run the archiving
-    // of the copy.
+    // of the copy, nor wait for its synchronous standby.
     let archived = setup.path("archived");
     let auto_conf = backup.join("postgresql.auto.conf");
     let conf = std::fs::read_to_string(&auto_conf).unwrap_or_default();
     std::fs::write(
         &auto_conf,
         format!(
-            "{conf}archive_mode = on\narchive_command = 'touch {}'\n",
+            "{conf}archive_mode = on\narchive_command = 'touch {}'\n\
+             synchronous_standby_names = 'pgwal'\n",
             archived.display()
         ),
     )
@@ -631,6 +632,68 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
         .map(|row| (row.get(0), row.get(1)))
         .unwrap();
     assert_eq!((rows, sum), (ROWS, ROWS * (ROWS + 1) / 2));
+}
+
+/// The primary raised max_connections after the copy. The replay pauses on
+/// the change, and the rebase starts its server again with the new value.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebase_crosses_a_raise_of_max_connections() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let setup = Setup::new(bin);
+    let receiver = setup.receiver();
+    let client = setup.client().await;
+    setup.wait_for_slot(&client).await;
+    run(
+        &setup.bin,
+        "pg_basebackup",
+        &[
+            "-h",
+            path(setup.root.path()),
+            "-p",
+            &setup.port.to_string(),
+            "-U",
+            "postgres",
+            "-D",
+            path(&setup.path("backup")),
+            "-X",
+            "none",
+            "-c",
+            "fast",
+        ],
+    );
+    client
+        .batch_execute("ALTER SYSTEM SET max_connections = 150")
+        .await
+        .unwrap();
+    drop(client);
+    setup.stop("data");
+    setup.start("data");
+    let client = setup.client().await;
+    setup.wait_for_slot(&client).await;
+    client
+        .batch_execute(
+            "CREATE TABLE t AS SELECT generate_series(1, 1000) AS i; \
+             CHECKPOINT; SELECT pg_switch_wal()",
+        )
+        .await
+        .unwrap();
+    drop(client);
+    setup.stop_with(receiver);
+
+    let out = setup.rebase();
+    assert!(
+        out.status.success(),
+        "pgwal rebase failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("starting again"),
+        "no restart after the pause:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// `pgwal plan` keeps the keys after the start of the copy, with their

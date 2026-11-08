@@ -1,11 +1,14 @@
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use pgwal::{AfterReplay, ClusterState, ControlFile, Lsn};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
 use crate::archive::ArchiveArgs;
@@ -91,50 +94,83 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
 /// Starts the server, waits for the replay to reach `end`, and stops it.
 /// Returns the replay position.
 fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
-    let server = start_server(pg, &args.pgdata, socket, &args.pg.user, Role::Standby)?;
-    let log = server.log();
-
+    let interrupted = interrupted();
     let stall = Duration::from_secs(args.stall_seconds);
-    let mut last = (Lsn(0), Instant::now());
-    let reached = loop {
-        let lsn = match server
-            .query("SELECT pg_last_wal_replay_lsn()")
-            .and_then(|out| {
-                out.parse()
-                    .map_err(|e| anyhow::anyhow!("pg_last_wal_replay_lsn: {e}"))
-            }) {
-            Ok(lsn) => lsn,
-            Err(e)
-                if pg
-                    .run("pg_ctl", &["-D", path(&args.pgdata), "status"])
-                    .is_err() =>
-            {
-                bail!("Postgres stopped during the replay: {e}\n{}", tail(&log));
+    let mut restarts = 0;
+    'server: loop {
+        let server = start_server(pg, &args.pgdata, socket, &args.pg.user, Role::Standby)?;
+        let mut last = (Lsn(0), Instant::now());
+        loop {
+            if interrupted.load(Ordering::SeqCst) {
+                bail!("interrupted");
             }
-            Err(e) => return Err(e),
+            let lsn = match server.replay_lsn() {
+                Ok(lsn) => lsn,
+                Err(e) => {
+                    if pg
+                        .run("pg_ctl", &["-D", path(&args.pgdata), "status"])
+                        .is_err()
+                    {
+                        bail!(
+                            "Postgres stopped during the replay: {e}\n{}",
+                            tail(&server.log())
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+            if lsn >= end {
+                server.stop()?;
+                return Ok(lsn);
+            }
+            if lsn != last.0 {
+                last = (lsn, Instant::now());
+            } else if last.1.elapsed() >= stall {
+                let paused = server.query("SELECT pg_get_wal_replay_pause_state()")?;
+                if paused == "not paused" {
+                    warn!(
+                        replayed = %lsn,
+                        archive_end = %end,
+                        "the replay stands still before the end of the archive: the last object ends inside a record"
+                    );
+                    server.stop()?;
+                    return Ok(lsn);
+                }
+                // A setting raised on the primary pauses the replay. The
+                // replay wrote the new value into pg_control, and the next
+                // start passes it.
+                if restarts == MAX_RESTARTS {
+                    bail!("the replay is {paused} at {lsn}:\n{}", tail(&server.log()));
+                }
+                restarts += 1;
+                warn!(replayed = %lsn, "the replay paused: starting again with the settings of pg_control");
+                server.stop()?;
+                continue 'server;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+/// Starts of the rebase server after a pause on a setting.
+const MAX_RESTARTS: u32 = 3;
+
+/// Becomes true on Ctrl-C or SIGTERM. The process then stops its private
+/// server and removes its files before it exits.
+fn interrupted() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let set = flag.clone();
+    tokio::spawn(async move {
+        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+            return;
         };
-        if lsn >= end {
-            break lsn;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
         }
-        if lsn != last.0 {
-            last = (lsn, Instant::now());
-        } else if last.1.elapsed() >= stall {
-            // Recovery pauses on a setting lower than on the primary.
-            let paused = server.query("SELECT pg_get_wal_replay_pause_state()")?;
-            if paused != "not paused" {
-                bail!("the replay is {paused} at {lsn}:\n{}", tail(&log));
-            }
-            warn!(
-                replayed = %lsn,
-                archive_end = %end,
-                "the replay stands still before the end of the archive: the last object ends inside a record"
-            );
-            break lsn;
-        }
-        std::thread::sleep(POLL);
-    };
-    server.stop()?;
-    Ok(reached)
+        set.store(true, Ordering::SeqCst);
+    });
+    flag
 }
 
 #[derive(Args, Debug)]
@@ -171,12 +207,11 @@ pub fn run_verify(args: VerifyArgs) -> Result<()> {
 /// would end its recovery and write WAL of its own.
 pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
     restore::refuse_running(pgdata)?;
+    let interrupted = interrupted();
     let t = Instant::now();
     let data = pg.run("pg_controldata", &[path(pgdata)])?;
-    let checksums = data
-        .lines()
-        .find_map(|line| line.strip_prefix("Data page checksum version:"))
-        .is_some_and(|version| version.trim() != "0");
+    let checksums = controldata_field(&data, "Data page checksum version")
+        .is_some_and(|version| version != "0");
     if checksums {
         pg.run("pg_checksums", &["--check", "-D", path(pgdata)])
             .context("the page checksums of the copy are wrong")?;
@@ -192,6 +227,9 @@ pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
     let result = amcheck(pg, pgdata, &scratch, &socket, user);
     let _ = std::fs::remove_dir_all(&scratch);
     let _ = std::fs::remove_dir_all(&socket);
+    if interrupted.load(Ordering::SeqCst) {
+        bail!("interrupted");
+    }
     result?;
     info!(
         checksums,
@@ -203,6 +241,11 @@ pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
 
 /// Runs `pg_amcheck` on a scratch copy of `pgdata`, served on `socket`.
 fn amcheck(pg: &Bin, pgdata: &Path, scratch: &Path, socket: &Path, user: &str) -> Result<()> {
+    // Another user must not get the copy through a directory made first.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(scratch)
+        .with_context(|| format!("creating {}", scratch.display()))?;
     copy_dir(pgdata, scratch)?;
     for signal in ["standby.signal", "recovery.signal"] {
         let _ = std::fs::remove_file(scratch.join(signal));
@@ -264,28 +307,29 @@ fn start_server<'a>(
     let mut opts = format!(
         "-c listen_addresses= -k {dir_name} -p {PORT} -c unix_socket_permissions=0700 \
          -c hba_file={dir_name}/pg_hba.conf -c hot_standby=on -c archive_mode=off \
-         -c primary_conninfo= -c primary_slot_name= -c logging_collector=off"
+         -c archive_cleanup_command= -c recovery_end_command= -c primary_conninfo= \
+         -c primary_slot_name= -c synchronous_standby_names= \
+         -c max_logical_replication_workers=0 -c logging_collector=off"
     );
     // A scratch primary runs no job of the extensions of the copy.
     if role == Role::Scratch {
         opts.push_str(" -c shared_preload_libraries=");
     }
-    // A copy of a Debian primary has no postgresql.conf. The settings that a
-    // standby needs at least as high as on the primary come from pg_control.
+    // A copy of a Debian primary has no postgresql.conf.
     if !pgdata.join("postgresql.conf").exists() {
         std::fs::write(dir.join("postgresql.conf"), "")?;
         std::fs::write(dir.join("pg_ident.conf"), "")?;
         opts.push_str(&format!(
             " -c config_file={dir_name}/postgresql.conf -c ident_file={dir_name}/pg_ident.conf"
         ));
-        let data = pg.run("pg_controldata", &[path(pgdata)])?;
-        for (field, setting) in PRIMARY_SETTINGS {
-            let value = data
-                .lines()
-                .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
-                .with_context(|| format!("pg_controldata has no {field}"))?;
-            opts.push_str(&format!(" -c {setting}={}", value.trim()));
-        }
+    }
+    // The settings that a standby needs at least as high as on the primary
+    // come from pg_control, which holds the newest values the replay saw.
+    let data = pg.run("pg_controldata", &[path(pgdata)])?;
+    for (field, setting) in PRIMARY_SETTINGS {
+        let value = controldata_field(&data, field)
+            .with_context(|| format!("pg_controldata has no {field}"))?;
+        opts.push_str(&format!(" -c {setting}={value}"));
     }
     let server = Server {
         pg,
@@ -315,7 +359,14 @@ fn start_server<'a>(
     Ok(server)
 }
 
-/// How long `pg_ctl start` waits. It stops waiting when the server exits.
+/// The value of `field` in the output of `pg_controldata`.
+fn controldata_field<'a>(data: &'a str, field: &str) -> Option<&'a str> {
+    data.lines()
+        .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+        .map(str::trim)
+}
+
+/// How long `pg_ctl start` and `pg_ctl stop` wait. It stops waiting when the server exits.
 const START_TIMEOUT_SECONDS: &str = "86400";
 
 /// The `pg_controldata` field of each setting a standby needs at least as
@@ -414,6 +465,12 @@ impl Server<'_> {
         self.dir.join("postgres.log")
     }
 
+    fn replay_lsn(&self) -> Result<Lsn> {
+        self.query("SELECT pg_last_wal_replay_lsn()")?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("pg_last_wal_replay_lsn: {e}"))
+    }
+
     /// The one value that `sql` returns.
     fn query(&self, sql: &str) -> Result<String> {
         let out = self.pg.run(
@@ -443,7 +500,20 @@ impl Server<'_> {
         let pg = self.pg;
         let pgdata = self.pgdata;
         std::mem::forget(self);
-        pg.run("pg_ctl", &["-D", path(pgdata), "-m", "fast", "-w", "stop"])?;
+        // The restartpoint of the stop can write every dirty buffer.
+        pg.run(
+            "pg_ctl",
+            &[
+                "-D",
+                path(pgdata),
+                "-m",
+                "fast",
+                "-t",
+                START_TIMEOUT_SECONDS,
+                "-w",
+                "stop",
+            ],
+        )?;
         Ok(())
     }
 }

@@ -99,8 +99,12 @@ pg_ctl -D /restore/data start
   it.
 - `pgwal restore` writes the archived WAL that follows the copy into its
   `pg_wal`. Postgres replays it at its next start.
-- The archive must hold the WAL from `START WAL LOCATION` of `backup_label`,
-  or from the redo point of `pg_control` without a label.
+- The archive must hold the WAL from the start of the segment that holds
+  `START WAL LOCATION` of `backup_label`, or the redo point of `pg_control`
+  without a label. Postgres reads that segment from its first page. A copy
+  whose `pg_wal` holds that segment needs the WAL from the LSN itself.
+- A timeline needs its WAL up to its switch point only. The command reads the
+  switch points in the newest history file of the archive.
 - A base backup, or a copy after a clean stop, replays as an archive
   recovery, then promotes to a new timeline. The command follows the
   timelines of the archive.
@@ -179,15 +183,18 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   fails.
 - The server listens on a socket in a directory that only the user of the
   command can enter, and trusts local connections there. The `pg_hba.conf`
-  of the copy stays as it is. The server archives nothing and connects to no
-  primary, whatever the settings of the copy say.
-- A replay that pauses, as on a setting lower than on the primary, is an
-  error.
+  of the copy stays as it is. The server archives nothing, cleans no archive,
+  connects to no primary and waits for no synchronous standby, whatever the
+  settings of the copy say.
+- The settings that a standby needs at least as high as on the primary, such
+  as `max_connections`, come from `pg_control`. When the primary raised one
+  after the copy, the replay pauses, and the command starts the server again
+  with the new value. A pause for another reason is an error.
+- Ctrl-C or SIGTERM stops the server and removes its files.
 - After the rebase, the copy has no `backup_label.old` and no
   `backup_manifest`: they describe the copy before the rebase.
 - A copy without `postgresql.conf`, such as a copy of a Debian primary,
-  starts with the settings that `pg_control` holds and the defaults for the
-  rest.
+  starts with the defaults and the settings of `pg_control`.
 - The command runs as the owner of the data directory, not as root.
 
 `pgwal verify` checks a stopped copy:
@@ -198,7 +205,8 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   copy, because a server on the copy itself would end its recovery and write
   WAL of its own. The scratch copy holds the targets of the links of the
   copy, uses file clones where the file system has them, and goes away at
-  the end. It archives nothing and loads no `shared_preload_libraries`.
+  the end. It archives nothing, loads no `shared_preload_libraries` and
+  starts no logical replication worker.
 
 `pgwal plan` reads archive keys on stdin and prints the ones that a restore
 or a rebase of a copy reads. Fetch only these from object storage:

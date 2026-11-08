@@ -6,7 +6,7 @@ use clap::Args;
 use futures_util::{StreamExt, TryStreamExt};
 use pgwal::{
     AfterReplay, ArchiveKey, Lsn, Origin, Recovery, ReplayStart, plan, request_recovery,
-    write_history, write_segment,
+    timeline_switches, write_history, write_segment,
 };
 use tracing::{info, warn};
 
@@ -83,7 +83,8 @@ pub fn run_plan(args: PlanArgs) -> Result<()> {
     let keys = lines
         .iter()
         .filter_map(|line| line.strip_prefix(&args.prefix));
-    let plan = plan(keys, &start);
+    // A plan from keys only: it does not read the switch points.
+    let plan = plan(keys, &start, &[]);
     if let Some(gap) = plan.gap {
         warn!(%gap, "the archive has a gap: a restore stops there");
     }
@@ -119,7 +120,8 @@ pub async fn apply(
     let start = replay_start(pgdata)?;
 
     let keys = archive.list("").await?;
-    let plan = plan(keys.iter().map(String::as_str), &start);
+    let switches = switches(archive, &keys, start.system_id).await?;
+    let plan = plan(keys.iter().map(String::as_str), &start, &switches);
     if let Some(gap) = plan.gap {
         if on_gap == OnGap::Refuse {
             bail!("the archive has a gap at {gap}; --accept-gap restores up to it");
@@ -185,6 +187,35 @@ pub async fn apply(
         "WAL written to pg_wal; start Postgres to replay it"
     );
     Ok(end.unwrap_or(start.from))
+}
+
+/// The lines of the newest history file of `system_id` in the archive.
+async fn switches(
+    archive: &dyn WalSink,
+    keys: &[String],
+    system_id: u64,
+) -> Result<Vec<(u32, Lsn)>> {
+    let newest = keys
+        .iter()
+        .filter_map(|key| match ArchiveKey::parse(key)? {
+            ArchiveKey::History {
+                system_id: system,
+                timeline,
+            } if system == system_id => Some(timeline),
+            _ => None,
+        })
+        .max();
+    let Some(timeline) = newest else {
+        return Ok(Vec::new());
+    };
+    let key = ArchiveKey::History {
+        system_id,
+        timeline,
+    };
+    let history = archive::read(archive, &key.to_string()).await?;
+    let history = String::from_utf8(history.to_vec())
+        .with_context(|| format!("archived object {key} is not text"))?;
+    Ok(timeline_switches(&history))
 }
 
 /// Refuses a data directory where Postgres runs.
