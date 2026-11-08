@@ -40,6 +40,18 @@ struct S3Args {
     s3_ca_file: Option<PathBuf>,
 }
 
+/// Adds the keys of a new listing of `prefix` to `keys`. A listing during a
+/// compaction of receive can miss both the whole segment, put behind its
+/// cursor, and the parts it deletes ahead of it: the archive looks to have
+/// a gap. A listing that starts after the first one ends sees the whole
+/// segment.
+pub async fn list_again(archive: &dyn WalSink, prefix: &str, keys: &mut Vec<String>) -> Result<()> {
+    keys.extend(archive.list(prefix).await?);
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(())
+}
+
 /// The object at `key`, which must be there.
 pub async fn read(archive: &dyn WalSink, key: &str) -> Result<Bytes> {
     archive

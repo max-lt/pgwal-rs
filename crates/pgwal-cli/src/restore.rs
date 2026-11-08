@@ -135,9 +135,18 @@ pub async fn apply(
 pub async fn prepare(archive: &dyn WalSink, pgdata: &Path) -> Result<Prepared> {
     refuse_running(pgdata)?;
     let start = replay_start(pgdata)?;
-    let keys = archive.list("").await?;
-    let switches = switches(archive, &keys, start.system_id).await?;
-    let plan = plan(keys.iter().map(String::as_str), &start, &switches);
+    let prefix = ArchiveKey::wal_prefix(start.system_id);
+    let mut keys = archive.list(&prefix).await?;
+    let mut listed_again = false;
+    let plan = loop {
+        let switches = switches(archive, &keys, start.system_id).await?;
+        let plan = plan(keys.iter().map(String::as_str), &start, &switches);
+        if plan.gap.is_none() || listed_again {
+            break plan;
+        }
+        archive::list_again(archive, &prefix, &mut keys).await?;
+        listed_again = true;
+    };
     // The archive holds the segment of the start of any copy that it serves.
     // An empty plan is the archive of another cluster, or a wrong location.
     if plan.segments.is_empty() {
@@ -189,6 +198,9 @@ async fn segment_objects(
         })
         .with_context(|| format!("the archive lost WAL from {} to {}", first.start, last.end))?;
     let wal = archive::read(archive, &whole.to_string()).await?;
+    if wal.len() as u64 != whole.end.0 - whole.start.0 {
+        bail!("archived object {whole} holds {} bytes", wal.len());
+    }
     // The replay ends where the plan says.
     let at = |lsn: Lsn| (lsn.0 - whole.start.0) as usize;
     let wal = wal.slice(at(first.start)..at(last.end));
@@ -342,5 +354,12 @@ mod tests {
             keys: vec![range(2 * SEG, 2 * SEG + 100)],
         };
         assert!(segment_objects(&archive, &gone, SEG).await.is_err());
+
+        archive
+            .put(&whole.to_string(), Bytes::from_static(b"short"))
+            .await
+            .unwrap();
+        let err = segment_objects(&archive, &segment, SEG).await.unwrap_err();
+        assert!(err.to_string().contains("holds 5 bytes"), "{err}");
     }
 }

@@ -153,6 +153,13 @@ impl std::fmt::Display for ArchiveKey {
 }
 
 impl ArchiveKey {
+    /// The prefix of the WAL ranges and the history files of a system, and
+    /// of none of its base backups. It holds the first digit of the
+    /// timeline: a timeline stays below 0x10000000.
+    pub fn wal_prefix(system_id: u64) -> String {
+        format!("{system_id}/0")
+    }
+
     /// The prefix of every object of the base backup that starts at `start`.
     pub fn backup_prefix(system_id: u64, start: Lsn) -> String {
         format!("{system_id}/base/{:016X}/", start.0)

@@ -65,8 +65,8 @@ pub struct FetchArgs {
 /// prints its start LSN. Then `pgwal restore` writes the WAL.
 pub async fn run_fetch(args: FetchArgs) -> Result<()> {
     let archive = args.archive.open()?;
-    let keys = archive.list("").await?;
-    let backup = latest(archive.as_ref(), &keys, args.system_id).await?;
+    let mut keys = archive.list("").await?;
+    let backup = latest(archive.as_ref(), &mut keys, args.system_id).await?;
     if !backup.tablespaces.is_empty() {
         bail!(
             "the backup at {} has tablespaces, and pgwal fetch writes the data directory only",
@@ -96,7 +96,7 @@ pub async fn run_fetch(args: FetchArgs) -> Result<()> {
 
 async fn latest(
     archive: &dyn WalSink,
-    keys: &[String],
+    keys: &mut Vec<String>,
     system_id: Option<u64>,
 ) -> Result<ArchivedBackup> {
     let mut found: Vec<(u64, Lsn)> = keys
@@ -112,6 +112,7 @@ async fn latest(
         bail!("the archive holds backups of the systems {systems:?}: choose one with --system-id");
     }
     found.sort();
+    let mut listed_again = false;
     for (system, start) in found.into_iter().rev() {
         let key = ArchiveKey::BackupDone {
             system_id: system,
@@ -124,6 +125,10 @@ async fn latest(
             .and_then(ArchivedBackup::parse)
             .filter(|b| (b.system_id, b.start) == (system, start))
             .with_context(|| format!("unreadable {key}"))?;
+        if !covered(keys, &backup) && !listed_again {
+            archive::list_again(archive, "", keys).await?;
+            listed_again = true;
+        }
         if covered(keys, &backup) {
             return Ok(backup);
         }
@@ -254,6 +259,61 @@ mod tests {
             end: Lsn(end),
         }
         .to_string()
+    }
+
+    /// Misses `hidden` in its first listing, as a listing during a
+    /// compaction can.
+    struct FirstListMisses {
+        sink: pgwal_receiver::DirSink,
+        hidden: String,
+        listed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl WalSink for FirstListMisses {
+        async fn put(&self, key: &str, data: Bytes) -> io::Result<()> {
+            self.sink.put(key, data).await
+        }
+
+        async fn get(&self, key: &str) -> io::Result<Option<Bytes>> {
+            self.sink.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+            let mut keys = self.sink.list(prefix).await?;
+            if !self.listed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                keys.retain(|key| *key != self.hidden);
+            }
+            Ok(keys)
+        }
+
+        async fn delete(&self, keys: &[String]) -> io::Result<()> {
+            self.sink.delete(keys).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_misses_wal_is_listed_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = FirstListMisses {
+            sink: pgwal_receiver::DirSink::new(tmp.path()),
+            hidden: range(1, 0x40, 0x90),
+            listed: Default::default(),
+        };
+        let backup = backup(0x30, 0x60);
+        let done = ArchiveKey::BackupDone {
+            system_id: 7,
+            start: backup.start,
+        };
+        for (key, data) in [
+            (done.to_string(), backup.to_text()),
+            (range(1, 0x00, 0x40), String::new()),
+            (range(1, 0x40, 0x90), String::new()),
+        ] {
+            archive.put(&key, data.into()).await.unwrap();
+        }
+        let mut keys = archive.list("").await.unwrap();
+        assert_eq!(latest(&archive, &mut keys, None).await.unwrap(), backup);
     }
 
     #[test]

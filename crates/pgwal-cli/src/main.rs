@@ -225,22 +225,17 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
                 info!(%lsn, "the server ended the stream");
                 backoff = MIN_BACKOFF;
             }
-            Err(e @ Error::WalGone { .. }) => {
+            Err(e) if fatal(&e) => {
                 final_upload(&cfg, &sink).await.context(e.to_string())?;
-                bail!(
-                    "{e}. The archive has the WAL of the store, up to a gap. To go on, drop \
-                     the slot {} with pg_drop_replication_slot, empty {}, start receive \
-                     again, and take a new base backup",
-                    cfg.slot,
-                    cfg.dir.display()
-                )
-            }
-            Err(e @ (Error::Config(_) | Error::SystemMismatch { .. })) => {
-                final_upload(&cfg, &sink).await.context(e.to_string())?;
-                bail!(e)
-            }
-            Err(Error::Io(e)) if e.get_ref().is_some_and(|e| e.is::<tls::TlsRefused>()) => {
-                final_upload(&cfg, &sink).await.context(e.to_string())?;
+                if matches!(e, Error::WalGone { .. }) {
+                    bail!(
+                        "{e}. The archive has the WAL of the store, up to a gap. To go on, \
+                         drop the slot {} with pg_drop_replication_slot, empty {}, start \
+                         receive again, and take a new base backup",
+                        cfg.slot,
+                        cfg.dir.display()
+                    )
+                }
                 bail!(e)
             }
             Err(e) if *stop.borrow() => {
@@ -254,6 +249,15 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
             _ = stop.wait_for(|stopped| *stopped) => return final_upload(&cfg, &sink).await,
         }
         backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// An error that every retry meets again.
+fn fatal(e: &Error) -> bool {
+    match e {
+        Error::WalGone { .. } | Error::Config(_) | Error::SystemMismatch { .. } => true,
+        Error::Io(e) => e.get_ref().is_some_and(|e| e.is::<tls::TlsRefused>()),
+        _ => false,
     }
 }
 
