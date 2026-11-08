@@ -12,8 +12,6 @@ use crate::error::Error;
 use crate::upload::WalSink;
 use crate::wire::{BackupMessage, Conn, ConnConfig};
 
-const PART_SIZE: usize = crate::MAX_OBJECT;
-
 const MANIFEST: &str = "backup_manifest";
 
 /// Takes a base backup of the server behind `stream`, without its WAL, and
@@ -130,8 +128,8 @@ impl Parts {
             return Err(Error::Protocol("BASE_BACKUP: data before a file".into()));
         }
         self.buf.extend_from_slice(&data);
-        while self.buf.len() >= PART_SIZE {
-            let part = self.buf.split_to(PART_SIZE).freeze();
+        while self.buf.len() >= crate::MAX_OBJECT {
+            let part = self.buf.split_to(crate::MAX_OBJECT).freeze();
             self.put(part).await?;
         }
         Ok(())

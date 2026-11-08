@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use pgwal::{ArchiveKey, Lsn, timeline_start};
+use pgwal::{ArchiveKey, Lsn, timeline_start, timeline_switches};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -39,7 +39,8 @@ pub enum Confirm {
     /// the WAL of one upload interval.
     Flushed,
     /// Once the WAL is in the sink. A receiver on another host with an empty
-    /// store starts at the slot and loses nothing.
+    /// store loses nothing: it starts at the slot, or on a later timeline at
+    /// its switch point.
     Uploaded,
 }
 
@@ -94,62 +95,79 @@ where
         .await?;
     }
 
-    // After a failover, the WAL of the old timeline goes up before its files
-    // go.
-    if let Some((timeline, _)) = read_flushed(&cfg.dir).await?
-        && timeline != system.timeline
-    {
-        salvage(&cfg.dir, sink.clone()).await?;
-        remove_other_timelines(&cfg.dir, system.timeline, seg_size).await?;
-    }
-    let mut store =
-        WalStore::open(cfg.dir.clone(), system.system_id, system.timeline, seg_size).await?;
-    // Nothing local on a later timeline: start at its switch point, not at the
-    // slot. A slot created after a promotion would leave the first WAL of the
-    // timeline out of the archive.
+    // After a failover, the old timeline goes on up to its end, which the
+    // new server still holds when this receiver lagged behind it. Then its
+    // WAL goes up before its files go, and the next timeline starts there.
+    let (timeline, begins_at) = match read_flushed(&cfg.dir).await? {
+        Some((old, flushed)) if old != system.timeline => {
+            let switches = history
+                .as_deref()
+                .map(timeline_switches)
+                .unwrap_or_default();
+            match switches.iter().position(|(tl, _)| *tl == old) {
+                Some(at) if flushed < switches[at].1 => (old, Some(flushed)),
+                Some(at) => {
+                    let next = switches.get(at + 1).map_or(system.timeline, |(tl, _)| *tl);
+                    salvage(&cfg.dir, sink.clone()).await?;
+                    remove_other_timelines(&cfg.dir, next, seg_size).await?;
+                    (next, Some(switches[at].1))
+                }
+                // Another branch of the history: its WAL goes up, and the
+                // stream follows the server.
+                None => {
+                    salvage(&cfg.dir, sink.clone()).await?;
+                    remove_other_timelines(&cfg.dir, system.timeline, seg_size).await?;
+                    (system.timeline, None)
+                }
+            }
+        }
+        _ => (system.timeline, None),
+    };
+    // A later timeline with nothing local starts where it begins, not at the
+    // slot. A slot created after a promotion would leave the first WAL of
+    // the timeline out of the archive.
+    let begin =
+        begins_at.or((timeline == system.timeline && history.is_some()).then_some(switch_point));
+
+    let mut store = WalStore::open(cfg.dir.clone(), system.system_id, timeline, seg_size).await?;
     let resumed = match store.resume_point().await? {
         Some(lsn) => Some(lsn),
-        None => read_watermark(&cfg.dir, system.timeline)
+        None => read_watermark(&cfg.dir, timeline)
             .await?
-            .map(|uploaded| uploaded.max(switch_point)),
+            .map(|uploaded| uploaded.max(begin.unwrap_or_default())),
     };
-    let first_wal_can_be_gone = resumed.is_none() && history.is_some();
-    let mut start = match resumed {
+    let first_wal_can_be_gone = resumed.is_none() && begin.is_some() && timeline == system.timeline;
+    let mut start = match resumed.or(begin) {
         Some(lsn) => lsn,
-        None if history.is_some() => switch_point,
         None => slot_position(&mut conn, &cfg.slot, system.xlogpos).await?,
     }
     .segment_start(seg_size);
-    match conn
-        .start_replication(&cfg.slot, start, system.timeline)
-        .await
-    {
+    match conn.start_replication(&cfg.slot, start, timeline).await {
         // A timeline that began long ago can have lost its first WAL. The
         // slot position is then the earliest WAL left.
         Err(Error::WalGone { .. }) if first_wal_can_be_gone => {
             let fallback = slot_position(&mut conn, &cfg.slot, system.xlogpos)
                 .await?
-                .max(switch_point)
+                .max(begin.unwrap_or_default())
                 .segment_start(seg_size);
             warn!(%start, %fallback, "the first WAL of the timeline is gone; its archive starts later");
             start = fallback;
-            conn.start_replication(&cfg.slot, start, system.timeline)
-                .await?;
+            conn.start_replication(&cfg.slot, start, timeline).await?;
         }
         other => other?,
     }
     store.start_at(start);
-    info!(slot = %cfg.slot, system_id = system.system_id, timeline = system.timeline, %start, "streaming WAL");
+    info!(slot = %cfg.slot, system_id = system.system_id, timeline, %start, "streaming WAL");
 
     // Finished segments before the start can wait for their upload: a dead
     // run with the sink down leaves them.
-    let first = first_segment(&cfg.dir, system.timeline)
+    let first = first_segment(&cfg.dir, timeline)
         .await?
         .map_or(start, |(lsn, _)| lsn.min(start));
     let uploader = Uploader::new(
         cfg.dir.clone(),
         system.system_id,
-        system.timeline,
+        timeline,
         seg_size,
         sink,
         first,
@@ -245,8 +263,13 @@ where
                 continue;
             }
             () = confirmed.upload_ended(), if confirmed.confirm == Confirm::Uploaded => {
-                conn.send_status(store.written(), confirmed.position(flushed), SystemTime::now())
-                    .await?;
+                // As below, the read side decides how the stream ended.
+                if let Err(e) = conn
+                    .send_status(store.written(), confirmed.position(flushed), SystemTime::now())
+                    .await
+                {
+                    debug!(error = %e, "status update not delivered");
+                }
                 continue;
             }
             msg = conn.next_message() => msg?,
@@ -320,8 +343,10 @@ enum Drain {
 }
 
 /// Drops `slot` on the server behind `stream`, if it exists. After an
-/// [`Error::WalGone`], call it and clear the store directory: the next
-/// [`receive`] creates the slot again and starts at the server's position.
+/// [`Error::WalGone`], call [`salvage`], then this, then clear the store
+/// directory: the next [`receive`] creates the slot again and starts at the
+/// server's position. Without the salvage, the flushed WAL that is not in
+/// the sink goes with the directory.
 pub async fn forget_slot<S>(stream: S, conn: &ConnConfig, slot: &str) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,

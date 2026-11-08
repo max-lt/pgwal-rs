@@ -644,10 +644,12 @@ async fn a_restart_uploads_the_finished_segments_that_a_dead_run_kept() {
     sink.assert_tiles(Lsn(SEG), end);
 }
 
-/// A failover while the sink is down: the run on the new timeline first
-/// uploads the WAL of the old one, then removes its files.
+/// A failover while the sink is down and the receiver lags behind the new
+/// server. The next run streams the old timeline up to its end from the new
+/// server, and the run after it uploads that WAL, removes its files, and
+/// streams the new timeline.
 #[tokio::test]
-async fn a_failover_uploads_then_removes_the_old_timeline() {
+async fn a_failover_archives_the_old_timeline_up_to_its_end() {
     let tmp = tempfile::tempdir().unwrap();
     let (client, server) = tokio::io::duplex(4 << 20);
     let mut server = Walsender {
@@ -664,31 +666,50 @@ async fn a_failover_uploads_then_removes_the_old_timeline() {
         )
         .await
     });
+    let switch = Lsn(0x300A00);
+    let old_wal = pattern((switch.0 - SEG) as usize, 3);
     server.open().await;
     server.start(Some(Lsn(SEG))).await;
-    let old_end = server.stream(Lsn(SEG), &pattern(4096, 3)).await;
-    server.await_flush(old_end).await;
+    let lagged = server.stream(Lsn(SEG), &old_wal[..4096]).await;
+    server.await_flush(lagged).await;
     drop(server);
     assert!(finish(task).await.is_err(), "the run dies");
 
     let sink = Arc::new(MemSink::default());
     let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
     server.open_on(2).await;
-    server.start(None).await;
+    let query = server.start(None).await;
+    assert!(query.ends_with("PHYSICAL 0/100000 TIMELINE 1"), "{query}");
+    let old_end = server.stream(Lsn(SEG), &old_wal).await;
+    assert_eq!(old_end, switch);
+    server.await_flush(old_end).await;
+    server.end().await;
+    assert_eq!(finish(task).await.unwrap(), switch);
+
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    let query = server.start(None).await;
+    assert!(query.ends_with("PHYSICAL 0/300000 TIMELINE 2"), "{query}");
     let end = server.stream(Lsn(3 * SEG), &pattern(4096, 0)).await;
     server.await_flush(end).await;
     server.end().await;
-
     assert_eq!(finish(task).await.unwrap(), end);
-    let old: Vec<RangeKey> = sink
+
+    let ranges: Vec<RangeKey> = sink
         .0
         .lock()
         .unwrap()
         .keys()
         .filter_map(|key| RangeKey::parse(key))
-        .filter(|key| key.timeline == 1)
         .collect();
-    assert_eq!((old[0].start, old.last().unwrap().end), (Lsn(SEG), old_end));
+    for (timeline, from, to) in [(1, Lsn(SEG), switch), (2, Lsn(3 * SEG), end)] {
+        let mut at = from;
+        for range in ranges.iter().filter(|r| r.timeline == timeline) {
+            assert!(range.start <= at, "a gap on timeline {timeline} at {at}");
+            at = at.max(range.end);
+        }
+        assert_eq!(at, to, "timeline {timeline}");
+    }
     let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())

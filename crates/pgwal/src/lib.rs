@@ -10,7 +10,7 @@ mod lsn;
 mod plan;
 
 pub use apply::{AfterReplay, request_recovery, segment_size, write_history, write_segment};
-pub use archive::{ArchiveKey, RangeKey, assemble_segment, history_file_name, timeline_start};
+pub use archive::{ArchiveKey, RangeKey, assemble_segment, timeline_start, timeline_switches};
 pub use backup::{ArchivedBackup, BackupLabel};
 pub use control::{ClusterState, ControlFile};
 pub use lsn::{Lsn, ParseLsnError, parse_segment_file_name, segment_file_name};

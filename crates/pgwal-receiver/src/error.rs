@@ -14,7 +14,7 @@ pub enum Error {
     Store(String),
     /// One directory per cluster.
     #[error("store holds WAL of system {found}, not {expected}")]
-    SystemMismatch { found: String, expected: String },
+    SystemMismatch { found: u64, expected: u64 },
     /// The server no longer has the WAL from `requested`: its slot was
     /// invalidated, or the segment was removed. The archive has a gap.
     #[error("the server no longer has the WAL from {requested}: {message}")]

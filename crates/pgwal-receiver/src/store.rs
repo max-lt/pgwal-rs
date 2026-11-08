@@ -45,15 +45,17 @@ impl WalStore {
     ) -> Result<Self, Error> {
         fs::create_dir_all(&dir).await?;
         let lock = lock(&dir)?;
-        let expected = system_id.to_string();
-        match fs::read_to_string(dir.join(SYSTEM_ID_FILE)).await {
-            Ok(found) if found == expected => {}
-            Ok(found) => return Err(Error::SystemMismatch { found, expected }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                write_durably(&dir, SYSTEM_ID_FILE, expected.as_bytes()).await?;
+        match read_system_id(&dir).await? {
+            Some(found) if found == system_id => {}
+            Some(found) => {
+                return Err(Error::SystemMismatch {
+                    found,
+                    expected: system_id,
+                });
             }
-            Err(e) => return Err(e.into()),
+            None => write_durably(&dir, SYSTEM_ID_FILE, system_id.to_string().as_bytes()).await?,
         }
+
         let flushed_file = OpenOptions::new()
             .write(true)
             .create(true)

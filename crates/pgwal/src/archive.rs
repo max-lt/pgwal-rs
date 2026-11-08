@@ -97,7 +97,7 @@ pub(crate) fn overlay_segment(
 }
 
 /// The Postgres name of the history file of `timeline`.
-pub fn history_file_name(timeline: u32) -> String {
+pub(crate) fn history_file_name(timeline: u32) -> String {
     format!("{timeline:08X}.history")
 }
 
@@ -180,17 +180,26 @@ impl ArchiveKey {
     }
 }
 
-/// Where the timeline a history file describes begins: the switch point on
-/// its last line, such as `1\t0/3000148\tno recovery target specified`.
-pub fn timeline_start(history: &str) -> Option<Lsn> {
+/// The lines of a history file: each parent timeline, with the LSN where
+/// it ends, oldest first. `1\t0/3000148\tno recovery target specified`
+/// says that timeline 1 ends at 0/3000148.
+pub fn timeline_switches(history: &str) -> Vec<(u32, Lsn)> {
     history
         .lines()
-        .rfind(|line| !line.trim().is_empty() && !line.starts_with('#'))?
-        .split('\t')
-        .nth(1)?
-        .trim()
-        .parse()
-        .ok()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let timeline = fields.next()?.trim().parse().ok()?;
+            let end = fields.next()?.trim().parse().ok()?;
+            Some((timeline, end))
+        })
+        .collect()
+}
+
+/// Where the timeline a history file describes begins: the end of its
+/// parent.
+pub fn timeline_start(history: &str) -> Option<Lsn> {
+    timeline_switches(history).last().map(|(_, end)| *end)
 }
 
 #[cfg(test)]
@@ -305,6 +314,10 @@ mod tests {
     fn timeline_starts() {
         let history = "1\t0/3000148\tno recovery target specified\n\n2\t0/5000000\tno recovery target specified\n";
         assert_eq!(timeline_start(history), Some(Lsn(0x500_0000)));
+        assert_eq!(
+            timeline_switches(history),
+            [(1, Lsn(0x300_0148)), (2, Lsn(0x500_0000))]
+        );
         assert_eq!(timeline_start(""), None);
     }
 }
