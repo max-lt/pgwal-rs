@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
-use crate::{ArchiveKey, BackupLabel, ClusterState, ControlFile, Lsn, RangeKey, segment_size};
+use crate::{
+    ArchiveKey, BackupLabel, ClusterState, ControlFile, Lsn, RangeKey, segment_file_name,
+    segment_size,
+};
 
 /// How Postgres reaches the end of the replayed WAL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +50,10 @@ pub struct ReplayStart {
     pub from: Lsn,
     pub origin: Origin,
     pub seg_size: u64,
+    /// `pg_wal` of the copy holds the segment of `from`. Without it, the
+    /// archive must hold that segment from its first page, which Postgres
+    /// reads first.
+    pub has_start_segment: bool,
 }
 
 impl ReplayStart {
@@ -61,24 +68,24 @@ impl ReplayStart {
                 .and_then(BackupLabel::segment_size)
                 .ok_or(e)?,
         };
-        Ok(match label {
-            Some(label) => ReplayStart {
-                system_id: control.system_id,
-                timeline: label.timeline,
-                from: label.start,
-                origin: Origin::BaseBackup,
-                seg_size,
-            },
-            None => ReplayStart {
-                system_id: control.system_id,
-                timeline: control.timeline,
-                from: control.redo,
-                origin: match control.state {
+        let (timeline, from, origin) = match label {
+            Some(label) => (label.timeline, label.start, Origin::BaseBackup),
+            None => {
+                let origin = match control.state {
                     ClusterState::ShutDown | ClusterState::ShutDownInRecovery => Origin::ShutDown,
                     ClusterState::Running => Origin::Running,
-                },
-                seg_size,
-            },
+                };
+                (control.timeline, control.redo, origin)
+            }
+        };
+        let name = segment_file_name(timeline, from.segment_no(seg_size), seg_size);
+        Ok(ReplayStart {
+            system_id: control.system_id,
+            timeline,
+            from,
+            origin,
+            seg_size,
+            has_start_segment: data_dir.join("pg_wal").join(name).exists(),
         })
     }
 }
@@ -104,11 +111,16 @@ pub struct ReplayPlan {
 
 /// Plans the replay of the archive `keys` onto the copy that `start`
 /// describes: its timeline from the segment of `start.from`, then each
-/// later timeline. The replay stops at the first gap and promotes, as a
-/// server that went on from the gap writes other WAL at the LSNs after it.
-pub fn plan<'a>(keys: impl IntoIterator<Item = &'a str>, start: &ReplayStart) -> ReplayPlan {
-    // Postgres reads a segment from its first page, and a copy without its
-    // WAL has no file for the segment of `from`.
+/// later timeline. `switches` are the lines of the newest history file,
+/// from [`timeline_switches`](crate::timeline_switches): a timeline needs
+/// its WAL up to its switch point only. The replay stops at the first gap
+/// and promotes, as a server that went on from the gap writes other WAL at
+/// the LSNs after it.
+pub fn plan<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    start: &ReplayStart,
+    switches: &[(u32, Lsn)],
+) -> ReplayPlan {
     let first = start.from.segment_start(start.seg_size);
     let (mut ranges, mut histories) = (Vec::new(), Vec::new());
     for key in keys {
@@ -127,16 +139,21 @@ pub fn plan<'a>(keys: impl IntoIterator<Item = &'a str>, start: &ReplayStart) ->
             _ => {}
         }
     }
-    let chained = chain_timelines(&mut ranges, start);
-    let gap = chained.and_then(|(end, hole)| hole.then_some(end));
+    let chain_from = if start.has_start_segment {
+        start.from
+    } else {
+        first
+    };
+    let chain = chain_timelines(&mut ranges, start.timeline, chain_from, switches);
+    let gap = chain.and_then(|chain| chain.gap);
 
     let later_timeline = ranges.iter().any(|r| r.timeline > start.timeline);
-    let recovery = match chained {
+    let recovery = match chain {
         None => Recovery::Nothing,
-        Some((end, _)) if start.origin != Origin::Running || later_timeline || gap.is_some() => {
-            Recovery::Archive { end }
+        Some(chain) if start.origin != Origin::Running || later_timeline || gap.is_some() => {
+            Recovery::Archive { end: chain.end }
         }
-        Some((end, _)) => Recovery::Crash { end },
+        Some(chain) => Recovery::Crash { end: chain.end },
     };
 
     // An object that crosses a segment boundary goes to each segment it
@@ -201,43 +218,64 @@ fn drop_contained(mut keys: Vec<RangeKey>) -> Vec<RangeKey> {
     keys
 }
 
-/// Chains each timeline in turn: the timeline of the copy from
-/// `start.from`, a later one from its first range, which must begin before
-/// the end of the chain so far. At the first hole, drops the rest of the
-/// ranges. Returns the end of the chain, and whether a hole follows it.
-/// `None` without ranges.
-fn chain_timelines(ranges: &mut Vec<RangeKey>, start: &ReplayStart) -> Option<(Lsn, bool)> {
+/// How far the archive holds the WAL with no hole.
+#[derive(Clone, Copy)]
+struct Chain {
+    end: Lsn,
+    /// Where a hole starts. The chain ends there.
+    gap: Option<Lsn>,
+}
+
+/// Chains each timeline in turn: `timeline` from `from`, a later one from
+/// its first range, which must begin before the end of the chain so far. A
+/// timeline with a switch point needs no WAL after it: the WAL there is of
+/// another branch. At the first hole, drops the rest of the ranges. `None`
+/// without ranges.
+fn chain_timelines(
+    ranges: &mut Vec<RangeKey>,
+    timeline: u32,
+    from: Lsn,
+    switches: &[(u32, Lsn)],
+) -> Option<Chain> {
     let mut timelines: Vec<u32> = ranges.iter().map(|r| r.timeline).collect();
     timelines.sort();
     timelines.dedup();
-    let mut end = start.from;
-    for timeline in &timelines {
-        let timeline = *timeline;
-        let from = if timeline == start.timeline {
-            start.from
+    let mut end = from;
+    for &later in &timelines {
+        let chain_from = if later == timeline {
+            from
         } else {
             let first = ranges
                 .iter()
-                .filter(|r| r.timeline == timeline)
+                .filter(|r| r.timeline == later)
                 .map(|r| r.start)
                 .min()
                 .expect("a timeline of the ranges has a range");
             if first > end {
-                ranges.retain(|r| r.timeline < timeline);
-                return Some((end, true));
+                ranges.retain(|r| r.timeline < later);
+                return Some(Chain {
+                    end,
+                    gap: Some(end),
+                });
             }
             first
         };
-        end = chain_end(ranges.iter(), timeline, from);
-        let hole = ranges
+        end = chain_end(ranges.iter(), later, chain_from);
+        let switch = switches
             .iter()
-            .any(|r| r.timeline == timeline && r.start > end);
+            .find(|(tl, _)| *tl == later)
+            .map(|(_, at)| *at);
+        let hole = switch.is_none_or(|switch| end < switch)
+            && ranges.iter().any(|r| r.timeline == later && r.start > end);
         if hole {
-            ranges.retain(|r| r.timeline < timeline || (r.timeline == timeline && r.start <= end));
-            return Some((end, true));
+            ranges.retain(|r| r.timeline < later || (r.timeline == later && r.start <= end));
+            return Some(Chain {
+                end,
+                gap: Some(end),
+            });
         }
     }
-    (!timelines.is_empty()).then_some((end, false))
+    (!timelines.is_empty()).then_some(Chain { end, gap: None })
 }
 
 #[cfg(test)]
@@ -253,6 +291,7 @@ mod tests {
             from: Lsn(SEG + 0x100),
             origin: Origin::Running,
             seg_size: SEG,
+            has_start_segment: true,
         }
     }
 
@@ -269,7 +308,7 @@ mod tests {
     #[test]
     fn a_chain_after_the_checkpoint_gets_crash_recovery() {
         let keys = [key(1, SEG, SEG + 0x200), key(1, SEG + 0x200, SEG + 0x300)];
-        let plan = plan(keys.iter().map(String::as_str), &start());
+        let plan = plan(keys.iter().map(String::as_str), &start(), &[]);
         assert_eq!(
             plan.recovery,
             Recovery::Crash {
@@ -287,7 +326,7 @@ mod tests {
             key(1, SEG + 0x400, SEG + 0x500),
             key(2, SEG + 0x500, SEG + 0x600),
         ];
-        let plan = plan(keys.iter().map(String::as_str), &start());
+        let plan = plan(keys.iter().map(String::as_str), &start(), &[]);
         assert_eq!(plan.gap, Some(Lsn(SEG + 0x200)));
         assert_eq!(
             plan.recovery,
@@ -301,7 +340,7 @@ mod tests {
     fn the_head_of_the_start_segment_stays_in_the_plan() {
         // The start is SEG + 0x100: the object before it holds page 0.
         let keys = [key(1, SEG, SEG + 0x80), key(1, SEG + 0x80, SEG + 0x300)];
-        let plan = plan(keys.iter().map(String::as_str), &start());
+        let plan = plan(keys.iter().map(String::as_str), &start(), &[]);
         assert_eq!(plan.gap, None);
         assert_eq!(plan.segments[0].keys.len(), 2);
     }
@@ -313,7 +352,7 @@ mod tests {
             key(1, SEG, SEG + 0x200),
             key(1, SEG + 0x200, 2 * SEG),
         ];
-        let plan = plan(keys.iter().map(String::as_str), &start());
+        let plan = plan(keys.iter().map(String::as_str), &start(), &[]);
         let objects = &plan.segments[0].keys;
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].end, Lsn(2 * SEG));
@@ -327,7 +366,7 @@ mod tests {
             key(2, SEG + 0x400, SEG + 0x500),
             key(3, SEG + 0x500, SEG + 0x600),
         ];
-        let plan = plan(keys.iter().map(String::as_str), &start());
+        let plan = plan(keys.iter().map(String::as_str), &start(), &[]);
         assert_eq!(plan.gap, Some(Lsn(SEG + 0x300)));
         assert_eq!(
             plan.recovery,
@@ -340,11 +379,42 @@ mod tests {
     }
 
     #[test]
+    fn wal_of_a_timeline_after_its_switch_point_is_not_needed() {
+        // A restore with --accept-gap promoted at SEG + 0x200, where timeline
+        // 1 had a hole; the old primary went on past it.
+        let keys = [
+            key(1, SEG, SEG + 0x200),
+            key(1, SEG + 0x400, SEG + 0x500),
+            key(2, SEG, SEG + 0x900),
+        ];
+        let switches = [(1, Lsn(SEG + 0x200))];
+        let plan = plan(keys.iter().map(String::as_str), &start(), &switches);
+        assert_eq!(plan.gap, None);
+        assert_eq!(
+            plan.recovery,
+            Recovery::Archive {
+                end: Lsn(SEG + 0x900)
+            }
+        );
+    }
+
+    #[test]
+    fn a_copy_without_its_start_segment_needs_its_first_page() {
+        let keys = [key(1, SEG + 0x100, SEG + 0x300)];
+        let bare = ReplayStart {
+            has_start_segment: false,
+            ..start()
+        };
+        let plan = plan(keys.iter().map(String::as_str), &bare, &[]);
+        assert_eq!(plan.gap, Some(Lsn(SEG)));
+    }
+
+    #[test]
     fn a_later_timeline_must_meet_the_chain_before_it() {
         // Timeline 1 stops at SEG + 0x200; timeline 2 begins in the next
         // segment: the WAL between is missing.
         let keys = [key(1, SEG, SEG + 0x200), key(2, 3 * SEG, 3 * SEG + 0x100)];
-        let plan = plan(keys.iter().map(String::as_str), &start());
+        let plan = plan(keys.iter().map(String::as_str), &start(), &[]);
         assert_eq!(plan.gap, Some(Lsn(SEG + 0x200)));
         assert!(plan.segments.iter().all(|s| s.timeline == 1));
     }
@@ -353,7 +423,7 @@ mod tests {
     fn the_end_is_the_end_of_the_last_timeline() {
         // The old primary wrote past the switch point before the failover.
         let keys = [key(1, SEG, SEG + 0x900), key(2, SEG + 0x200, SEG + 0x300)];
-        let plan = plan(keys.iter().map(String::as_str), &start());
+        let plan = plan(keys.iter().map(String::as_str), &start(), &[]);
         assert_eq!(plan.gap, None);
         assert_eq!(
             plan.recovery,
@@ -370,7 +440,7 @@ mod tests {
             origin: Origin::ShutDown,
             ..start()
         };
-        let plan = plan(keys.iter().map(String::as_str), &clean);
+        let plan = plan(keys.iter().map(String::as_str), &clean, &[]);
         assert_eq!(
             plan.recovery,
             Recovery::Archive {
