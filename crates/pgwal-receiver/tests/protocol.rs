@@ -255,6 +255,8 @@ impl Walsender {
     }
 
     async fn row(&mut self, values: &[Option<&str>]) {
+        // The receiver does not read the column names.
+        self.send(b'T', &0i16.to_be_bytes()).await;
         let mut body = BytesMut::new();
         body.put_i16(values.len() as i16);
         for value in values {

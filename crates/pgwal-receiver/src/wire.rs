@@ -59,6 +59,10 @@ pub struct ConnConfig {
     pub idle_timeout: Duration,
 }
 
+/// One row of a result set, with `None` for NULL.
+type Row = Vec<Option<String>>;
+
+#[derive(Debug)]
 pub struct SystemInfo {
     pub system_id: u64,
     pub timeline: u32,
@@ -66,8 +70,8 @@ pub struct SystemInfo {
     pub xlogpos: Lsn,
 }
 
-/// `wal_end` is the server's view of its WAL end: its flush position in
-/// XLogData, what it has sent in a keepalive.
+/// `wal_end` is the flush position of the server in XLogData, and the end
+/// of what it has sent in a keepalive.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CopyMessage {
     XLogData {
@@ -79,6 +83,7 @@ pub enum CopyMessage {
     Keepalive { wal_end: Lsn, reply_requested: bool },
 }
 
+#[derive(Debug)]
 pub struct BackupStart {
     pub start: Lsn,
     pub timeline: u32,
@@ -193,12 +198,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         })
     }
 
-    /// `wal_segment_size` in bytes.
     pub async fn wal_segment_size(&mut self) -> Result<u64, Error> {
         parse_segment_size(&self.show("wal_segment_size").await?)
     }
 
-    pub async fn show(&mut self, setting: &str) -> Result<String, Error> {
+    async fn show(&mut self, setting: &str) -> Result<String, Error> {
         let row = self.single_row(&format!("SHOW {setting}")).await?;
         row.into_iter()
             .next()
@@ -304,7 +308,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
     }
 
-    /// The stream, to close it.
     pub fn into_inner(self) -> S {
         self.stream
     }
@@ -363,21 +366,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// [`Conn::finish_base_backup`].
     pub async fn start_base_backup(&mut self) -> Result<BackupStart, Error> {
         self.send_query(BASE_BACKUP).await?;
-        let mut sets: Vec<Vec<Vec<Option<String>>>> = Vec::new();
-        loop {
-            let (tag, body) = self.read_frame().await?;
-            match tag {
-                b'T' => sets.push(Vec::new()),
-                b'D' => sets
-                    .last_mut()
-                    .ok_or_else(|| protocol("BASE_BACKUP: DataRow before RowDescription"))?
-                    .push(data_row(body)?),
-                b'C' | b'N' => {}
-                b'H' => break,
-                b'E' => return Err(db_error(body)),
-                other => return Err(unexpected(other, "BASE_BACKUP")),
-            }
-        }
+        let sets = self.result_sets("BASE_BACKUP", b'H').await?;
         let [begin, spaces] = &sets[..] else {
             return Err(protocol(format!(
                 "BASE_BACKUP: {} result sets before the copy, not 2",
@@ -428,25 +417,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     /// The end position and timeline of the backup.
     pub async fn finish_base_backup(&mut self) -> Result<(Lsn, u32), Error> {
-        let mut sets: Vec<Vec<Vec<Option<String>>>> = Vec::new();
-        let mut err = None;
-        loop {
-            let (tag, body) = self.read_frame().await?;
-            match tag {
-                b'T' => sets.push(Vec::new()),
-                b'D' => sets
-                    .last_mut()
-                    .ok_or_else(|| protocol("BASE_BACKUP: DataRow before RowDescription"))?
-                    .push(data_row(body)?),
-                b'E' => err = Some(db_error(body)),
-                b'Z' => break,
-                b'C' | b'N' => {}
-                other => return Err(unexpected(other, "BASE_BACKUP end")),
-            }
-        }
-        if let Some(e) = err {
-            return Err(e);
-        }
+        let sets = self.result_sets("BASE_BACKUP end", b'Z').await?;
         match &sets[..] {
             [end] => position(end),
             _ => Err(protocol(format!(
@@ -456,7 +427,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
     }
 
-    async fn single_row(&mut self, sql: &str) -> Result<Vec<Option<String>>, Error> {
+    async fn single_row(&mut self, sql: &str) -> Result<Row, Error> {
         let mut rows = self.simple_query(sql).await?;
         if rows.len() != 1 {
             return Err(protocol(format!(
@@ -467,22 +438,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         Ok(rows.remove(0))
     }
 
-    async fn simple_query(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>, Error> {
+    async fn simple_query(&mut self, sql: &str) -> Result<Vec<Row>, Error> {
         self.send_query(sql).await?;
-        let mut rows = Vec::new();
+        Ok(self.result_sets(sql, b'Z').await?.concat())
+    }
+
+    /// Reads result sets up to the message `end`. An error ends at
+    /// ReadyForQuery, after which the connection takes another command.
+    async fn result_sets(&mut self, during: &str, end: u8) -> Result<Vec<Vec<Row>>, Error> {
+        let mut sets: Vec<Vec<Row>> = Vec::new();
         let mut err = None;
         loop {
             let (tag, body) = self.read_frame().await?;
             match tag {
-                b'D' => rows.push(data_row(body)?),
+                b'T' => sets.push(Vec::new()),
+                b'D' => sets
+                    .last_mut()
+                    .ok_or_else(|| protocol(format!("{during}: DataRow before RowDescription")))?
+                    .push(data_row(body)?),
                 b'E' => err = Some(db_error(body)),
-                b'Z' => break,
-                _ => {}
+                b'Z' if err.is_some() => return Err(err.expect("checked")),
+                tag if tag == end => return Ok(sets),
+                b'C' | b'N' | b'S' => {}
+                other => return Err(unexpected(other, during)),
             }
-        }
-        match err {
-            Some(e) => Err(e),
-            None => Ok(rows),
         }
     }
 
@@ -616,7 +595,7 @@ fn status_update(written: Lsn, flushed: Lsn, now_micros: i64, reply_requested: b
     out
 }
 
-fn data_row(mut body: BytesMut) -> Result<Vec<Option<String>>, Error> {
+fn data_row(mut body: BytesMut) -> Result<Row, Error> {
     let cols = take_i16(&mut body)?;
     (0..cols)
         .map(|_| {
@@ -653,7 +632,7 @@ fn db_error(mut body: BytesMut) -> Error {
 }
 
 /// The `(LSN, timeline)` row that BASE_BACKUP sends at its start and end.
-fn position(rows: &[Vec<Option<String>>]) -> Result<(Lsn, u32), Error> {
+fn position(rows: &[Row]) -> Result<(Lsn, u32), Error> {
     let [row] = rows else {
         return Err(protocol("BASE_BACKUP: expected one position row"));
     };
