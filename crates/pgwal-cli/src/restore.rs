@@ -2,11 +2,12 @@ use std::path::{Path, PathBuf};
 use std::pin::pin;
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use clap::Args;
 use futures_util::{StreamExt, TryStreamExt};
 use pgwal::{
-    AfterReplay, ArchiveKey, Lsn, Recovery, ReplayPlan, ReplayStart, plan, request_recovery,
-    timeline_switches, write_history, write_segment,
+    AfterReplay, ArchiveKey, Lsn, RangeKey, Recovery, ReplayPlan, ReplayStart, Segment, plan,
+    request_recovery, timeline_switches, write_history, write_segment,
 };
 use tracing::{info, warn};
 
@@ -151,6 +152,47 @@ pub async fn prepare(archive: &dyn WalSink, pgdata: &Path) -> Result<Prepared> {
 }
 
 /// Writes the WAL of `prepared` into the `pg_wal` of `pgdata`, asks for the
+/// The WAL objects of `segment`. Once a segment is whole, the receiver puts
+/// it as one object and deletes its parts, also after the plan listed them:
+/// a missing part then gives that object.
+async fn segment_objects(
+    archive: &dyn WalSink,
+    segment: &Segment,
+    seg_size: u64,
+) -> Result<Vec<(Lsn, Lsn, Bytes)>> {
+    let objects: Vec<_> = futures_util::stream::iter(&segment.keys)
+        .map(|key| async move {
+            let name = key.to_string();
+            let wal = archive
+                .get(&name)
+                .await
+                .with_context(|| format!("reading archived object {name}"))?;
+            anyhow::Ok(wal.map(|wal| (key.start, key.end, wal)))
+        })
+        .buffered(OBJECTS_IN_FLIGHT)
+        .try_collect()
+        .await?;
+    if let Some(objects) = objects.into_iter().collect::<Option<Vec<_>>>() {
+        return Ok(objects);
+    }
+    let (first, last) = (&segment.keys[0], &segment.keys[segment.keys.len() - 1]);
+    let seg_start = Lsn(segment.segno * seg_size);
+    let prefix = RangeKey::prefix(first.system_id, segment.timeline, seg_start, seg_size);
+    let whole = archive
+        .list(&prefix)
+        .await?
+        .iter()
+        .filter_map(|key| RangeKey::parse(key))
+        .find(|key| {
+            (key.system_id, key.timeline) == (first.system_id, segment.timeline)
+                && key.start <= first.start
+                && key.end >= last.end
+        })
+        .with_context(|| format!("the archive lost WAL from {} to {}", first.start, last.end))?;
+    let wal = archive::read(archive, &whole.to_string()).await?;
+    Ok(vec![(whole.start, whole.end, wal)])
+}
+
 /// recovery that `after` says, and returns where the replay ends.
 pub async fn write(
     archive: &dyn WalSink,
@@ -175,14 +217,7 @@ pub async fn write(
     let mut segments = pin!(
         futures_util::stream::iter(&plan.segments)
             .map(|segment| async move {
-                let objects: Vec<_> = futures_util::stream::iter(&segment.keys)
-                    .map(|key| async move {
-                        let wal = archive::read(archive, &key.to_string()).await?;
-                        anyhow::Ok((key.start, key.end, wal))
-                    })
-                    .buffered(OBJECTS_IN_FLIGHT)
-                    .try_collect()
-                    .await?;
+                let objects = segment_objects(archive, segment, start.seg_size).await?;
                 anyhow::Ok((segment, objects))
             })
             .buffered(SEGMENTS_IN_FLIGHT)
@@ -256,4 +291,47 @@ pub fn refuse_running(pgdata: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use pgwal_receiver::DirSink;
+
+    use super::*;
+
+    const SEG: u64 = 1 << 20;
+
+    fn range(start: u64, end: u64) -> RangeKey {
+        RangeKey {
+            system_id: 7,
+            timeline: 1,
+            start: Lsn(start),
+            end: Lsn(end),
+        }
+    }
+
+    /// The receiver puts the whole segment and deletes its parts after the
+    /// plan listed them.
+    #[tokio::test]
+    async fn a_part_gone_in_a_compaction_gives_the_whole_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = DirSink::new(tmp.path());
+        let whole = range(SEG, 2 * SEG);
+        let wal = Bytes::from(vec![5; SEG as usize]);
+        archive.put(&whole.to_string(), wal.clone()).await.unwrap();
+        let segment = Segment {
+            timeline: 1,
+            segno: 1,
+            keys: vec![range(SEG, SEG + 100), range(SEG + 100, SEG + 300)],
+        };
+        let objects = segment_objects(&archive, &segment, SEG).await.unwrap();
+        assert_eq!(objects, [(whole.start, whole.end, wal)]);
+
+        let gone = Segment {
+            timeline: 1,
+            segno: 2,
+            keys: vec![range(2 * SEG, 2 * SEG + 100)],
+        };
+        assert!(segment_objects(&archive, &gone, SEG).await.is_err());
+    }
 }

@@ -239,13 +239,8 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
                 final_upload(&cfg, &sink).await.context(e.to_string())?;
                 bail!(e)
             }
-            // A server that refuses TLS, or a certificate that fails the
-            // check, fails every retry the same way.
-            Err(Error::Io(e))
-                if e.kind() == std::io::ErrorKind::Unsupported
-                    || e.get_ref()
-                        .is_some_and(|e| e.is::<tls::CertificateRefused>()) =>
-            {
+            Err(Error::Io(e)) if e.get_ref().is_some_and(|e| e.is::<tls::TlsRefused>()) => {
+                final_upload(&cfg, &sink).await.context(e.to_string())?;
                 bail!(e)
             }
             Err(e) if *stop.borrow() => {

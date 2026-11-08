@@ -93,8 +93,8 @@ pub fn connector(mode: Option<SslMode>, root_cert: Option<&Path>) -> Result<Opti
     Ok(Some(TlsConnector::from(Arc::new(config))))
 }
 
-/// Asks the server behind `stream` for TLS and runs the handshake. A server
-/// that refuses TLS gives an error of kind `Unsupported`.
+/// Asks the server behind `stream` for TLS and runs the handshake. A
+/// server that refuses TLS gives a [`TlsRefused`] error.
 pub async fn connect(
     mut stream: TcpStream,
     connector: &TlsConnector,
@@ -108,10 +108,9 @@ pub async fn connect(
     match stream.read_u8().await? {
         b'S' => {}
         b'N' => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the server refuses TLS",
-            ));
+            return Err(io::Error::other(TlsRefused(format!(
+                "the server {host} refuses TLS"
+            ))));
         }
         other => {
             return Err(io::Error::new(
@@ -146,23 +145,24 @@ pub async fn connect(
             CertificateError::UnknownIssuer => " --sslrootcert gives the CA that signed it.",
             _ => "",
         };
-        io::Error::other(CertificateRefused(format!(
+        io::Error::other(TlsRefused(format!(
             "the certificate of {host} fails the check: {e}.{hint}"
         )))
     })
 }
 
-/// A server certificate that every retry refuses the same way.
+/// A TLS failure that every retry meets: a server that refuses TLS, or a
+/// certificate that fails the check for good.
 #[derive(Debug)]
-pub struct CertificateRefused(String);
+pub struct TlsRefused(String);
 
-impl std::fmt::Display for CertificateRefused {
+impl std::fmt::Display for TlsRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for CertificateRefused {}
+impl std::error::Error for TlsRefused {}
 
 /// Accepts any server certificate, but checks the handshake signatures.
 #[derive(Debug)]
