@@ -1,17 +1,14 @@
-use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use pgwal::{AfterReplay, ClusterState, ControlFile, Lsn};
-use tokio::signal::unix::{SignalKind, signal};
+use pgwal::{AfterReplay, ClusterState, ControlFile, Lsn, segment_size};
 use tracing::{info, warn};
 
 use crate::archive::ArchiveArgs;
+use crate::pg::{Bin, OnSignal, check_interrupted, path, watch_signals};
 use crate::restore::{self, OnGap};
 
 /// Port of the private socket. The server listens on no TCP port.
@@ -39,7 +36,6 @@ pub struct RebaseArgs {
 /// then a base backup at the last checkpoint of the primary in the archive.
 /// Prints its redo point.
 pub async fn run(args: RebaseArgs) -> Result<()> {
-    watch_signals();
     let pg = Bin(args.pg.pg_bin.clone());
     check_version(&pg, &args.pgdata)?;
     let archive = args.archive.open()?;
@@ -56,9 +52,12 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
         "archive written to pg_wal"
     );
     let before = ControlFile::read(&args.pgdata)?.redo;
+    // From here a signal stops the private server and removes its files.
+    watch_signals();
 
+    let seg_size = segment_size(&args.pgdata.join("pg_wal"))?;
     let socket = private_dir("rebase")?;
-    let result = replay(&pg, &args, &socket, end);
+    let result = replay(&pg, &args, &socket, end, seg_size);
     let _ = std::fs::remove_dir_all(&socket);
     let reached = result?;
 
@@ -94,7 +93,7 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
 
 /// Starts the server, waits for the replay to reach `end`, and stops it.
 /// Returns the replay position.
-fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
+fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn, seg_size: u64) -> Result<Lsn> {
     let stall = Duration::from_secs(args.stall_seconds);
     'server: loop {
         let server = start_server(pg, &args.pgdata, socket, &args.pg.user, Role::Standby)?;
@@ -119,10 +118,10 @@ fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
                 server.stop()?;
                 return Ok(lsn);
             }
-            if lsn != last.0 || last.1.elapsed() < stall {
-                if lsn != last.0 {
-                    last = (lsn, Instant::now());
-                }
+            if lsn != last.0 {
+                last = (lsn, Instant::now());
+            }
+            if last.1.elapsed() < stall {
                 std::thread::sleep(POLL);
                 continue;
             }
@@ -142,6 +141,15 @@ fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
             let waits = server
                 .query("SELECT wait_event FROM pg_stat_activity WHERE backend_type = 'startup'")?;
             if waits == "RecoveryRetrieveRetryInterval" {
+                // A standby takes an unreadable record for the end of the WAL.
+                // The last object can end inside a record, but not a segment
+                // before the end.
+                if end.0 - lsn.0 > seg_size {
+                    bail!(
+                        "the replay stops at {lsn}, before the end of the archive at {end}: \
+                         the archived WAL there is unreadable"
+                    );
+                }
                 if lsn < end {
                     warn!(
                         replayed = %lsn,
@@ -155,24 +163,6 @@ fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
             last.1 = Instant::now();
         }
     }
-}
-
-/// Stops the long commands of rebase and verify on Ctrl-C or SIGTERM. The
-/// process then stops its private server and removes its files before it
-/// exits.
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-fn watch_signals() {
-    tokio::spawn(async move {
-        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
-            return;
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
-        INTERRUPTED.store(true, Ordering::SeqCst);
-    });
 }
 
 #[derive(Args, Debug)]
@@ -210,6 +200,14 @@ pub fn run_verify(args: VerifyArgs) -> Result<()> {
 /// would end its recovery and write WAL of its own.
 pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
     restore::refuse_running(pgdata)?;
+    let state = ControlFile::read(pgdata)?.state;
+    if state == ClusterState::Running {
+        bail!(
+            "{} did not stop cleanly: pgwal verify checks a copy after a clean stop, \
+             such as the output of pgwal rebase",
+            pgdata.display()
+        );
+    }
     let t = Instant::now();
     let data = pg.run("pg_controldata", &[path(pgdata)])?;
     let checksums = controldata_field(&data, "Data page checksum version")
@@ -387,6 +385,7 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to)?;
     std::fs::set_permissions(to, std::fs::metadata(from)?.permissions())?;
     for entry in std::fs::read_dir(from)? {
+        check_interrupted()?;
         let entry = entry?;
         let target = to.join(entry.file_name());
         if entry.path().is_dir() {
@@ -396,80 +395,6 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// The Postgres binaries: in a directory, or on PATH.
-pub struct Bin(Option<PathBuf>);
-
-impl Bin {
-    /// The output of `pg_controldata` is translated in other locales.
-    fn command(&self, tool: &str) -> Command {
-        let mut command = match &self.0 {
-            Some(dir) => Command::new(dir.join(tool)),
-            None => Command::new(tool),
-        };
-        command.env("LC_ALL", "C");
-        command
-    }
-
-    /// Runs `tool`, and returns its stdout. A failure carries its stderr.
-    /// Ctrl-C or SIGTERM stops it.
-    fn run(&self, tool: &str, args: &[&str]) -> Result<String> {
-        self.exec(tool, args, OnSignal::Stop)
-    }
-
-    fn exec(&self, tool: &str, args: &[&str], on_signal: OnSignal) -> Result<String> {
-        let mut child = self
-            .command(tool)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("running {tool}"))?;
-        let stdout = read_all(child.stdout.take().expect("piped"));
-        let stderr = read_all(child.stderr.take().expect("piped"));
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            if on_signal == OnSignal::Stop && INTERRUPTED.load(Ordering::SeqCst) {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("interrupted during {tool}");
-            }
-            std::thread::sleep(CHILD_POLL);
-        };
-        let stdout = stdout.join().expect("the reader thread ends");
-        let stderr = stderr.join().expect("the reader thread ends");
-        if !status.success() {
-            bail!(
-                "{tool} failed: {}{}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr)
-            );
-        }
-        Ok(String::from_utf8_lossy(&stdout).into_owned())
-    }
-}
-
-/// What a signal does to a command.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OnSignal {
-    Stop,
-    /// For the stop of a server after a signal.
-    Finish,
-}
-
-const CHILD_POLL: Duration = Duration::from_millis(20);
-
-/// Reads `pipe` to its end in a thread, so that a full pipe never blocks
-/// the command.
-fn read_all(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut data = Vec::new();
-        let _ = pipe.read_to_end(&mut data);
-        data
-    })
 }
 
 /// Refuses binaries of another major version than the copy.
@@ -560,8 +485,9 @@ impl Server<'_> {
         let pg = self.pg;
         let pgdata = self.pgdata;
         std::mem::forget(self);
-        // The restartpoint of the stop can write every dirty buffer.
-        pg.run(
+        // The restartpoint of the stop can write every dirty buffer. A
+        // signal must not stop pg_ctl, or the server goes on on the copy.
+        pg.exec(
             "pg_ctl",
             &[
                 "-D",
@@ -573,6 +499,7 @@ impl Server<'_> {
                 "-w",
                 "stop",
             ],
+            OnSignal::Finish,
         )?;
         Ok(())
     }
@@ -592,8 +519,4 @@ fn tail(log: &Path) -> String {
     let text = std::fs::read_to_string(log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(20)..].join("\n")
-}
-
-fn path(p: &Path) -> &str {
-    p.to_str().expect("a UTF-8 path")
 }

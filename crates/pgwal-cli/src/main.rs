@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 mod archive;
 mod backup;
+mod pg;
 mod rebase;
 mod restore;
 mod tls;

@@ -636,6 +636,39 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
     assert_eq!((rows, sum), (ROWS, ROWS * (ROWS + 1) / 2));
 }
 
+/// An archived object is damaged a few segments before the end. Postgres
+/// takes the damage for the end of the WAL: the rebase must fail, not stop
+/// there.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebase_fails_on_unreadable_wal() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let setup = Setup::new(bin);
+    let keys = setup.archived_backup().await;
+    let label = pgwal::BackupLabel::read(&setup.path("backup"))
+        .unwrap()
+        .unwrap();
+    let damaged = keys
+        .iter()
+        .filter_map(|key| pgwal::RangeKey::parse(key).map(|range| (range, key)))
+        .filter(|(range, _)| range.start.0 >= label.start.0 + label.segment_size().unwrap())
+        .min_by_key(|(range, _)| range.start)
+        .map(|(_, key)| setup.path("archive").join(key))
+        .unwrap();
+    let mut wal = std::fs::read(&damaged).unwrap();
+    for byte in &mut wal[0x3010..0x3050] {
+        *byte ^= 0xFF;
+    }
+    std::fs::write(&damaged, wal).unwrap();
+
+    let out = setup.rebase();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the rebase passed:\n{stderr}");
+    assert!(stderr.contains("unreadable"), "{stderr}");
+}
+
 /// The primary raised max_connections after the copy. The replay pauses on
 /// the change, and the rebase starts its server again with the new value.
 #[tokio::test(flavor = "multi_thread")]

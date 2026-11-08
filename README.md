@@ -113,8 +113,10 @@ pg_ctl -D /restore/data start
 - The command refuses an archive with a gap after the start, on any
   timeline. With `--accept-gap`, it restores up to the gap.
 - The command refuses a data directory with a `postmaster.pid`.
-- Postgres accepts connections once the replay ends, not when `pg_ctl start`
-  returns.
+- An archive recovery accepts read-only connections once the copy is
+  consistent, which is when `pg_ctl start -w` returns. Writes wait for the
+  promotion at the end of the replay: wait for `pg_is_in_recovery()` to be
+  false. A crash recovery accepts no connection until its end.
 - The replay goes to the end of the archive. There is no target time.
 - The command prints the LSN where the replay ends.
 - With `--standby`, Postgres replays the archive as a standby and does not
@@ -179,7 +181,8 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
 - The replay can stand still before the end of the archive when the last
   object ends inside a WAL record. After `--stall-seconds` (default 10) of
   no progress, the command takes the replay position as the end once
-  Postgres waits for more WAL.
+  Postgres waits for more WAL. A stop more than one segment before the end is
+  an error: Postgres takes an unreadable record for the end of the WAL.
 - The binaries must be of the major version of the copy, on the same
   platform as the primary. `--pg-bin` (or `PGWAL_PG_BIN`) gives their
   directory. Without it, they come from `PATH`.
@@ -197,15 +200,16 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   as `max_connections`, come from `pg_control`. When the primary raised one
   after the copy, the replay pauses, and the command starts the server again
   with the new value. A pause for another reason is an error.
-- Ctrl-C or SIGTERM stops the running tool and the server, and removes their
-  files.
+- Once the WAL is in the copy, Ctrl-C or SIGTERM stops the running tool and
+  the server, and removes their files. During the download, it stops the
+  command at once.
 - After the rebase, the copy has no `backup_label.old` and no
   `backup_manifest`: they describe the copy before the rebase.
 - A copy without `postgresql.conf`, such as a copy of a Debian primary,
   starts with the defaults and the settings of `pg_control`.
 - The command runs as the owner of the data directory, not as root.
 
-`pgwal verify` checks a stopped copy:
+`pgwal verify` checks a copy after a clean stop, and refuses another one:
 
 - `pg_checksums --check`, when the copy has page checksums.
 - `pg_amcheck --all --heapallindexed --install-missing` on the heap and the
