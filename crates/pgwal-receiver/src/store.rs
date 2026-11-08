@@ -103,6 +103,8 @@ impl WalStore {
         );
         self.open = None;
         self.written = lsn;
+        // A rewrite up to the recorded position still needs its flush.
+        self.recorded = Lsn(0);
     }
 
     /// Appends WAL that starts at `start`, which must follow what is written.
@@ -129,17 +131,18 @@ impl WalStore {
 
     /// Makes everything written so far durable, and returns where it ends.
     pub async fn flush(&mut self) -> Result<Lsn, Error> {
+        if self.written == self.recorded {
+            return Ok(self.written);
+        }
         if let Some((_, file)) = &mut self.open {
             file.sync_data().await?;
         }
-        if self.written != self.recorded {
-            self.flushed_file.seek(io::SeekFrom::Start(0)).await?;
-            self.flushed_file
-                .write_all(&encode_flushed(self.timeline, self.written))
-                .await?;
-            self.flushed_file.sync_data().await?;
-            self.recorded = self.written;
-        }
+        self.flushed_file.seek(io::SeekFrom::Start(0)).await?;
+        self.flushed_file
+            .write_all(&encode_flushed(self.timeline, self.written))
+            .await?;
+        self.flushed_file.sync_data().await?;
+        self.recorded = self.written;
         Ok(self.written)
     }
 

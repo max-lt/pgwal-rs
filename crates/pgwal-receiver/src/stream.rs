@@ -19,8 +19,6 @@ use crate::wire::{
 
 /// Longest delay before a flush while WAL keeps arriving.
 const MAX_FLUSH_DELAY: Duration = Duration::from_millis(100);
-/// A silence this long ends a burst of WAL, and the flush comes then.
-const BURST_END: Duration = Duration::from_millis(1);
 
 pub struct StreamConfig {
     pub conn: ConnConfig,
@@ -465,8 +463,8 @@ where
     // its answer, and the position the caller gave.
     let mut target = Lsn(0);
     let mut flushed = store.flush().await?;
-    // Since when written WAL waits for its flush.
-    let mut unflushed_since: Option<Instant> = None;
+    // When the written WAL must be flushed at the latest.
+    let mut flush_by: Option<Instant> = None;
     loop {
         let msg = match first_message.take() {
             Some(message) => message,
@@ -485,16 +483,18 @@ where
                     send_status(conn, store.written(), confirmed.position(flushed)).await;
                     continue;
                 }
-                msg = conn.next_message() => msg.map_err(|e| wal_gone(e, store.written()))?,
-                // A burst has ended: nothing came for a moment.
-                () = tokio::time::sleep(BURST_END), if unflushed_since.is_some() => {
+                () = sleep_until(flush_by), if flush_by.is_some() => {
                     flushed = flush(conn, store, flushed_tx, &confirmed).await?;
-                    unflushed_since = None;
+                    flush_by = None;
                     continue;
                 }
+                msg = conn.next_message() => msg.map_err(|e| wal_gone(e, store.written()))?,
             },
         };
         let Some(msg) = msg else { break };
+        // The server has sent all it has: a synchronous commit waits for
+        // this flush.
+        let mut caught_up = false;
         let reply_requested = match msg {
             CopyMessage::XLogData {
                 start,
@@ -505,6 +505,8 @@ where
                 if drain != Drain::Answered {
                     target = target.max(wal_end);
                 }
+                flush_by.get_or_insert_with(|| Instant::now() + MAX_FLUSH_DELAY);
+                caught_up = store.written() >= wal_end && !conn.has_buffered_frame();
                 false
             }
             CopyMessage::Keepalive {
@@ -519,12 +521,9 @@ where
             }
         };
         let done = drain == Drain::Answered && store.written() >= target;
-        // Flush once per burst rather than per message, but never later than
-        // MAX_FLUSH_DELAY under a continuous stream.
-        let since = *unflushed_since.get_or_insert_with(Instant::now);
-        if done || reply_requested || since.elapsed() >= MAX_FLUSH_DELAY {
+        if done || reply_requested || caught_up {
             flushed = flush(conn, store, flushed_tx, &confirmed).await?;
-            unflushed_since = None;
+            flush_by = None;
         }
         if done {
             break;
@@ -535,6 +534,14 @@ where
     // A failed goodbye changes nothing: the server can be going away.
     conn.send_copy_done().await.ok();
     Ok(flushed)
+}
+
+/// Waits until `at`, or for ever without it.
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Flushes the store, and reports the new position to the uploader and the

@@ -603,34 +603,27 @@ async fn a_lost_slot_is_reported_then_recreated() {
         .unwrap();
     std::fs::remove_dir_all(&wal).unwrap();
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<Lsn>();
     let receiver = {
         let (cfg, sink) = (stream_config(&wal), sink.clone());
         let stream = UnixStream::connect(&socket).await.unwrap();
-        tokio::spawn(async move {
-            receive(stream, &cfg, sink, async {
-                let _ = stop_rx.await;
-                None
-            })
-            .await
-        })
+        tokio::spawn(async move { receive(stream, &cfg, sink, async { stop_rx.await.ok() }).await })
     };
     wait_for_slot(&client, true).await;
     client
         .execute("INSERT INTO t SELECT generate_series(1, 1000)", &[])
         .await
         .unwrap();
-    let written: String = client
+    let written: Lsn = client
         .query_one("SELECT pg_current_wal_flush_lsn()::text", &[])
         .await
         .unwrap()
-        .get(0);
-    stop_tx.send(()).unwrap();
+        .get::<_, String>(0)
+        .parse()
+        .unwrap();
+    stop_tx.send(written).unwrap();
     let uploaded = finish(receiver).await.unwrap();
-    assert!(
-        uploaded >= written.parse().unwrap(),
-        "{uploaded} < {written}"
-    );
+    assert!(uploaded >= written, "{uploaded} < {written}");
     drop(client);
     stop(&bin, &data);
 }

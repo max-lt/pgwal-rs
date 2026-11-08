@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -566,8 +566,37 @@ async fn a_stop_on_a_caught_up_server_ends_at_its_position() {
     sink.assert_tiles(Lsn(SEG), end);
 }
 
-/// A walsender that lags answers with what it has sent, below the WAL end
-/// its XLogData announced. The receiver keeps reading until that end.
+/// WAL that ends where the server announces its end gets its flush at once,
+/// as a synchronous commit waits for it. WAL behind that end waits for more,
+/// up to MAX_FLUSH_DELAY.
+#[tokio::test]
+async fn the_flush_comes_at_once_when_caught_up_and_late_when_behind() {
+    const MAX_FLUSH_DELAY: Duration = Duration::from_millis(100);
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let wal = pattern(8192, 7);
+    let (half, end) = (Lsn(SEG + 4096), Lsn(SEG + 8192));
+
+    let sent = Instant::now();
+    server.stream_announcing(Lsn(SEG), &wal[..4096], end).await;
+    server.await_flush(half).await;
+    assert!(
+        sent.elapsed() >= MAX_FLUSH_DELAY,
+        "a flush behind the server end"
+    );
+
+    let sent = Instant::now();
+    server.stream(half, &wal[4096..]).await;
+    server.await_flush(end).await;
+    assert!(sent.elapsed() < MAX_FLUSH_DELAY, "no flush when caught up");
+
+    server.end().await;
+    assert_eq!(finish(task).await.unwrap(), end);
+}
+
 /// The server answers a stop with what it has sent, short of what it had
 /// flushed before the stop. The caller gives that flush position, and the
 /// stream reads up to it.
@@ -592,6 +621,8 @@ async fn a_stop_with_a_flush_position_reads_up_to_it() {
     sink.assert_tiles(Lsn(SEG), flushed);
 }
 
+/// A walsender that lags answers with what it has sent, below the WAL end
+/// its XLogData announced. The receiver keeps reading until that end.
 #[tokio::test]
 async fn a_stop_on_a_lagging_server_waits_for_the_announced_end() {
     let tmp = tempfile::tempdir().unwrap();
