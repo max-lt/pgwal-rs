@@ -10,7 +10,7 @@
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
 use pgwal_receiver::WalSink;
-use pgwal_receiver::s3::{Retry, S3Config, S3Sink};
+use pgwal_receiver::s3::{S3Config, S3Sink};
 
 fn sink(prefix: &str) -> Option<S3Sink> {
     let endpoint = std::env::var("PGWAL_TEST_S3_ENDPOINT").ok()?;
@@ -18,16 +18,15 @@ fn sink(prefix: &str) -> Option<S3Sink> {
     let ca_pem = std::env::var("AWS_CA_BUNDLE")
         .ok()
         .map(|path| std::fs::read(path).unwrap());
-    let config = S3Config {
+    let mut config = S3Config::new(
         endpoint,
         bucket,
-        prefix: prefix.to_string(),
-        region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
-        access_key: std::env::var("AWS_ACCESS_KEY_ID").unwrap(),
-        secret_key: std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
-        ca_pem,
-        retry: Retry::default(),
-    };
+        std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
+        std::env::var("AWS_ACCESS_KEY_ID").unwrap(),
+        std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
+    );
+    config.prefix = prefix.to_string();
+    config.ca_pem = ca_pem;
     Some(S3Sink::new(config).unwrap())
 }
 

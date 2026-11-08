@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
-use pgwal_receiver::{Confirm, Error, Lsn, StreamConfig, WalSink, receive};
+use pgwal_receiver::{Error, Lsn, StreamConfig, WalSink, receive};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::watch;
@@ -153,16 +153,11 @@ async fn main() -> Result<()> {
 
 async fn run_receive(args: ReceiveArgs) -> Result<()> {
     let tls = args.conn.tls()?;
-    let cfg = StreamConfig {
-        slot: args.slot,
-        user: args.conn.user.clone(),
-        password: std::env::var("PGPASSWORD").ok(),
-        application_name: args.application_name,
-        dir: args.dir,
-        upload_every: Duration::from_secs(args.upload_every),
-        idle_timeout: Duration::from_secs(args.idle_timeout),
-        confirm: Confirm::Flushed,
-    };
+    let mut cfg = StreamConfig::new(args.slot, &args.conn.user, args.dir);
+    cfg.password = std::env::var("PGPASSWORD").ok();
+    cfg.application_name = args.application_name;
+    cfg.upload_every = Duration::from_secs(args.upload_every);
+    cfg.idle_timeout = Duration::from_secs(args.idle_timeout);
     let sink: Arc<dyn WalSink> = archive::Archive::open(&args.archive, &args.s3)?.sink();
 
     let (stop_tx, mut stop) = watch::channel(false);

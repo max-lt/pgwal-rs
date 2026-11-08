@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Retry {
     /// Attempts, the first included.
     pub attempts: u32,

@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pgwal::{ControlFile, assemble_segment, backup_done_key, backup_part_key, segment_file_name};
 use pgwal_receiver::{
-    ArchivedBackup, BackupConfig, Confirm, Error, Lsn, RangeKey, StreamConfig, WalSink,
-    base_backup, forget_slot, receive,
+    ArchivedBackup, BackupConfig, Error, Lsn, RangeKey, StreamConfig, WalSink, base_backup,
+    forget_slot, receive,
 };
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
@@ -199,16 +199,7 @@ async fn wait_for_slot(client: &tokio_postgres::Client, active: bool) {
 }
 
 fn spawn_receiver(root: &Path, wal: &Path, objects: &Path) -> JoinHandle<Result<Lsn, Error>> {
-    let cfg = StreamConfig {
-        slot: SLOT.into(),
-        user: "postgres".into(),
-        password: None,
-        application_name: "pgwal_receiver".into(),
-        dir: wal.to_path_buf(),
-        upload_every: Duration::from_millis(100),
-        idle_timeout: Duration::from_secs(60),
-        confirm: Confirm::Flushed,
-    };
+    let cfg = stream_config(wal);
     let sink = Arc::new(DirSink(objects.to_path_buf()));
     let socket = root.join(".s.PGSQL.5432");
     tokio::spawn(async move {
@@ -433,22 +424,13 @@ async fn a_base_backup_in_the_sink_restores_every_row() {
     insert(&client, 1, ROWS).await;
 
     let backup = {
-        let cfg = BackupConfig {
-            user: "postgres".into(),
-            password: None,
-            application_name: "pgwal_backup".into(),
-            idle_timeout: Duration::from_secs(60),
-            slot: "missing".into(),
-        };
+        let mut cfg = BackupConfig::new("postgres", "missing");
         let sink = Arc::new(DirSink(objects.clone()));
         let socket = root.join(".s.PGSQL.5432");
         let stream = UnixStream::connect(&socket).await.unwrap();
         let err = base_backup(stream, &cfg, sink.clone()).await.unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
-        let cfg = BackupConfig {
-            slot: SLOT.into(),
-            ..cfg
-        };
+        cfg.slot = SLOT.into();
         tokio::spawn(
             async move { base_backup(UnixStream::connect(socket).await?, &cfg, sink).await },
         )
@@ -561,16 +543,10 @@ fn control_file_matches_pg_controldata() {
 }
 
 fn stream_config(wal: &Path) -> StreamConfig {
-    StreamConfig {
-        slot: SLOT.into(),
-        user: "postgres".into(),
-        password: None,
-        application_name: "pgwal_receiver".into(),
-        dir: wal.to_path_buf(),
-        upload_every: Duration::from_millis(100),
-        idle_timeout: Duration::from_secs(60),
-        confirm: Confirm::Flushed,
-    }
+    let mut cfg = StreamConfig::new(SLOT, "postgres", wal);
+    cfg.application_name = "pgwal_receiver".into();
+    cfg.upload_every = Duration::from_millis(100);
+    cfg
 }
 
 /// A slot past `max_slot_wal_keep_size` loses its WAL. The receiver reports
