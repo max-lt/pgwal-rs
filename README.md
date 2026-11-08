@@ -12,7 +12,7 @@ point is the upload interval, not one 16 MiB segment.
   segment writer. It uses `std` only.
 - `pgwal-receiver`: the replication stream, the local store, the uploader,
   salvage, compaction and base backups. A sink implements the `WalSink`
-  trait. Without the default `runtime` feature, only the protocol module
+  trait: `DirSink` keeps a directory, `S3Sink` an S3 bucket. Without the default `runtime` feature, only the protocol module
   `wire` builds, for hosts without tokio such as wasm32.
 - `pgwal-cli`: the `pgwal` command.
 - `pgwal-worker`: a receiver in a Cloudflare Durable Object, for one
@@ -34,20 +34,21 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
   - `disable` (default): no TLS. Use it on a Unix socket, `localhost` or an
     encrypted private network only. Without TLS, the WAL, and so every row
     the server writes, crosses the network in clear text.
-  - `require`: TLS, with no check of the server certificate.
+  - `require`: TLS, with no check of the server certificate. With
+    `--sslrootcert`, the command refuses to start.
   - `verify-full`: TLS, with a check of the chain and of the host name.
     `--sslrootcert` (or `PGSSLROOTCERT`) gives a PEM file of the CAs to trust.
     Without it, the command trusts the Mozilla roots.
 - With `require` or `verify-full`, the command never falls back to clear
   text. A server that refuses TLS stops it.
 - The slot is `pgwal`. The command creates it on first use.
-- The command reconnects after an error. It stops on Ctrl-C, after it uploads
-  the WAL it received.
+- The command reconnects after an error. It stops on Ctrl-C or SIGTERM,
+  after it uploads the WAL it received.
 
 ### S3 archives
 
-`--archive` takes a directory or `s3://bucket/prefix/`, in `receive`,
-`restore` and `rebase`.
+`--archive` takes a directory or `s3://bucket/prefix/`, in every command
+that reads or writes an archive.
 
 ```sh
 export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
@@ -91,12 +92,13 @@ pg_ctl -D /restore/data start
   it.
 - `pgwal restore` writes the archived WAL that follows the copy into its
   `pg_wal`. Postgres replays it at its next start.
-- The replay starts at `START WAL LOCATION` of `backup_label`, or at the
-  checkpoint of `pg_control` without a label.
-- A base backup replays as an archive recovery, then promotes to a new
-  timeline. The command follows the timelines of the archive.
-- The command refuses an archive with a gap after the start. With
-  `--accept-gap`, it restores up to the gap.
+- The archive must hold the WAL from `START WAL LOCATION` of `backup_label`,
+  or from the checkpoint of `pg_control` without a label.
+- A base backup, or a copy after a clean stop, replays as an archive
+  recovery, then promotes to a new timeline. The command follows the
+  timelines of the archive.
+- The command refuses an archive with a gap after the start, on any
+  timeline. With `--accept-gap`, it restores up to the gap.
 - The command refuses a data directory with a `postmaster.pid`.
 - Postgres accepts connections once the replay ends, not when `pg_ctl start`
   returns.

@@ -6,9 +6,9 @@
 //! host then loses at most the WAL of one upload interval. With
 //! [`Confirm::Uploaded`], it confirms once the WAL is in the sink.
 //!
-//! To restore, rebuild each segment with [`pgwal::assemble_segment`] from the
-//! objects whose keys [`RangeKey::parse`] reads, and give the segments to Postgres
-//! through `restore_command`.
+//! [`pgwal::plan`] lists the objects that the restore of a copy reads, and
+//! [`pgwal::write_segment`] writes them into its `pg_wal`. The `pgwal
+//! restore` command of `pgwal-cli` does both.
 //!
 //! ```no_run
 //! # async fn run(sink: std::sync::Arc<dyn pgwal_receiver::WalSink>) -> Result<(), Box<dyn std::error::Error>> {
