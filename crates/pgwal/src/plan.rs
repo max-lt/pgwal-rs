@@ -202,38 +202,42 @@ fn drop_contained(mut keys: Vec<RangeKey>) -> Vec<RangeKey> {
 }
 
 /// Chains each timeline in turn: the timeline of the copy from
-/// `start.from`, a later one from its first range. At the first hole, drops
-/// the rest of that timeline and every later timeline. Returns the end of
-/// the last chain, and whether a hole follows it. `None` without ranges.
+/// `start.from`, a later one from its first range, which must begin before
+/// the end of the chain so far. At the first hole, drops the rest of the
+/// ranges. Returns the end of the chain, and whether a hole follows it.
+/// `None` without ranges.
 fn chain_timelines(ranges: &mut Vec<RangeKey>, start: &ReplayStart) -> Option<(Lsn, bool)> {
     let mut timelines: Vec<u32> = ranges.iter().map(|r| r.timeline).collect();
     timelines.sort();
     timelines.dedup();
-    let mut end = None;
-    for timeline in timelines {
+    let mut end = start.from;
+    for timeline in &timelines {
+        let timeline = *timeline;
         let from = if timeline == start.timeline {
             start.from
         } else {
-            ranges
+            let first = ranges
                 .iter()
                 .filter(|r| r.timeline == timeline)
                 .map(|r| r.start)
                 .min()
-                .expect("a timeline of the ranges has a range")
+                .expect("a timeline of the ranges has a range");
+            if first > end {
+                ranges.retain(|r| r.timeline < timeline);
+                return Some((end, true));
+            }
+            first
         };
-        let reached = chain_end(ranges.iter(), timeline, from);
-        end = Some(reached);
+        end = chain_end(ranges.iter(), timeline, from);
         let hole = ranges
             .iter()
-            .any(|r| r.timeline == timeline && r.start > reached);
+            .any(|r| r.timeline == timeline && r.start > end);
         if hole {
-            ranges.retain(|r| {
-                r.timeline < timeline || (r.timeline == timeline && r.start <= reached)
-            });
-            return Some((reached, true));
+            ranges.retain(|r| r.timeline < timeline || (r.timeline == timeline && r.start <= end));
+            return Some((end, true));
         }
     }
-    end.map(|end| (end, false))
+    (!timelines.is_empty()).then_some((end, false))
 }
 
 #[cfg(test)]
@@ -333,6 +337,16 @@ mod tests {
         );
         let kept: Vec<_> = plan.segments.iter().flat_map(|s| &s.keys).collect();
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn a_later_timeline_must_meet_the_chain_before_it() {
+        // Timeline 1 stops at SEG + 0x200; timeline 2 begins in the next
+        // segment: the WAL between is missing.
+        let keys = [key(1, SEG, SEG + 0x200), key(2, 3 * SEG, 3 * SEG + 0x100)];
+        let plan = plan(keys.iter().map(String::as_str), &start());
+        assert_eq!(plan.gap, Some(Lsn(SEG + 0x200)));
+        assert!(plan.segments.iter().all(|s| s.timeline == 1));
     }
 
     #[test]
