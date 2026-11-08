@@ -93,7 +93,6 @@ fn open_s3(location: &str, s3: &S3Args) -> Result<Archive> {
         access_key: env("AWS_ACCESS_KEY_ID")?,
         secret_key: env("AWS_SECRET_ACCESS_KEY")?,
         ca_pem,
-        retry: pgwal_receiver::s3::Retry::default(),
     };
     Ok(Archive::S3(Arc::new(pgwal_receiver::s3::S3Sink::new(
         config,

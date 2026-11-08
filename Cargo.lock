@@ -778,7 +778,6 @@ dependencies = [
  "tokio-postgres",
  "tracing",
  "webpki-roots",
- "zeroize",
 ]
 
 [[package]]

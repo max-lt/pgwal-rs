@@ -27,7 +27,7 @@ use crate::store::{
 const WATERMARK_FILE: &str = "uploaded";
 
 /// Largest object uploaded, so that memory stays bounded with 1 GB segments.
-const MAX_OBJECT: u64 = 16 << 20;
+pub(crate) const MAX_OBJECT: u64 = 16 << 20;
 
 #[async_trait]
 pub trait WalSink: Send + Sync {

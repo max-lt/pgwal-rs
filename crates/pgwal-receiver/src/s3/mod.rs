@@ -2,8 +2,8 @@
 //!
 //! - Every request signs the SHA-256 of its body, so the server refuses a
 //!   body that changed on the way.
-//! - Every PUT carries `If-None-Match: *`: an object is never overwritten.
-//!   A key names one LSN range of one timeline of one system, so the same
+//! - Every PUT carries `If-None-Match: *`, so a store that honors it, such
+//!   as AWS, R2 or MinIO, never overwrites an object. A key names one LSN range of one timeline of one system, so the same
 //!   key must hold the same bytes. On a 412, the client reads the object
 //!   back and fails unless the bytes are equal.
 //! - Paths are in the path style: `/bucket/key`.
@@ -19,13 +19,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, Full};
-use hyper::{Method, Request, StatusCode};
+use hyper::header::HeaderValue;
+use hyper::{Method, Request, StatusCode, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use tokio::sync::Semaphore;
 
-pub use retry::Retry;
 use sigv4::Slash;
 
 use crate::WalSink;
@@ -34,8 +34,8 @@ use crate::WalSink;
 const MAX_IN_FLIGHT: usize = 64;
 /// Deletes at one time, within `MAX_IN_FLIGHT`.
 const DELETES_IN_FLIGHT: usize = 16;
-/// Largest object read. A segment is at most 1 GiB.
-const MAX_OBJECT: usize = 1 << 30;
+/// Largest object read: the receiver writes none larger.
+const MAX_OBJECT: usize = crate::upload::MAX_OBJECT as usize;
 /// Largest list page or error body read. The store is not trusted.
 const MAX_SMALL: usize = 16 << 20;
 
@@ -53,7 +53,6 @@ pub struct S3Config {
     /// PEM certificates to trust next to the public roots, for a store
     /// with a private CA.
     pub ca_pem: Option<Vec<u8>>,
-    pub retry: Retry,
 }
 
 impl std::fmt::Debug for S3Config {
@@ -66,7 +65,6 @@ impl std::fmt::Debug for S3Config {
             .field("access_key", &self.access_key)
             .field("secret_key", &"<redacted>")
             .field("ca_pem", &self.ca_pem.as_ref().map(Vec::len))
-            .field("retry", &self.retry)
             .finish()
     }
 }
@@ -148,8 +146,8 @@ struct Call<'a> {
     /// The key under the prefix. `None` addresses the bucket.
     key: Option<&'a str>,
     /// Name and value pairs, not encoded.
-    query: Vec<(&'static str, String)>,
-    headers: Vec<(&'static str, String)>,
+    query: Vec<(&'static str, &'a str)>,
+    headers: Vec<(&'static str, &'static str)>,
     body: Bytes,
     /// The longest reply body this call reads.
     max_reply: usize,
@@ -168,11 +166,19 @@ impl<'a> Call<'a> {
     }
 }
 
+/// The parts of a call that stay the same from one attempt to the next.
+struct Target {
+    path: String,
+    query: String,
+    payload_hash: String,
+    uri: String,
+}
+
 pub struct S3Sink {
     client: Client<Connector, Full<Bytes>>,
     in_flight: Semaphore,
     /// `http` or `https`.
-    scheme: &'static str,
+    scheme: String,
     /// `host[:port]`, for the `host` header.
     authority: String,
     config: S3Config,
@@ -181,21 +187,20 @@ pub struct S3Sink {
 impl S3Sink {
     /// Sends no request.
     pub fn new(config: S3Config) -> io::Result<S3Sink> {
-        let (scheme, authority) = match config.endpoint.split_once("://") {
-            Some(("http", rest)) => ("http", rest),
-            Some(("https", rest)) => ("https", rest),
-            _ => {
-                return Err(invalid(
-                    "the endpoint must be http:// or https://, then host[:port]",
-                ));
-            }
-        };
-        let authority = authority.trim_end_matches('/').to_string();
-        if authority.is_empty() || authority.contains('/') {
+        let endpoint: Uri = config
+            .endpoint
+            .parse()
+            .map_err(|e| invalid(format!("the endpoint {}: {e}", config.endpoint)))?;
+        let (Some(scheme @ ("http" | "https")), Some(authority), "" | "/", None) = (
+            endpoint.scheme_str(),
+            endpoint.authority(),
+            endpoint.path(),
+            endpoint.query(),
+        ) else {
             return Err(invalid(
-                "the endpoint must be scheme://host[:port], with no path",
+                "the endpoint must be http:// or https://, then host[:port], with no path",
             ));
-        }
+        };
         if !config.prefix.is_empty() && !config.prefix.ends_with('/') {
             return Err(invalid("the key prefix must be empty or end with '/'"));
         }
@@ -207,78 +212,86 @@ impl S3Sink {
                 "the access key and the secret key must not be empty",
             ));
         }
+        // Both go into the authorization header.
+        if HeaderValue::from_str(&format!("{}/{}", config.access_key, config.region)).is_err() {
+            return Err(invalid(
+                "the access key or the region has a character that a header cannot carry",
+            ));
+        }
         let client = Client::builder(TokioExecutor::new())
             .pool_max_idle_per_host(MAX_IN_FLIGHT / 2)
             .build(connector(config.ca_pem.as_deref())?);
         Ok(S3Sink {
             client,
             in_flight: Semaphore::new(MAX_IN_FLIGHT),
-            scheme,
-            authority,
+            scheme: scheme.to_string(),
+            authority: authority.to_string(),
             config,
         })
     }
 
     fn path(&self, key: Option<&str>) -> String {
         let bucket = sigv4::uri_encode(self.config.bucket.as_bytes(), Slash::Encode);
-        match key {
-            Some(key) => {
-                let full = format!("{}{key}", self.config.prefix);
-                format!(
-                    "/{bucket}/{}",
-                    sigv4::uri_encode(full.as_bytes(), Slash::Keep)
-                )
-            }
-            None => format!("/{bucket}"),
+        let Some(key) = key else {
+            return format!("/{bucket}");
+        };
+        let full = format!("{}{key}", self.config.prefix);
+        format!(
+            "/{bucket}/{}",
+            sigv4::uri_encode(full.as_bytes(), Slash::Keep)
+        )
+    }
+
+    fn target(&self, call: &Call<'_>) -> Target {
+        let path = self.path(call.key);
+        let query = sigv4::canonical_query(&call.query);
+        let mut uri = format!("{}://{}{path}", self.scheme, self.authority);
+        if !query.is_empty() {
+            uri = format!("{uri}?{query}");
+        }
+        Target {
+            path,
+            query,
+            payload_hash: sigv4::sha256_hex(&call.body),
+            uri,
         }
     }
 
-    fn signed(&self, call: &Call<'_>) -> Request<Full<Bytes>> {
-        let path = self.path(call.key);
-        let query: Vec<(String, String)> = call
-            .query
-            .iter()
-            .map(|(name, value)| {
-                (
-                    sigv4::uri_encode(name.as_bytes(), Slash::Encode),
-                    sigv4::uri_encode(value.as_bytes(), Slash::Encode),
-                )
-            })
-            .collect();
+    fn signed(&self, call: &Call<'_>, target: &Target) -> Request<Full<Bytes>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+            .expect("the clock is after 1970")
+            .as_secs();
         let timestamp = sigv4::amz_date(now);
-        let payload_hash = sigv4::sha256_hex(&call.body);
         let mut headers = vec![
             ("host".to_string(), self.authority.clone()),
-            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+            (
+                "x-amz-content-sha256".to_string(),
+                target.payload_hash.clone(),
+            ),
             ("x-amz-date".to_string(), timestamp.clone()),
         ];
-        headers.extend(call.headers.iter().map(|(n, v)| (n.to_string(), v.clone())));
+        headers.extend(
+            call.headers
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string())),
+        );
         let authorization = sigv4::sign(
             &sigv4::Request {
                 method: call.method.as_str(),
-                path: &path,
-                query: &query,
+                path: &target.path,
+                query: &target.query,
                 headers: &headers,
-                payload_hash: &payload_hash,
+                payload_hash: &target.payload_hash,
             },
             &self.config.access_key,
             &self.config.secret_key,
             &timestamp,
             &self.config.region,
         );
-        let query = query
-            .iter()
-            .map(|(n, v)| format!("{n}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        let uri = match query.is_empty() {
-            true => format!("{}://{}{path}", self.scheme, self.authority),
-            false => format!("{}://{}{path}?{query}", self.scheme, self.authority),
-        };
-        let mut request = Request::builder().method(call.method.clone()).uri(uri);
+        let mut request = Request::builder()
+            .method(call.method.clone())
+            .uri(&target.uri);
         for (name, value) in &headers {
             request = request.header(name.as_str(), value.as_str());
         }
@@ -294,68 +307,38 @@ impl S3Sink {
     /// Sends a call, signed again for every attempt. A reply with a status
     /// that a retry does not fix comes back as `Ok`.
     async fn send(&self, call: Call<'_>) -> io::Result<Reply> {
-        let target = format!(
-            "{} {}://{}{}",
-            call.method,
-            self.scheme,
-            self.authority,
-            self.path(call.key)
-        );
-        self.config
-            .retry
-            .run(&self.in_flight, || async {
-                let response = self
-                    .client
-                    .request(self.signed(&call))
-                    .await
-                    .map_err(|e| io::Error::other(format!("{target}: {}", with_causes(&e))))?;
-                let status = response.status();
-                let max = match status.is_success() {
-                    true => call.max_reply,
-                    false => MAX_SMALL,
-                };
-                let body = http_body_util::Limited::new(response.into_body(), max)
-                    .collect()
-                    .await
-                    .map_err(|e| io::Error::other(format!("{target}: reading the body: {e}")))?
-                    .to_bytes();
-                let reply = Reply {
-                    status,
-                    body,
-                    target: target.clone(),
-                };
-                if retry::is_transient(status.as_u16(), &xml::error(&reply.body).0) {
-                    return Err(reply.error());
-                }
-                Ok(reply)
-            })
-            .await
-    }
-
-    /// Stores `data` at `key`, unless an object is there. An object with the
-    /// same bytes counts as stored: it is an earlier attempt of the same
-    /// upload.
-    pub async fn put_object(&self, key: &str, data: Bytes) -> io::Result<()> {
-        let mut call = Call::new(Method::PUT, Some(key));
-        call.headers.push(("if-none-match", "*".to_string()));
-        call.body = data.clone();
-        let reply = self.send(call).await?;
-        match reply.status {
-            status if status.is_success() => Ok(()),
-            StatusCode::PRECONDITION_FAILED => match self.get(key).await? {
-                Some(stored) if stored == data => Ok(()),
-                Some(stored) => Err(io::Error::other(format!(
-                    "{key} is in the store with other bytes ({} stored, {} new): \
-                     two writers disagree on this WAL",
-                    stored.len(),
-                    data.len()
-                ))),
-                None => Err(io::Error::other(format!(
-                    "{key}: the store refused the write, then has no object there"
-                ))),
-            },
-            _ => Err(reply.error()),
-        }
+        let target = self.target(&call);
+        let name = format!("{} {}", call.method, target.uri);
+        retry::run(&self.in_flight, || async {
+            let response = self
+                .client
+                .request(self.signed(&call, &target))
+                .await
+                .map_err(|e| io::Error::other(format!("{name}: {}", with_causes(&e))))?;
+            let status = response.status();
+            let max = if status.is_success() {
+                call.max_reply
+            } else {
+                MAX_SMALL
+            };
+            let body = http_body_util::Limited::new(response.into_body(), max)
+                .collect()
+                .await
+                .map_err(|e| io::Error::other(format!("{name}: reading the body: {e}")))?
+                .to_bytes();
+            let reply = Reply {
+                status,
+                body,
+                target: name.clone(),
+            };
+            if !status.is_success()
+                && retry::is_transient(status.as_u16(), &xml::error(&reply.body).0)
+            {
+                return Err(reply.error());
+            }
+            Ok(reply)
+        })
+        .await
     }
 
     /// The object at `key`, or `None` if there is none.
@@ -375,12 +358,12 @@ impl S3Sink {
     pub async fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
         let full = format!("{}{prefix}", self.config.prefix);
         let mut keys = Vec::new();
-        let mut token = None;
+        let mut token: Option<String> = None;
         loop {
             let mut call = Call::new(Method::GET, None);
-            call.query.push(("list-type", "2".to_string()));
-            call.query.push(("prefix", full.clone()));
-            if let Some(token) = token.take() {
+            call.query.push(("list-type", "2"));
+            call.query.push(("prefix", &full));
+            if let Some(token) = &token {
                 call.query.push(("continuation-token", token));
             }
             let reply = self.send(call).await?;
@@ -391,12 +374,10 @@ impl S3Sink {
                 io::Error::other(format!("{}: unreadable list page", reply.target))
             })?;
             for key in page.keys {
-                match key.strip_prefix(&self.config.prefix) {
-                    Some(key) => keys.push(key.to_string()),
-                    None => {
-                        return Err(io::Error::other(format!("listed {key} outside the prefix")));
-                    }
-                }
+                let Some(key) = key.strip_prefix(&self.config.prefix) else {
+                    return Err(io::Error::other(format!("listed {key} outside the prefix")));
+                };
+                keys.push(key.to_string());
             }
             match page.next_token {
                 Some(next) => token = Some(next),
@@ -404,21 +385,34 @@ impl S3Sink {
             }
         }
     }
-
-    async fn delete_one(&self, key: &str) -> io::Result<()> {
-        let reply = self.send(Call::new(Method::DELETE, Some(key))).await?;
-        match reply.status {
-            status if status.is_success() => Ok(()),
-            StatusCode::NOT_FOUND => Ok(()),
-            _ => Err(reply.error()),
-        }
-    }
 }
 
 #[async_trait]
 impl WalSink for S3Sink {
+    /// Stores `wal` at `key`, unless an object is there. An object with the
+    /// same bytes counts as stored: it is an earlier attempt of the same
+    /// upload.
     async fn put(&self, key: &str, wal: Bytes) -> io::Result<()> {
-        self.put_object(key, wal).await
+        let mut call = Call::new(Method::PUT, Some(key));
+        call.headers.push(("if-none-match", "*"));
+        call.body = wal.clone();
+        let reply = self.send(call).await?;
+        match reply.status {
+            status if status.is_success() => Ok(()),
+            StatusCode::PRECONDITION_FAILED => match self.get(key).await? {
+                Some(stored) if stored == wal => Ok(()),
+                Some(stored) => Err(io::Error::other(format!(
+                    "{key} is in the store with other bytes ({} stored, {} new): \
+                     two writers disagree on this WAL",
+                    stored.len(),
+                    wal.len()
+                ))),
+                None => Err(io::Error::other(format!(
+                    "{key}: the store refused the write, then has no object there"
+                ))),
+            },
+            _ => Err(reply.error()),
+        }
     }
 
     async fn list(&self, dir: &str) -> io::Result<Vec<String>> {
@@ -427,7 +421,13 @@ impl WalSink for S3Sink {
 
     async fn delete(&self, keys: &[String]) -> io::Result<()> {
         futures_util::stream::iter(keys.iter().cloned())
-            .map(|key| async move { self.delete_one(&key).await })
+            .map(|key| async move {
+                let reply = self.send(Call::new(Method::DELETE, Some(&key))).await?;
+                match reply.status {
+                    status if status.is_success() || status == StatusCode::NOT_FOUND => Ok(()),
+                    _ => Err(reply.error()),
+                }
+            })
             .buffer_unordered(DELETES_IN_FLIGHT)
             .try_collect()
             .await
@@ -447,7 +447,6 @@ mod tests {
             access_key: "AK".to_string(),
             secret_key: "secret".to_string(),
             ca_pem: None,
-            retry: Retry::default(),
         }
     }
 
@@ -457,6 +456,9 @@ mod tests {
         assert!(S3Sink::new(config("https://s3.example/path", "")).is_err());
         assert!(S3Sink::new(config("https://s3.example", "wal")).is_err());
         assert!(S3Sink::new(config("https://s3.example:9000/", "wal/")).is_ok());
+        let mut crlf = config("https://s3.example", "");
+        crlf.access_key = "AK\r".to_string();
+        assert!(S3Sink::new(crlf).is_err());
     }
 
     #[test]

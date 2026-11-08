@@ -33,6 +33,23 @@ pub(crate) fn uri_encode(bytes: &[u8], slash: Slash) -> String {
     out
 }
 
+/// The query string, encoded and sorted. It also serves as the query of
+/// the URI.
+pub(crate) fn canonical_query(pairs: &[(&str, &str)]) -> String {
+    let mut pairs: Vec<String> = pairs
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "{}={}",
+                uri_encode(name.as_bytes(), Slash::Encode),
+                uri_encode(value.as_bytes(), Slash::Encode)
+            )
+        })
+        .collect();
+    pairs.sort();
+    pairs.join("&")
+}
+
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
@@ -48,8 +65,8 @@ pub(crate) struct Request<'a> {
     pub method: &'a str,
     /// Already encoded.
     pub path: &'a str,
-    /// `name=value` pairs, each part already encoded, in any order.
-    pub query: &'a [(String, String)],
+    /// From [`canonical_query`].
+    pub query: &'a str,
     /// Every header to sign, `host` included, with lowercase names.
     pub headers: &'a [(String, String)],
     pub payload_hash: &'a str,
@@ -81,16 +98,9 @@ pub(crate) fn sign(
         .collect::<Vec<_>>()
         .join(";");
     let canonical_headers: String = headers.iter().map(|(n, v)| format!("{n}:{v}\n")).collect();
-    let mut query = request.query.to_vec();
-    query.sort();
-    let query = query
-        .iter()
-        .map(|(n, v)| format!("{n}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
     let canonical = format!(
-        "{}\n{}\n{query}\n{canonical_headers}\n{signed}\n{}",
-        request.method, request.path, request.payload_hash
+        "{}\n{}\n{}\n{canonical_headers}\n{signed}\n{}",
+        request.method, request.path, request.query, request.payload_hash
     );
 
     let scope = format!("{date}/{region}/s3/aws4_request");
@@ -99,8 +109,7 @@ pub(crate) fn sign(
         sha256_hex(canonical.as_bytes())
     );
     let key = {
-        let secret = zeroize::Zeroizing::new(format!("AWS4{secret}"));
-        let date_key = hmac(secret.as_bytes(), date.as_bytes());
+        let date_key = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
         let region_key = hmac(&date_key, region.as_bytes());
         let service_key = hmac(&region_key, b"s3");
         hmac(&service_key, b"aws4_request")
@@ -158,7 +167,7 @@ mod tests {
         let request = Request {
             method: "GET",
             path: "/test.txt",
-            query: &[],
+            query: "",
             headers: &headers,
             payload_hash: EMPTY_SHA256,
         };
@@ -185,10 +194,7 @@ mod tests {
             ("x-amz-content-sha256", EMPTY_SHA256),
             ("x-amz-date", "20130524T000000Z"),
         ]);
-        let query = [
-            ("prefix".to_string(), "J".to_string()),
-            ("max-keys".to_string(), "2".to_string()),
-        ];
+        let query = canonical_query(&[("prefix", "J"), ("max-keys", "2")]);
         let request = Request {
             method: "GET",
             path: "/",

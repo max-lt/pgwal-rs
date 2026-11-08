@@ -10,7 +10,7 @@
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
 use pgwal_receiver::WalSink;
-use pgwal_receiver::s3::{Retry, S3Config, S3Sink};
+use pgwal_receiver::s3::{S3Config, S3Sink};
 
 fn sink(prefix: &str) -> Option<S3Sink> {
     let endpoint = std::env::var("PGWAL_TEST_S3_ENDPOINT").ok()?;
@@ -26,7 +26,6 @@ fn sink(prefix: &str) -> Option<S3Sink> {
         access_key: std::env::var("AWS_ACCESS_KEY_ID").unwrap(),
         secret_key: std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
         ca_pem,
-        retry: Retry::default(),
     };
     Some(S3Sink::new(config).unwrap())
 }

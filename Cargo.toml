@@ -38,5 +38,4 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 quick-xml = { version = "0.41", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-zeroize = "1"
 rcgen = "0.13"

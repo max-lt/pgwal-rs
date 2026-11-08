@@ -27,9 +27,10 @@ pub(crate) struct ListPage {
 /// listing could not go on.
 pub(crate) fn list_page(body: &[u8]) -> Option<ListPage> {
     let result: ListResult = quick_xml::de::from_str(std::str::from_utf8(body).ok()?).ok()?;
-    let next_token = match result.is_truncated {
-        true => Some(result.next_continuation_token?),
-        false => None,
+    let next_token = if result.is_truncated {
+        Some(result.next_continuation_token?)
+    } else {
+        None
     };
     Some(ListPage {
         keys: result.contents.into_iter().map(|c| c.key).collect(),
@@ -45,8 +46,7 @@ struct ErrorBody {
     message: String,
 }
 
-/// The code and message of an S3 error body. Empty when there is none, as
-/// for a HEAD.
+/// The code and message of an S3 error body. Empty when there is none.
 pub(crate) fn error(body: &[u8]) -> (String, String) {
     std::str::from_utf8(body)
         .ok()
