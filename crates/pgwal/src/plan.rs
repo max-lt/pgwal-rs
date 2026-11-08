@@ -17,6 +17,15 @@ pub enum Recovery {
     Archive { end: Lsn },
 }
 
+impl Recovery {
+    pub fn end(self) -> Option<Lsn> {
+        match self {
+            Recovery::Nothing => None,
+            Recovery::Crash { end } | Recovery::Archive { end } => Some(end),
+        }
+    }
+}
+
 /// What a copy of a data directory is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
@@ -33,17 +42,15 @@ pub enum Origin {
 pub struct ReplayStart {
     pub system_id: u64,
     pub timeline: u32,
-    /// The archive must hold the WAL from here: the start of `backup_label`,
-    /// or the checkpoint of `pg_control`.
+    /// The replay needs the WAL from here: the start of `backup_label`, or
+    /// the checkpoint of `pg_control`.
     pub from: Lsn,
     pub origin: Origin,
     pub seg_size: u64,
 }
 
 impl ReplayStart {
-    /// Reads `backup_label` and `pg_control` of `data_dir`. The label wins:
-    /// a checkpoint during the copy moves `pg_control` past WAL that the
-    /// replay still needs.
+    /// Reads `backup_label` and `pg_control` of `data_dir`. The label wins.
     pub fn read(data_dir: &Path) -> io::Result<Self> {
         let control = ControlFile::read(data_dir)?;
         let label = BackupLabel::read(data_dir)?;
@@ -96,16 +103,19 @@ pub struct ReplayPlan {
 }
 
 /// Plans the replay of the archive `keys` onto the copy that `start`
-/// describes: its timeline from `start.from`, then each later timeline.
-/// The replay stops at the first gap and promotes, as a server that went on
-/// from the gap writes other WAL at the LSNs after it.
+/// describes: its timeline from the segment of `start.from`, then each
+/// later timeline. The replay stops at the first gap and promotes, as a
+/// server that went on from the gap writes other WAL at the LSNs after it.
 pub fn plan<'a>(keys: impl IntoIterator<Item = &'a str>, start: &ReplayStart) -> ReplayPlan {
+    // Postgres reads a segment from its first page, and a copy without its
+    // WAL has no file for the segment of `from`.
+    let first = start.from.segment_start(start.seg_size);
     let (mut ranges, mut histories) = (Vec::new(), Vec::new());
     for key in keys {
         match ArchiveKey::parse(key) {
             Some(ArchiveKey::Range(range))
                 if range.system_id == start.system_id
-                    && ((range.timeline == start.timeline && range.end > start.from)
+                    && ((range.timeline == start.timeline && range.end > first)
                         || range.timeline > start.timeline) =>
             {
                 ranges.push(range);
@@ -117,16 +127,16 @@ pub fn plan<'a>(keys: impl IntoIterator<Item = &'a str>, start: &ReplayStart) ->
             _ => {}
         }
     }
-    let (end, gap) = drop_after_gap(&mut ranges, start);
+    let chained = chain_timelines(&mut ranges, start);
+    let gap = chained.and_then(|(end, hole)| hole.then_some(end));
 
     let later_timeline = ranges.iter().any(|r| r.timeline > start.timeline);
-    let recovery = match end {
-        None if gap.is_none() => Recovery::Nothing,
-        None => Recovery::Archive { end: start.from },
-        Some(end) if start.origin != Origin::Running || later_timeline || gap.is_some() => {
+    let recovery = match chained {
+        None => Recovery::Nothing,
+        Some((end, _)) if start.origin != Origin::Running || later_timeline || gap.is_some() => {
             Recovery::Archive { end }
         }
-        Some(end) => Recovery::Crash { end },
+        Some((end, _)) => Recovery::Crash { end },
     };
 
     // An object that crosses a segment boundary goes to each segment it
@@ -194,8 +204,8 @@ fn drop_contained(mut keys: Vec<RangeKey>) -> Vec<RangeKey> {
 /// Chains each timeline in turn: the timeline of the copy from
 /// `start.from`, a later one from its first range. At the first hole, drops
 /// the rest of that timeline and every later timeline. Returns the end of
-/// the last chain, and where the hole starts.
-fn drop_after_gap(ranges: &mut Vec<RangeKey>, start: &ReplayStart) -> (Option<Lsn>, Option<Lsn>) {
+/// the last chain, and whether a hole follows it. `None` without ranges.
+fn chain_timelines(ranges: &mut Vec<RangeKey>, start: &ReplayStart) -> Option<(Lsn, bool)> {
     let mut timelines: Vec<u32> = ranges.iter().map(|r| r.timeline).collect();
     timelines.sort();
     timelines.dedup();
@@ -220,10 +230,10 @@ fn drop_after_gap(ranges: &mut Vec<RangeKey>, start: &ReplayStart) -> (Option<Ls
             ranges.retain(|r| {
                 r.timeline < timeline || (r.timeline == timeline && r.start <= reached)
             });
-            return (end, Some(reached));
+            return Some((reached, true));
         }
     }
-    (end, None)
+    end.map(|end| (end, false))
 }
 
 #[cfg(test)]
@@ -281,6 +291,15 @@ mod tests {
                 end: Lsn(SEG + 0x200)
             }
         );
+    }
+
+    #[test]
+    fn the_head_of_the_start_segment_stays_in_the_plan() {
+        // The start is SEG + 0x100: the object before it holds page 0.
+        let keys = [key(1, SEG, SEG + 0x80), key(1, SEG + 0x80, SEG + 0x300)];
+        let plan = plan(keys.iter().map(String::as_str), &start());
+        assert_eq!(plan.gap, None);
+        assert_eq!(plan.segments[0].keys.len(), 2);
     }
 
     #[test]

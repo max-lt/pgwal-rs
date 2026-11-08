@@ -4,7 +4,7 @@ use std::io;
 use std::path::Path;
 
 use crate::archive::{history_file_name, overlay_segment};
-use crate::lsn::{Lsn, segment_file_name};
+use crate::lsn::{Lsn, parse_segment_file_name, segment_file_name};
 
 /// The size of the segments in `pg_wal`, from the size of any segment file.
 pub fn segment_size(pg_wal: &Path) -> io::Result<u64> {
@@ -12,7 +12,8 @@ pub fn segment_size(pg_wal: &Path) -> io::Result<u64> {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.len() == 24 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // Every segment name parses with the smallest segment size.
+        if parse_segment_file_name(name, 1 << 20).is_some() {
             let size = entry.metadata()?.len();
             if size.is_power_of_two() && (1 << 20..=1 << 30).contains(&size) {
                 return Ok(size);
@@ -26,7 +27,8 @@ pub fn segment_size(pg_wal: &Path) -> io::Result<u64> {
 }
 
 /// Lays `ranges` over segment `segno` of `timeline` in `pg_wal`. A segment
-/// that does not exist yet starts as zeros.
+/// that does not exist yet starts as zeros. Each range holds `end - start`
+/// bytes, or nothing is written.
 pub fn write_segment(
     pg_wal: &Path,
     timeline: u32,
@@ -41,12 +43,19 @@ pub fn write_segment(
         Err(e) if e.kind() == io::ErrorKind::NotFound => vec![0; seg_size as usize],
         Err(e) => return Err(e),
     };
-    overlay_segment(&mut segment, segno, seg_size, ranges).ok_or_else(|| {
-        io::Error::new(
+    if let Some((start, end, wal)) = ranges
+        .iter()
+        .find(|(start, end, wal)| wal.as_ref().len() as u64 != end.0 - start.0)
+    {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "an archived WAL object is shorter than its key",
-        )
-    })?;
+            format!(
+                "the archived WAL object {start}-{end} holds {} bytes",
+                wal.as_ref().len()
+            ),
+        ));
+    }
+    overlay_segment(&mut segment, segno, seg_size, ranges);
     std::fs::write(path, segment)
 }
 
@@ -73,30 +82,19 @@ pub fn request_recovery(data_dir: &Path, after: AfterReplay) -> io::Result<()> {
     };
     std::fs::write(data_dir.join(signal), b"")?;
     // Postgres reads the WAL in pg_wal when the restore command fails.
-    append_missing(
-        &data_dir.join("postgresql.auto.conf"),
-        &["restore_command = 'false'"],
-    )
-}
-
-/// Appends each line of `lines` that `path` does not hold yet.
-fn append_missing(path: &Path, lines: &[&str]) -> io::Result<()> {
-    let mut text = match std::fs::read_to_string(path) {
+    const RESTORE_COMMAND: &str = "restore_command = 'false'";
+    let path = data_dir.join("postgresql.auto.conf");
+    let mut text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
-    let before = text.len();
-    for line in lines {
-        if !text.lines().any(|l| l.trim() == *line) {
-            text.push_str(line);
-            text.push('\n');
-        }
+    if text.lines().any(|line| line.trim() == RESTORE_COMMAND) {
+        return Ok(());
     }
-    if text.len() > before {
-        std::fs::write(path, text)?;
-    }
-    Ok(())
+    text.push_str(RESTORE_COMMAND);
+    text.push('\n');
+    std::fs::write(path, text)
 }
 
 #[cfg(test)]

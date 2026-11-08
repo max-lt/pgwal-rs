@@ -74,14 +74,14 @@ pub fn assemble_segment(
 }
 
 /// Lays archived WAL over `segment`, the bytes of segment `segno`. Ranges may
-/// overlap, leave gaps, or belong to other segments. `None` if an object is
-/// shorter than its key says.
+/// overlap, leave gaps, or belong to other segments. Each range holds
+/// `end - start` bytes.
 pub(crate) fn overlay_segment(
     segment: &mut [u8],
     segno: u64,
     seg_size: u64,
     ranges: &[(Lsn, Lsn, impl AsRef<[u8]>)],
-) -> Option<()> {
+) {
     assert_eq!(segment.len() as u64, seg_size, "a whole segment");
     let (base, limit) = (segno * seg_size, (segno + 1) * seg_size);
     for (start, end, wal) in ranges {
@@ -92,9 +92,8 @@ pub(crate) fn overlay_segment(
         let skip = (from - start.0) as usize;
         let len = (to - from) as usize;
         let at = (from - base) as usize;
-        segment[at..at + len].copy_from_slice(wal.as_ref().get(skip..skip + len)?);
+        segment[at..at + len].copy_from_slice(&wal.as_ref()[skip..skip + len]);
     }
-    Some(())
 }
 
 /// The Postgres name of the history file of `timeline`.
@@ -258,11 +257,9 @@ mod tests {
             (Lsn(SEG - 2), Lsn(SEG + 2), b"xyzw".to_vec()),
             (Lsn(2 * SEG), Lsn(2 * SEG + 1), b"!".to_vec()),
         ];
-        assert_eq!(overlay_segment(&mut segment, 1, SEG, &ranges), Some(()));
+        overlay_segment(&mut segment, 1, SEG, &ranges);
         assert_eq!(&segment[..10], b"zw\x09\x09abcd\x09\x09");
         assert!(segment[10..].iter().all(|&b| b == 9));
-        let short = [(Lsn(SEG), Lsn(SEG + 10), b"abc".to_vec())];
-        assert_eq!(overlay_segment(&mut segment, 1, SEG, &short), None);
     }
 
     #[test]
