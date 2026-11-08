@@ -190,8 +190,10 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
     loop {
         let stopped = {
             let mut stop = stop.clone();
+            // A signal gives no flush position of the server.
             async move {
                 let _ = stop.wait_for(|stopped| *stopped).await;
+                None
             }
         };
         let connected = tokio::select! {

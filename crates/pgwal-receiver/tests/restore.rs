@@ -610,6 +610,7 @@ async fn a_lost_slot_is_reported_then_recreated() {
         tokio::spawn(async move {
             receive(stream, &cfg, sink, async {
                 let _ = stop_rx.await;
+                None
             })
             .await
         })

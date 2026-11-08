@@ -301,10 +301,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         self.stream
     }
 
-    pub fn has_buffered_frame(&self) -> bool {
-        matches!(frame_len(&self.buf), Ok(Some(len)) if self.buf.len() > len)
-    }
-
     /// Reports the written and flushed positions at `now`. The caller gives
     /// the time: `SystemTime::now()` panics on wasm32.
     pub async fn send_status(

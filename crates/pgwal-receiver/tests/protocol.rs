@@ -167,14 +167,15 @@ fn spawn_stoppable(
 ) -> (
     JoinHandle<Result<Lsn, Error>>,
     Walsender,
-    oneshot::Sender<()>,
+    oneshot::Sender<Option<Lsn>>,
 ) {
     let (client, server) = tokio::io::duplex(4 << 20);
     let sink: Arc<dyn WalSink> = sink.clone();
     let (stop_tx, stop_rx) = oneshot::channel();
     let stop = async move {
-        if stop_rx.await.is_err() {
-            std::future::pending::<()>().await;
+        match stop_rx.await {
+            Ok(at) => at,
+            Err(_) => std::future::pending().await,
         }
     };
     let task = tokio::spawn(async move { receive(client, &cfg, sink, stop).await });
@@ -547,7 +548,7 @@ async fn a_stop_on_a_caught_up_server_ends_at_its_position() {
     let end = server.stream(Lsn(SEG), &pattern(4096, 0)).await;
     server.await_flush(end).await;
 
-    stop.send(()).unwrap();
+    stop.send(None).unwrap();
     server.await_reply_request().await;
     server.keepalive(end, false).await;
 
@@ -567,6 +568,30 @@ async fn a_stop_on_a_caught_up_server_ends_at_its_position() {
 
 /// A walsender that lags answers with what it has sent, below the WAL end
 /// its XLogData announced. The receiver keeps reading until that end.
+/// The server answers a stop with what it has sent, short of what it had
+/// flushed before the stop. The caller gives that flush position, and the
+/// stream reads up to it.
+#[tokio::test]
+async fn a_stop_with_a_flush_position_reads_up_to_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server, stop) = spawn_stoppable(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let wal = pattern(8192, 6);
+    let (sent, flushed) = (Lsn(SEG + 4096), Lsn(SEG + 8192));
+    server.stream_announcing(Lsn(SEG), &wal[..4096], sent).await;
+    server.await_flush(sent).await;
+
+    stop.send(Some(flushed)).unwrap();
+    server.await_reply_request().await;
+    server.keepalive(sent, false).await;
+    server.stream_announcing(sent, &wal[4096..], flushed).await;
+
+    assert_eq!(finish(task).await.unwrap(), flushed);
+    sink.assert_tiles(Lsn(SEG), flushed);
+}
+
 #[tokio::test]
 async fn a_stop_on_a_lagging_server_waits_for_the_announced_end() {
     let tmp = tempfile::tempdir().unwrap();
@@ -579,7 +604,7 @@ async fn a_stop_on_a_lagging_server_waits_for_the_announced_end() {
     server.stream_announcing(Lsn(SEG), &wal[..4096], end).await;
     server.await_flush(sent).await;
 
-    stop.send(()).unwrap();
+    stop.send(None).unwrap();
     server.await_reply_request().await;
     server.keepalive(sent, false).await;
     server.stream_announcing(sent, &wal[4096..], end).await;
@@ -607,7 +632,7 @@ async fn a_stop_ignores_the_wal_end_announced_after_the_answer() {
     server.stream_announcing(Lsn(SEG), &wal[..4096], end).await;
     server.await_flush(sent).await;
 
-    stop.send(()).unwrap();
+    stop.send(None).unwrap();
     server.await_reply_request().await;
     server.keepalive(sent, false).await;
     server

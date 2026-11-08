@@ -19,6 +19,8 @@ use crate::wire::{
 
 /// Longest delay before a flush while WAL keeps arriving.
 const MAX_FLUSH_DELAY: Duration = Duration::from_millis(100);
+/// A silence this long ends a burst of WAL, and the flush comes then.
+const BURST_END: Duration = Duration::from_millis(1);
 
 pub struct StreamConfig {
     pub conn: ConnConfig,
@@ -55,9 +57,12 @@ pub enum Confirm {
 /// - After a failover, the stream of a parent timeline reaches its end. Call
 ///   `receive` again: it goes on with the next timeline.
 /// - `stop` resolves. The receiver asks the server for its position, reads
-///   and flushes up to it, and ends the stream. Use it before the server is
-///   paused or killed. WAL that the server writes after it answers is not in
-///   the result.
+///   and flushes up to it, and ends the stream. The server answers with what
+///   it has sent, which can stop short of what it has flushed. Before the
+///   server is paused or killed, give `stop` the result of
+///   `pg_current_wal_flush_lsn()` read after the last write: the stream
+///   then reads up to it too. WAL that the server writes after that is not
+///   in the result.
 ///
 /// On an error during the stream, the WAL flushed so far is still uploaded
 /// before the function returns. Calling it again with the same directory
@@ -66,7 +71,7 @@ pub async fn receive<S>(
     stream: S,
     cfg: &StreamConfig,
     sink: Arc<dyn WalSink>,
-    stop: impl Future<Output = ()>,
+    stop: impl Future<Output = Option<Lsn>>,
 ) -> Result<Lsn, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -449,23 +454,29 @@ async fn stream_into<S>(
     flushed_tx: &watch::Sender<Lsn>,
     mut confirmed: Confirmed,
     mut first_message: Option<Option<CopyMessage>>,
-    stop: impl Future<Output = ()>,
+    stop: impl Future<Output = Option<Lsn>>,
 ) -> Result<Lsn, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut stop = pin!(stop);
     let mut drain = Drain::Streaming;
-    // The highest WAL end the server announced up to its answer to a stop.
+    // How far a stop reads: the highest WAL end the server announced up to
+    // its answer, and the position the caller gave.
     let mut target = Lsn(0);
     let mut flushed = store.flush().await?;
-    let mut last_flush = Instant::now();
+    // Since when written WAL waits for its flush.
+    let mut unflushed_since: Option<Instant> = None;
     loop {
         let msg = match first_message.take() {
             Some(message) => message,
+            // The stop comes first, or a server that streams a backlog would
+            // keep it out.
             None => tokio::select! {
-                () = &mut stop, if drain == Drain::Streaming => {
+                biased;
+                at = &mut stop, if drain == Drain::Streaming => {
                     drain = Drain::Asked;
+                    target = target.max(at.unwrap_or_default());
                     conn.ask_position(store.written(), confirmed.position(flushed), SystemTime::now())
                         .await?;
                     continue;
@@ -475,6 +486,12 @@ where
                     continue;
                 }
                 msg = conn.next_message() => msg.map_err(|e| wal_gone(e, store.written()))?,
+                // A burst has ended: nothing came for a moment.
+                () = tokio::time::sleep(BURST_END), if unflushed_since.is_some() => {
+                    flushed = flush(conn, store, flushed_tx, &confirmed).await?;
+                    unflushed_since = None;
+                    continue;
+                }
             },
         };
         let Some(msg) = msg else { break };
@@ -502,17 +519,12 @@ where
             }
         };
         let done = drain == Drain::Answered && store.written() >= target;
-        // Flush once a burst is drained rather than per message, but never
-        // later than MAX_FLUSH_DELAY under a continuous stream.
-        if done
-            || reply_requested
-            || !conn.has_buffered_frame()
-            || last_flush.elapsed() >= MAX_FLUSH_DELAY
-        {
-            flushed = store.flush().await?;
-            last_flush = Instant::now();
-            flushed_tx.send_replace(flushed);
-            send_status(conn, store.written(), confirmed.position(flushed)).await;
+        // Flush once per burst rather than per message, but never later than
+        // MAX_FLUSH_DELAY under a continuous stream.
+        let since = *unflushed_since.get_or_insert_with(Instant::now);
+        if done || reply_requested || since.elapsed() >= MAX_FLUSH_DELAY {
+            flushed = flush(conn, store, flushed_tx, &confirmed).await?;
+            unflushed_since = None;
         }
         if done {
             break;
@@ -522,6 +534,23 @@ where
     flushed_tx.send_replace(flushed);
     // A failed goodbye changes nothing: the server can be going away.
     conn.send_copy_done().await.ok();
+    Ok(flushed)
+}
+
+/// Flushes the store, and reports the new position to the uploader and the
+/// server.
+async fn flush<S>(
+    conn: &mut Conn<S>,
+    store: &mut WalStore,
+    flushed_tx: &watch::Sender<Lsn>,
+    confirmed: &Confirmed,
+) -> Result<Lsn, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let flushed = store.flush().await?;
+    flushed_tx.send_replace(flushed);
+    send_status(conn, store.written(), confirmed.position(flushed)).await;
     Ok(flushed)
 }
 
