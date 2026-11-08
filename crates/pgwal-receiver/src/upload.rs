@@ -99,7 +99,7 @@ pub(crate) struct Uploader {
     sink: Arc<dyn WalSink>,
     pub(crate) uploaded: Lsn,
     /// Objects that go up before the WAL, such as history files.
-    pub(crate) first: Vec<(String, Bytes)>,
+    pub(crate) pending: Vec<(String, Bytes)>,
     max_object: u64,
     /// At most one compaction runs next to the uploads: it bounds the memory
     /// to one segment.
@@ -141,7 +141,7 @@ impl Uploader {
             seg_size,
             sink,
             uploaded,
-            first: Vec::new(),
+            pending: Vec::new(),
             max_object: crate::MAX_OBJECT as u64,
             compaction: None,
         })
@@ -192,9 +192,9 @@ impl Uploader {
     }
 
     async fn upload_to(&mut self, upto: Lsn) -> Result<(), Error> {
-        while let Some((key, data)) = self.first.first() {
+        while let Some((key, data)) = self.pending.first() {
             self.sink.put(key, data.clone()).await?;
-            self.first.remove(0);
+            self.pending.remove(0);
         }
         let before = self.uploaded;
         while self.uploaded < upto {

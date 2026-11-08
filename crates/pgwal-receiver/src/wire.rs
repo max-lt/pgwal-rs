@@ -30,9 +30,12 @@ const DUPLICATE_OBJECT: &str = "42710";
 /// SQLSTATE `undefined_object`.
 const UNDEFINED_OBJECT: &str = "42704";
 
+/// SQLSTATE `undefined_file`, as of a removed segment or history file.
+pub(crate) const UNDEFINED_FILE: &str = "58P01";
+
 /// SQLSTATEs of a START_REPLICATION whose WAL is gone: an invalidated slot
-/// (`object_not_in_prerequisite_state`), a removed segment (`undefined_file`).
-const WAL_GONE: [&str; 2] = ["55000", "58P01"];
+/// (`object_not_in_prerequisite_state`), a removed segment.
+const WAL_GONE: [&str; 2] = ["55000", UNDEFINED_FILE];
 
 /// `WAIT false`: the WAL comes from the stream of the slot, not from the
 /// `archive_command` of the server.

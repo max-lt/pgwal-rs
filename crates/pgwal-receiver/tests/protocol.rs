@@ -755,7 +755,7 @@ async fn a_chain_of_failovers_archives_every_timeline_and_history() {
     let runs: [(u32, Lsn, Lsn, &[u32]); 3] = [
         (1, Lsn(SEG), Lsn(0x300A00), &[2]),
         (2, Lsn(3 * SEG), Lsn(0x500A00), &[2]),
-        (3, Lsn(5 * SEG), Lsn(5 * SEG + 4096), &[]),
+        (3, Lsn(5 * SEG), Lsn(5 * SEG + 4096), &[2]),
     ];
     for (timeline, from, to, queries) in runs {
         let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
@@ -829,6 +829,115 @@ async fn a_sink_outage_on_a_later_timeline_does_not_stop_the_stream() {
 
     assert_eq!(finish(task).await.unwrap(), end);
     let objects = sink.inner.0.lock().unwrap().clone();
+    assert_eq!(&objects["7401/00000002.history"][..], HISTORY.as_bytes());
+}
+
+/// The sink is down while the receiver streams timeline 2 past the switch
+/// point of timeline 3, and the run dies. The next run, on timeline 3,
+/// salvages timeline 2 and archives its history file too.
+#[tokio::test]
+async fn a_second_failover_after_a_sink_outage_archives_the_parent_history() {
+    const HISTORY_3: &str = "1\t0/300A00\tno recovery target specified\n\
+                             2\t0/500A00\tno recovery target specified\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let (client, server) = tokio::io::duplex(4 << 20);
+    let mut server = Walsender {
+        io: server,
+        buf: BytesMut::new(),
+    };
+    let cfg = config(tmp.path());
+    let task = tokio::spawn(async move {
+        receive(
+            client,
+            &cfg,
+            Arc::new(GateSink::default()),
+            std::future::pending(),
+        )
+        .await
+    });
+    server.open_on(2).await;
+    server.start(None).await;
+    let end = server
+        .stream(Lsn(3 * SEG), &pattern((0x501000 - 3 * SEG) as usize, 2))
+        .await;
+    server.await_flush(end).await;
+    drop(server);
+    assert!(finish(task).await.is_err(), "the run dies");
+
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_with(3, HISTORY_3).await;
+    assert_eq!(server.expect_query().await, "TIMELINE_HISTORY 2");
+    server.history(2, HISTORY).await;
+    assert!(
+        server
+            .start(None)
+            .await
+            .ends_with("PHYSICAL 0/500000 TIMELINE 3")
+    );
+    let end = server.stream(Lsn(5 * SEG), &pattern(4096, 3)).await;
+    server.await_flush(end).await;
+    server.end().await;
+    finish(task).await.unwrap();
+
+    let objects = sink.0.lock().unwrap().clone();
+    assert_eq!(&objects["7401/00000002.history"][..], HISTORY.as_bytes());
+}
+
+/// A new host with an empty store, after a failover that took the old host
+/// down too. The sink ends early on the parent timeline: the run streams
+/// the rest of it from the new server.
+#[tokio::test]
+async fn an_empty_store_streams_the_tail_of_the_parent_timeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let held = RangeKey {
+        system_id: 7401,
+        timeline: 1,
+        start: Lsn(SEG),
+        end: Lsn(SEG + 4096),
+    };
+    let old_wal = pattern((0x300A00 - SEG) as usize, 1);
+    sink.0
+        .lock()
+        .unwrap()
+        .insert(held.to_string(), Bytes::copy_from_slice(&old_wal[..4096]));
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    assert!(
+        server
+            .start(None)
+            .await
+            .ends_with("PHYSICAL 0/100000 TIMELINE 1")
+    );
+    let end = server.stream(Lsn(SEG), &old_wal).await;
+    server.await_flush(end).await;
+    server.copy_done().await;
+    assert_eq!(finish(task).await.unwrap(), Lsn(0x300A00));
+
+    let objects = sink.0.lock().unwrap().clone();
+    assert_eq!(&objects["7401/00000002.history"][..], HISTORY.as_bytes());
+    let reached = objects
+        .keys()
+        .filter_map(|key| RangeKey::parse(key))
+        .filter(|range| range.timeline == 1)
+        .map(|range| range.end)
+        .max();
+    assert_eq!(reached, Some(Lsn(0x300A00)));
+}
+
+/// The server ends the copy of a later timeline before its first message.
+/// The history file still goes up.
+#[tokio::test]
+async fn an_end_before_the_first_message_still_archives_the_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    server.start(None).await;
+    server.end().await;
+    finish(task).await.unwrap();
+    let objects = sink.0.lock().unwrap().clone();
     assert_eq!(&objects["7401/00000002.history"][..], HISTORY.as_bytes());
 }
 
@@ -908,17 +1017,17 @@ async fn an_invalidated_slot_is_reported_as_wal_gone() {
     );
 }
 
-/// The switch point of an old timeline is gone from the server. The stream
-/// falls back to the slot position on the same connection.
+/// The slot of a later timeline was invalidated: the server refuses the
+/// copy before it starts. The stream starts again at the slot.
 #[tokio::test]
-async fn a_later_timeline_whose_first_wal_is_gone_starts_at_the_slot() {
+async fn an_invalidated_slot_on_a_later_timeline_starts_at_the_slot() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(MemSink::default());
     let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
     server.open_on(2).await;
     assert!(server.expect_query().await.contains("PHYSICAL 0/300000 "));
     server
-        .error("58P01", "requested WAL segment has already been removed")
+        .error("55000", "can no longer access replication slot")
         .await;
     server.ready().await;
     assert_eq!(
