@@ -140,12 +140,7 @@ impl WalStore {
             file.flush().await?;
             file.sync_data().await?;
         }
-        self.flushed_file.seek(io::SeekFrom::Start(0)).await?;
-        self.flushed_file
-            .write_all(&encode_flushed(self.timeline, self.written))
-            .await?;
-        self.flushed_file.flush().await?;
-        self.flushed_file.sync_data().await?;
+        write_mark(&mut self.flushed_file, self.timeline, self.written).await?;
         self.recorded = self.written;
         Ok(self.written)
     }
@@ -196,10 +191,21 @@ impl WalStore {
     }
 }
 
-/// `lsn` and `timeline`, then a checksum of both: a torn write reads back
-/// as no record.
-fn encode_flushed(timeline: u32, lsn: Lsn) -> [u8; 20] {
-    let mut record = [0u8; 20];
+/// The size of a mark: `lsn` and `timeline`, then a checksum of both.
+pub(crate) const MARK_LEN: u64 = 20;
+
+/// Writes a mark over the one in `file`. In place, the write needs no new
+/// block, as on a full disk, and a torn write reads back as no mark.
+pub(crate) async fn write_mark(file: &mut File, timeline: u32, lsn: Lsn) -> io::Result<()> {
+    file.seek(io::SeekFrom::Start(0)).await?;
+    file.write_all(&encode_mark(timeline, lsn)).await?;
+    // A tokio write ends on a blocking thread: only a flush gives its error.
+    file.flush().await?;
+    file.sync_data().await
+}
+
+fn encode_mark(timeline: u32, lsn: Lsn) -> [u8; MARK_LEN as usize] {
+    let mut record = [0u8; MARK_LEN as usize];
     record[..8].copy_from_slice(&lsn.0.to_le_bytes());
     record[8..12].copy_from_slice(&timeline.to_le_bytes());
     let sum = fnv1a(&record[..12]);
@@ -209,12 +215,17 @@ fn encode_flushed(timeline: u32, lsn: Lsn) -> [u8; 20] {
 
 /// The flushed position a store recorded: `(timeline, lsn)`.
 pub(crate) async fn read_flushed(dir: &Path) -> Result<Option<(u32, Lsn)>, Error> {
-    let record = match fs::read(dir.join(FLUSHED_FILE)).await {
+    read_mark(&dir.join(FLUSHED_FILE)).await
+}
+
+/// The mark in the file at `path`: `(timeline, lsn)`.
+pub(crate) async fn read_mark(path: &Path) -> Result<Option<(u32, Lsn)>, Error> {
+    let record = match fs::read(path).await {
         Ok(record) => record,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let Some(record) = record.get(..20) else {
+    let Some(record) = record.get(..MARK_LEN as usize) else {
         return Ok(None);
     };
     let sum = u64::from_le_bytes(record[12..20].try_into().expect("8 bytes"));
@@ -348,7 +359,7 @@ pub(crate) async fn write_durably(dir: &Path, name: &str, contents: &[u8]) -> io
     sync_dir(dir).await
 }
 
-async fn sync_dir(dir: &Path) -> io::Result<()> {
+pub(crate) async fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir).await?.sync_all().await
 }
 

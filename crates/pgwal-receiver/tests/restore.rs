@@ -558,6 +558,82 @@ async fn backups_of_an_idle_standby_share_their_start() {
     stop(&bin, &data);
 }
 
+/// A sink that refuses the `done` object of a backup.
+struct NoDone(DirSink);
+
+#[async_trait::async_trait]
+impl WalSink for NoDone {
+    async fn put(&self, key: &str, data: Bytes) -> std::io::Result<()> {
+        if key.ends_with("/done") {
+            return Err(std::io::Error::other("sink down"));
+        }
+        self.0.put(key, data).await
+    }
+
+    async fn get(&self, key: &str) -> std::io::Result<Option<Bytes>> {
+        self.0.get(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.0.list(prefix).await
+    }
+
+    async fn delete(&self, keys: &[String]) -> std::io::Result<()> {
+        self.0.delete(keys).await
+    }
+}
+
+/// A primary starts each backup at a new checkpoint, so no later backup
+/// removes the parts of a failed one: the failed backup removes them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_backup_leaves_no_part() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let tmp = tempfile::Builder::new()
+        .prefix("bfb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = tmp.path();
+    let data = root.join("data");
+    run(
+        &bin,
+        "initdb",
+        &[
+            "-D",
+            path(&data),
+            "-U",
+            "postgres",
+            "-A",
+            "trust",
+            "--no-sync",
+            "--no-instructions",
+        ],
+    );
+    start(&bin, &data, root, &root.join("primary.log"));
+    connect(root)
+        .await
+        .batch_execute(&format!(
+            "SELECT pg_create_physical_replication_slot('{SLOT}', true)"
+        ))
+        .await
+        .unwrap();
+
+    let objects = root.join("objects");
+    let sink: Arc<dyn WalSink> = Arc::new(NoDone(DirSink::new(&objects)));
+    let stream = UnixStream::connect(root.join(".s.PGSQL.5432"))
+        .await
+        .unwrap();
+    let err = base_backup(stream, &conn("pgwal_backup"), SLOT, sink.clone())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("sink down"), "{err}");
+    assert_eq!(sink.list("").await.unwrap(), Vec::<String>::new());
+
+    stop(&bin, &data);
+}
+
 /// `pg_controldata` output as `label -> value`.
 fn controldata(bin: &Path, data: &Path) -> BTreeMap<String, String> {
     let out = Command::new(bin.join("pg_controldata"))

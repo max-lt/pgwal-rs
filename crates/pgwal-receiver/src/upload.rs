@@ -21,8 +21,8 @@ use tracing::{debug, info, warn};
 
 use crate::error::Error;
 use crate::store::{
-    PARTIAL_SUFFIX, WalStore, first_segment, read_flushed, read_system_id, segment_files,
-    write_durably,
+    MARK_LEN, PARTIAL_SUFFIX, WalStore, first_segment, read_flushed, read_mark, read_system_id,
+    segment_files, sync_dir, write_mark,
 };
 
 const WATERMARK_FILE: &str = "uploaded";
@@ -46,18 +46,11 @@ pub trait WalSink: Send + Sync {
 /// The LSN up to which a previous run uploaded on `timeline`. A watermark of
 /// another timeline says nothing about this one.
 pub(crate) async fn read_watermark(dir: &Path, timeline: u32) -> Result<Option<Lsn>, Error> {
-    let text = match fs::read_to_string(dir.join(WATERMARK_FILE)).await {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let corrupt = || Error::Store(format!("corrupt upload watermark {text:?}"));
-    let (mark_timeline, lsn) = text.split_once(' ').ok_or_else(corrupt)?;
-    let mark_timeline: u32 = mark_timeline.parse().map_err(|_| corrupt())?;
-    let lsn: Lsn = lsn.parse().map_err(|_| corrupt())?;
     // After a failover, the watermark holds the old timeline until the first
     // upload on the new one.
-    Ok((mark_timeline == timeline).then_some(lsn))
+    Ok(read_mark(&dir.join(WATERMARK_FILE))
+        .await?
+        .and_then(|(mark_timeline, lsn)| (mark_timeline == timeline).then_some(lsn)))
 }
 
 /// Uploads the WAL that a receiver flushed in `dir` but did not upload, and
@@ -98,6 +91,7 @@ pub(crate) struct Uploader {
     seg_size: u64,
     sink: Arc<dyn WalSink>,
     pub(crate) uploaded: Lsn,
+    watermark: File,
     /// Objects that go up before the WAL, such as history files.
     pub(crate) pending: Vec<(String, Bytes)>,
     max_object: u64,
@@ -134,6 +128,18 @@ impl Uploader {
             Some(mark) => mark,
             None => start,
         };
+        let mut watermark = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(WATERMARK_FILE))
+            .await?;
+        // A mark from the start: on a full disk, the write in place of a
+        // later one still passes, and frees the uploaded segments.
+        if watermark.metadata().await?.len() < MARK_LEN {
+            write_mark(&mut watermark, timeline, uploaded).await?;
+            sync_dir(&dir).await?;
+        }
         Ok(Self {
             dir,
             system_id,
@@ -141,6 +147,7 @@ impl Uploader {
             seg_size,
             sink,
             uploaded,
+            watermark,
             pending: Vec::new(),
             max_object: crate::MAX_OBJECT as u64,
             compaction: None,
@@ -212,10 +219,17 @@ impl Uploader {
             self.sink.put(&key.to_string(), wal).await?;
             self.uploaded = end;
             // Durable before any segment it covers is removed.
-            let mark = format!("{} {}", self.timeline, self.uploaded);
-            write_durably(&self.dir, WATERMARK_FILE, mark.as_bytes()).await?;
+            write_mark(&mut self.watermark, self.timeline, self.uploaded).await?;
             if end.0 == (segno + 1) * self.seg_size {
                 self.start_compaction(segno).await;
+                // At once, so a long backlog frees the disk as it goes up.
+                let path = self
+                    .dir
+                    .join(segment_file_name(self.timeline, segno, self.seg_size));
+                match fs::remove_file(path).await {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                    _ => {}
+                }
             }
         }
         if self.uploaded > before {
@@ -343,11 +357,13 @@ mod tests {
         .to_string()
     }
 
-    /// Fails the first `fail_first` puts, then stores objects in memory.
+    /// Fails the first `fail_first` puts and every put of `fail_key`, and
+    /// stores the other objects in memory.
     #[derive(Default)]
     struct MemSink {
         objects: Mutex<BTreeMap<String, Bytes>>,
         fail_first: AtomicUsize,
+        fail_key: Mutex<Option<String>>,
     }
 
     #[async_trait]
@@ -357,6 +373,7 @@ mod tests {
                 .fail_first
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
+                || self.fail_key.lock().unwrap().as_deref() == Some(key)
             {
                 return Err(io::Error::other("sink down"));
             }
@@ -512,7 +529,7 @@ mod tests {
         let mut uploader = uploader(tmp.path(), &sink).await;
 
         assert!(uploader.upload_to(flushed).await.is_err());
-        assert_eq!(read_watermark(tmp.path(), 1).await.unwrap(), None);
+        assert_eq!(read_watermark(tmp.path(), 1).await.unwrap(), Some(Lsn(SEG)));
         assert!(tmp.path().join(segment_file_name(1, 1, SEG)).exists());
 
         uploader.upload_to(flushed).await.unwrap();
@@ -520,24 +537,37 @@ mod tests {
         assert_eq!(read_watermark(tmp.path(), 1).await.unwrap(), Some(flushed));
     }
 
+    /// A long backlog frees each segment once it is up: the disk need not
+    /// hold the whole backlog until its end.
+    #[tokio::test]
+    async fn a_segment_goes_once_it_is_up_even_when_a_later_put_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_store, _, flushed) = filled_store(tmp.path()).await;
+        let sink = Arc::new(MemSink::default());
+        *sink.fail_key.lock().unwrap() = Some(key(2 * SEG, flushed.0));
+        let mut uploader = uploader(tmp.path(), &sink).await;
+
+        assert!(uploader.upload_to(flushed).await.is_err());
+        assert_eq!(
+            read_watermark(tmp.path(), 1).await.unwrap(),
+            Some(Lsn(2 * SEG))
+        );
+        assert!(!tmp.path().join(segment_file_name(1, 1, SEG)).exists());
+    }
+
     #[tokio::test]
     async fn a_watermark_of_another_timeline_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        write_durably(tmp.path(), WATERMARK_FILE, b"1 0/3000000")
-            .await
-            .unwrap();
+        let path = tmp.path().join(WATERMARK_FILE);
+        let mut file = File::create(&path).await.unwrap();
+        write_mark(&mut file, 1, Lsn(0x300_0000)).await.unwrap();
         assert_eq!(read_watermark(tmp.path(), 2).await.unwrap(), None);
         assert_eq!(
             read_watermark(tmp.path(), 1).await.unwrap(),
             Some(Lsn(0x300_0000))
         );
-        write_durably(tmp.path(), WATERMARK_FILE, b"garbage")
-            .await
-            .unwrap();
-        assert!(matches!(
-            read_watermark(tmp.path(), 1).await,
-            Err(Error::Store(_))
-        ));
+        std::fs::write(&path, b"a torn mark of 20 b").unwrap();
+        assert_eq!(read_watermark(tmp.path(), 1).await.unwrap(), None);
     }
 
     #[tokio::test]

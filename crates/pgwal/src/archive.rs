@@ -140,15 +140,24 @@ impl std::fmt::Display for ArchiveKey {
                 start,
                 name,
                 part,
-            } => write!(f, "{system_id}/base/{:016X}/{name}.{part:06}", start.0),
+            } => write!(
+                f,
+                "{}{name}.{part:06}",
+                Self::backup_prefix(*system_id, *start)
+            ),
             ArchiveKey::BackupDone { system_id, start } => {
-                write!(f, "{system_id}/base/{:016X}/done", start.0)
+                write!(f, "{}done", Self::backup_prefix(*system_id, *start))
             }
         }
     }
 }
 
 impl ArchiveKey {
+    /// The prefix of every object of the base backup that starts at `start`.
+    pub fn backup_prefix(system_id: u64, start: Lsn) -> String {
+        format!("{system_id}/base/{:016X}/", start.0)
+    }
+
     /// Accepts only the exact form `Display` writes.
     pub fn parse(key: &str) -> Option<Self> {
         if let Some(range) = RangeKey::parse(key) {

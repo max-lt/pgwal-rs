@@ -6,11 +6,11 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use pgwal::{ArchiveKey, ArchivedBackup, Lsn};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::Error;
 use crate::upload::WalSink;
-use crate::wire::{BackupMessage, Conn, ConnConfig};
+use crate::wire::{BackupMessage, BackupStart, Conn, ConnConfig};
 
 const MANIFEST: &str = "backup_manifest";
 
@@ -26,8 +26,8 @@ const MANIFEST: &str = "backup_manifest";
 /// The server sends nothing during the checkpoint at the start: give `conn`
 /// an idle timeout that covers it.
 ///
-/// The `done` object goes last. On an error, the parts written so far stay
-/// in the sink without it, and the next backup with the same start removes
+/// The `done` object goes last. On an error, the parts written so far go;
+/// when the sink fails that too, the next backup with the same start removes
 /// them. A standby starts its backups at its last restartpoint: when the
 /// sink holds a whole backup with that start, that backup is the result.
 pub async fn base_backup<S>(
@@ -60,18 +60,40 @@ where
         info!(start = %backup.start, "the sink holds a base backup with this start");
         return Ok(backup);
     }
-    let prefix = done
-        .strip_suffix("done")
-        .expect("a done key ends with done");
-    let leftovers = sink.list(prefix).await?;
-    if !leftovers.is_empty() {
-        sink.delete(&leftovers).await?;
-    }
+    let prefix = ArchiveKey::backup_prefix(system.system_id, begun.start);
+    remove_parts(sink.as_ref(), &prefix).await?;
     info!(start = %begun.start, timeline = begun.timeline, "base backup started");
+    let written = write_backup(&mut conn, system.system_id, begun, &done, sink.clone()).await;
+    if written.is_err() {
+        // No later backup of a primary has this start to remove them.
+        if let Err(e) = remove_parts(sink.as_ref(), &prefix).await {
+            warn!(%prefix, error = %e, "the parts of the failed backup stay in the sink");
+        }
+    }
+    written
+}
 
+async fn remove_parts(sink: &dyn WalSink, prefix: &str) -> Result<(), Error> {
+    let parts = sink.list(prefix).await?;
+    if !parts.is_empty() {
+        sink.delete(&parts).await?;
+    }
+    Ok(())
+}
+
+async fn write_backup<S>(
+    conn: &mut Conn<S>,
+    system_id: u64,
+    begun: BackupStart,
+    done: &str,
+    sink: Arc<dyn WalSink>,
+) -> Result<ArchivedBackup, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut parts = Parts {
         sink,
-        system_id: system.system_id,
+        system_id,
         start: begun.start,
         streams: Vec::new(),
         buf: BytesMut::new(),
@@ -92,7 +114,7 @@ where
         )));
     }
     let backup = ArchivedBackup {
-        system_id: system.system_id,
+        system_id,
         timeline: begun.timeline,
         start: begun.start,
         end,
@@ -110,7 +132,7 @@ where
             backup.streams
         )));
     }
-    parts.sink.put(&done, Bytes::from(backup.to_text())).await?;
+    parts.sink.put(done, Bytes::from(backup.to_text())).await?;
     info!(start = %backup.start, end = %backup.end, "base backup written");
     Ok(backup)
 }
