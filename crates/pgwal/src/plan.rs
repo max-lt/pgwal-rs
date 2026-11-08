@@ -43,7 +43,7 @@ pub struct ReplayStart {
     pub system_id: u64,
     pub timeline: u32,
     /// The replay needs the WAL from here: the start of `backup_label`, or
-    /// the checkpoint of `pg_control`.
+    /// the redo point of `pg_control`.
     pub from: Lsn,
     pub origin: Origin,
     pub seg_size: u64,
@@ -72,7 +72,7 @@ impl ReplayStart {
             None => ReplayStart {
                 system_id: control.system_id,
                 timeline: control.timeline,
-                from: control.checkpoint,
+                from: control.redo,
                 origin: match control.state {
                     ClusterState::ShutDown | ClusterState::ShutDownInRecovery => Origin::ShutDown,
                     ClusterState::Running => Origin::Running,

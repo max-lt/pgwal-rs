@@ -68,8 +68,7 @@ pub fn write_history(pg_wal: &Path, timeline: u32, content: &[u8]) -> io::Result
 pub enum AfterReplay {
     /// It promotes to an unused timeline.
     Promote,
-    /// It stays a standby on the timeline of the archive. Hot standby stays
-    /// on, so a client can watch `pg_last_wal_replay_lsn()`.
+    /// It stays a standby on the timeline of the archive.
     StayStandby,
 }
 
