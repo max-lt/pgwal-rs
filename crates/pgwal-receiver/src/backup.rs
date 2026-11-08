@@ -12,8 +12,7 @@ use crate::error::Error;
 use crate::upload::WalSink;
 use crate::wire::{BackupMessage, Conn, ConnConfig};
 
-/// Largest part, so that memory stays bounded to one part.
-const PART_SIZE: usize = 16 << 20;
+const PART_SIZE: usize = crate::MAX_OBJECT;
 
 const MANIFEST: &str = "backup_manifest";
 

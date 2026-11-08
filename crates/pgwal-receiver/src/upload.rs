@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use pgwal::{Lsn, RangeKey, parse_segment_file_name, segment_file_name};
+use pgwal::{Lsn, RangeKey, segment_file_name};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
@@ -21,13 +21,11 @@ use tracing::{debug, info, warn};
 
 use crate::error::Error;
 use crate::store::{
-    PARTIAL_SUFFIX, WalStore, first_segment, read_flushed, read_system_id, write_durably,
+    PARTIAL_SUFFIX, WalStore, first_segment, read_flushed, read_system_id, segment_files,
+    write_durably,
 };
 
 const WATERMARK_FILE: &str = "uploaded";
-
-/// Largest object uploaded, so that memory stays bounded with 1 GB segments.
-pub(crate) const MAX_OBJECT: u64 = 16 << 20;
 
 #[async_trait]
 pub trait WalSink: Send + Sync {
@@ -114,7 +112,7 @@ pub(crate) struct Uploader {
     compaction: Option<tokio::task::JoinHandle<Result<(), Error>>>,
 }
 
-/// A compaction must not outlive its run: a replay can follow the run. An
+/// A replay that starts after the run must not see a delete in flight. An
 /// abort is safe, as the whole object goes up before the parts go.
 impl Drop for Uploader {
     fn drop(&mut self) {
@@ -149,7 +147,7 @@ impl Uploader {
             seg_size,
             sink,
             uploaded,
-            max_object: MAX_OBJECT,
+            max_object: crate::MAX_OBJECT as u64,
             compaction: None,
         })
     }
@@ -281,17 +279,10 @@ impl Uploader {
     }
 
     async fn remove_uploaded_segments(&self) -> Result<(), Error> {
-        let mut entries = fs::read_dir(&self.dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name();
-            let Some((timeline, segno)) = name
-                .to_str()
-                .and_then(|name| parse_segment_file_name(name, self.seg_size))
-            else {
-                continue;
-            };
-            if timeline == self.timeline && (segno + 1) * self.seg_size <= self.uploaded.0 {
-                fs::remove_file(entry.path()).await?;
+        for file in segment_files(&self.dir, self.seg_size).await? {
+            let uploaded = (file.segno + 1) * self.seg_size <= self.uploaded.0;
+            if file.timeline == self.timeline && !file.partial && uploaded {
+                fs::remove_file(file.path).await?;
             }
         }
         Ok(())

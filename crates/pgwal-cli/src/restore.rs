@@ -45,7 +45,13 @@ pub struct RestoreArgs {
 /// next start of Postgres replays it. Prints the LSN where the replay ends.
 pub async fn run(args: RestoreArgs) -> Result<()> {
     let archive = archive::open(&args.archive, &args.s3)?;
-    let end = apply(archive.as_ref(), &args.pgdata, args.accept_gap, args.standby).await?;
+    let end = apply(
+        archive.as_ref(),
+        &args.pgdata,
+        args.accept_gap,
+        args.standby,
+    )
+    .await?;
     println!("{end}");
     Ok(())
 }

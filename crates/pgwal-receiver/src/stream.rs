@@ -109,34 +109,30 @@ where
             .await?
             .map(|uploaded| uploaded.max(switch_point)),
     };
+    let first_wal_can_be_gone = resumed.is_none() && history.is_some();
     let mut start = match resumed {
         Some(lsn) => lsn,
         None if history.is_some() => switch_point,
-        None => conn
-            .slot_restart_lsn(&cfg.slot)
-            .await?
-            .unwrap_or(system.xlogpos),
+        None => slot_position(&mut conn, &cfg.slot, system.xlogpos).await?,
     }
     .segment_start(seg_size);
-    if let Err(e) = conn
+    match conn
         .start_replication(&cfg.slot, start, system.timeline)
         .await
     {
         // The first WAL of an old later timeline can be gone. Then the slot
         // position is the earliest WAL left.
-        if !matches!(e, Error::WalGone { .. }) || resumed.is_some() || history.is_none() {
-            return Err(e);
+        Err(Error::WalGone { .. }) if first_wal_can_be_gone => {
+            let fallback = slot_position(&mut conn, &cfg.slot, system.xlogpos)
+                .await?
+                .max(switch_point)
+                .segment_start(seg_size);
+            warn!(%start, %fallback, "the first WAL of the timeline is gone; its archive starts later");
+            start = fallback;
+            conn.start_replication(&cfg.slot, start, system.timeline)
+                .await?;
         }
-        let fallback = conn
-            .slot_restart_lsn(&cfg.slot)
-            .await?
-            .unwrap_or(system.xlogpos)
-            .max(switch_point)
-            .segment_start(seg_size);
-        warn!(%start, %fallback, "the first WAL of the timeline is gone; its archive starts later");
-        start = fallback;
-        conn.start_replication(&cfg.slot, start, system.timeline)
-            .await?;
+        other => other?,
     }
     store.start_at(start);
     info!(slot = %cfg.slot, system_id = system.system_id, timeline = system.timeline, %start, "streaming WAL");
@@ -171,6 +167,15 @@ where
     let uploaded = uploaded?;
     debug!(%flushed, %uploaded, "replication ended");
     Ok(uploaded)
+}
+
+/// The restart position of the slot, or the server position for a slot
+/// that holds no WAL yet.
+async fn slot_position<S>(conn: &mut Conn<S>, slot: &str, xlogpos: Lsn) -> Result<Lsn, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    Ok(conn.slot_restart_lsn(slot).await?.unwrap_or(xlogpos))
 }
 
 /// A dropped `receive` stops its uploader, which reads the store that the

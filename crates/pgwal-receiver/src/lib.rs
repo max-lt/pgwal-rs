@@ -69,3 +69,8 @@ pub use upload::{WalSink, salvage};
 pub use wire::ConnConfig;
 
 pub use pgwal::{ArchivedBackup, Lsn, RangeKey};
+
+/// Largest object put in a sink, so that memory stays bounded with 1 GiB
+/// segments.
+#[cfg(feature = "runtime")]
+const MAX_OBJECT: usize = 16 << 20;

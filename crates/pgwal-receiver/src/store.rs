@@ -76,24 +76,14 @@ impl WalStore {
     /// rewritten whole, or the end of the last finished one.
     pub async fn resume_point(&self) -> Result<Option<Lsn>, Error> {
         let (mut partial, mut finished) = (None, None);
-        let mut entries = fs::read_dir(&self.dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let (base, is_partial) = match name.strip_suffix(PARTIAL_SUFFIX) {
-                Some(base) => (base, true),
-                None => (name, false),
-            };
-            let Some((timeline, segno)) = parse_segment_file_name(base, self.seg_size) else {
-                continue;
-            };
-            if timeline != self.timeline {
+        for file in segment_files(&self.dir, self.seg_size).await? {
+            if file.timeline != self.timeline {
                 continue;
             }
-            if is_partial {
-                partial = partial.max(Some(segno));
+            if file.partial {
+                partial = partial.max(Some(file.segno));
             } else {
-                finished = finished.max(Some(segno));
+                finished = finished.max(Some(file.segno));
             }
         }
         Ok(match (partial, finished) {
@@ -232,19 +222,48 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+/// A segment file of a store.
+pub(crate) struct SegmentFile {
+    pub path: PathBuf,
+    pub timeline: u32,
+    pub segno: u64,
+    /// The unfinished segment.
+    pub partial: bool,
+}
+
+/// The segment files in `dir`.
+pub(crate) async fn segment_files(dir: &Path, seg_size: u64) -> Result<Vec<SegmentFile>, Error> {
+    let mut files = Vec::new();
+    let mut entries = fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let (base, partial) = match name.strip_suffix(PARTIAL_SUFFIX) {
+            Some(base) => (base, true),
+            None => (name, false),
+        };
+        let Some((timeline, segno)) = parse_segment_file_name(base, seg_size) else {
+            continue;
+        };
+        files.push(SegmentFile {
+            path: entry.path(),
+            timeline,
+            segno,
+            partial,
+        });
+    }
+    Ok(files)
+}
+
 /// Removes the segment files of every timeline but `timeline`.
 pub(crate) async fn remove_other_timelines(
     dir: &Path,
     timeline: u32,
     seg_size: u64,
 ) -> Result<(), Error> {
-    let mut entries = fs::read_dir(dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let base = name.strip_suffix(PARTIAL_SUFFIX).unwrap_or(name);
-        if parse_segment_file_name(base, seg_size).is_some_and(|(found, _)| found != timeline) {
-            fs::remove_file(entry.path()).await?;
+    for file in segment_files(dir, seg_size).await? {
+        if file.timeline != timeline {
+            fs::remove_file(file.path).await?;
         }
     }
     Ok(())

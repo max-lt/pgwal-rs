@@ -35,7 +35,7 @@ const MAX_IN_FLIGHT: usize = 64;
 /// Deletes at one time, within `MAX_IN_FLIGHT`.
 const DELETES_IN_FLIGHT: usize = 16;
 /// Largest object read: the receiver writes none larger.
-const MAX_OBJECT: usize = crate::upload::MAX_OBJECT as usize;
+const MAX_OBJECT: usize = crate::MAX_OBJECT;
 /// Largest list page or error body read. The store is not trusted.
 const MAX_SMALL: usize = 16 << 20;
 
