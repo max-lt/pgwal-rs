@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::{Either, select};
 use js_sys::Promise;
-use pgwal::{Lsn, RangeKey, history_key, timeline_start};
+use pgwal::{ArchiveKey, Lsn, RangeKey, timeline_start};
 use pgwal_receiver::Error as WireError;
 use pgwal_receiver::wire::{Conn, ConnConfig, CopyMessage};
 use serde::Deserialize;
@@ -548,7 +548,11 @@ impl Receiver {
                 .map_err(|e| Stop::fatal(format!("gap in the archive: {e}")))?;
         }
         if let Some(content) = &history {
-            let key = format!("{}{}", cfg.prefix, history_key(system.system_id, timeline));
+            let history = ArchiveKey::History {
+                system_id: system.system_id,
+                timeline,
+            };
+            let key = format!("{}{history}", cfg.prefix);
             self.bucket()?
                 .put(key, content.clone().into_bytes())
                 .execute()

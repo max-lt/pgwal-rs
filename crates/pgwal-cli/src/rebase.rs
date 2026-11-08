@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use pgwal::{ControlFile, Lsn};
+use pgwal::{AfterReplay, ClusterState, ControlFile, Lsn};
 use tracing::{info, warn};
 
 use crate::archive::{self, S3Args};
-use crate::restore;
+use crate::restore::{self, OnGap};
 
 /// Port of the private socket. The server listens on no TCP port.
 const PORT: &str = "5432";
@@ -49,7 +49,13 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
     check_version(&pg, &args.pgdata)?;
     let archive = archive::open(&args.archive, &args.s3)?;
     let t = Instant::now();
-    let end = restore::apply(archive.as_ref(), &args.pgdata, false, true).await?;
+    let end = restore::apply(
+        archive.as_ref(),
+        &args.pgdata,
+        OnGap::Refuse,
+        AfterReplay::StayStandby,
+    )
+    .await?;
     info!(
         seconds = t.elapsed().as_secs_f64(),
         "archive written to pg_wal"
@@ -64,9 +70,8 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
 
     std::fs::remove_file(args.pgdata.join("standby.signal"))?;
     let control = ControlFile::read(&args.pgdata)?;
-    let data = controldata(&pg, &args.pgdata)?;
-    if field(&data, "Database cluster state") != Some("shut down in recovery") {
-        bail!("the copy is not shut down in recovery:\n{data}");
+    if control.state != ClusterState::ShutDownInRecovery {
+        bail!("the copy is not shut down in recovery: {:?}", control.state);
     }
     verify(&pg, &args.pgdata, &args.user)?;
     if control.redo == before {
@@ -151,15 +156,13 @@ pub fn run_verify(args: VerifyArgs) -> Result<()> {
 /// amcheck pass runs on a scratch copy, because a server on the copy itself
 /// would end its recovery and write WAL of its own.
 pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
-    if pgdata.join("postmaster.pid").exists() {
-        bail!(
-            "{} has a postmaster.pid: stop Postgres first",
-            pgdata.display()
-        );
-    }
+    restore::refuse_running(pgdata)?;
     let t = Instant::now();
-    let data = controldata(pg, pgdata)?;
-    let checksums = field(&data, "Data page checksum version").is_some_and(|v| v != "0");
+    let data = pg.run("pg_controldata", &[path(pgdata)])?;
+    let checksums = data
+        .lines()
+        .find_map(|line| line.strip_prefix("Data page checksum version:"))
+        .is_some_and(|version| version.trim() != "0");
     if checksums {
         pg.run("pg_checksums", &["--check", "-D", path(pgdata)])
             .context("the page checksums of the copy are wrong")?;
@@ -262,11 +265,14 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
 pub struct Bin(Option<PathBuf>);
 
 impl Bin {
+    /// The output of `pg_controldata` is translated in other locales.
     fn command(&self, tool: &str) -> Command {
-        match &self.0 {
+        let mut command = match &self.0 {
             Some(dir) => Command::new(dir.join(tool)),
             None => Command::new(tool),
-        }
+        };
+        command.env("LC_ALL", "C");
+        command
     }
 
     /// Runs `tool`, and returns its stdout. A failure carries its stderr.
@@ -381,17 +387,6 @@ impl Drop for TrustLocal {
             warn!(path = %self.path.display(), "putting pg_hba.conf back failed: {e}");
         }
     }
-}
-
-fn controldata(pg: &Bin, pgdata: &Path) -> Result<String> {
-    pg.run("pg_controldata", &[path(pgdata)])
-}
-
-/// The value of `name` in `pg_controldata` output.
-fn field<'a>(data: &'a str, name: &str) -> Option<&'a str> {
-    data.lines()
-        .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
-        .map(str::trim)
 }
 
 fn tail(log: &Path) -> String {

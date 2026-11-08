@@ -1,7 +1,7 @@
 use crate::lsn::Lsn;
 
 /// The key of one uploaded object: the WAL bytes `[start, end)` of `timeline`
-/// in the cluster `system_id`. Keys of one cluster sort by LSN.
+/// in the cluster `system_id`. The keys of one timeline sort by LSN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RangeKey {
     pub system_id: u64,
@@ -67,7 +67,7 @@ pub fn assemble_segment(
 /// Lays archived WAL over `segment`, the bytes of segment `segno`. Ranges may
 /// overlap, leave gaps, or belong to other segments. `None` if an object is
 /// shorter than its key says.
-pub fn overlay_segment(
+pub(crate) fn overlay_segment(
     segment: &mut [u8],
     segno: u64,
     seg_size: u64,
@@ -93,17 +93,83 @@ pub fn history_file_name(timeline: u32) -> String {
     format!("{timeline:08X}.history")
 }
 
-/// Object key of the history file of `timeline` in the cluster `system_id`.
-pub fn history_key(system_id: u64, timeline: u32) -> String {
-    format!("{system_id}/{}", history_file_name(timeline))
+/// The key of an object in an archive. The objects of one cluster are under
+/// `{system_id}/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArchiveKey {
+    Range(RangeKey),
+    /// The history file of `timeline`.
+    History {
+        system_id: u64,
+        timeline: u32,
+    },
+    /// Part `part` of the file `name` of the base backup that starts at
+    /// `start`. The parts of a file, in order, make the file.
+    BackupPart {
+        system_id: u64,
+        start: Lsn,
+        name: String,
+        part: u32,
+    },
+    /// The description of the base backup that starts at `start`. It goes
+    /// last: a backup without it is incomplete.
+    BackupDone {
+        system_id: u64,
+        start: Lsn,
+    },
 }
 
-/// Inverse of [`history_key`]: `(system_id, timeline)`.
-pub fn parse_history_key(key: &str) -> Option<(u64, u32)> {
-    let (system_id, name) = key.split_once('/')?;
-    let timeline = u32::from_str_radix(name.strip_suffix(".history")?, 16).ok()?;
-    let parsed = (system_id.parse().ok()?, timeline);
-    (history_key(parsed.0, parsed.1) == key).then_some(parsed)
+impl std::fmt::Display for ArchiveKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArchiveKey::Range(range) => range.fmt(f),
+            ArchiveKey::History {
+                system_id,
+                timeline,
+            } => write!(f, "{system_id}/{}", history_file_name(*timeline)),
+            ArchiveKey::BackupPart {
+                system_id,
+                start,
+                name,
+                part,
+            } => write!(f, "{system_id}/base/{:016X}/{name}.{part:06}", start.0),
+            ArchiveKey::BackupDone { system_id, start } => {
+                write!(f, "{system_id}/base/{:016X}/done", start.0)
+            }
+        }
+    }
+}
+
+impl ArchiveKey {
+    /// Accepts only the exact form `Display` writes.
+    pub fn parse(key: &str) -> Option<Self> {
+        if let Some(range) = RangeKey::parse(key) {
+            return Some(ArchiveKey::Range(range));
+        }
+        let (system_id, rest) = key.split_once('/')?;
+        let system_id = system_id.parse().ok()?;
+        let parsed = if let Some(name) = rest.strip_suffix(".history") {
+            ArchiveKey::History {
+                system_id,
+                timeline: u32::from_str_radix(name, 16).ok()?,
+            }
+        } else {
+            let (start, file) = rest.strip_prefix("base/")?.split_once('/')?;
+            let start = Lsn(u64::from_str_radix(start, 16).ok()?);
+            if file == "done" {
+                ArchiveKey::BackupDone { system_id, start }
+            } else {
+                let (name, part) = file.rsplit_once('.')?;
+                ArchiveKey::BackupPart {
+                    system_id,
+                    start,
+                    name: name.to_owned(),
+                    part: part.parse().ok()?,
+                }
+            }
+        };
+        (parsed.to_string() == key).then_some(parsed)
+    }
 }
 
 /// Where the timeline a history file describes begins: the switch point on
@@ -182,14 +248,46 @@ mod tests {
     }
 
     #[test]
-    fn history_keys_and_timeline_starts() {
-        assert_eq!(history_key(7401, 2), "7401/00000002.history");
-        assert_eq!(parse_history_key("7401/00000002.history"), Some((7401, 2)));
-        assert_eq!(parse_history_key("7401/0000000002.history"), None);
-        assert_eq!(
-            parse_history_key("7401/00000001/0000000001000000-0000000001000148"),
-            None
-        );
+    fn archive_keys_round_trip() {
+        let keys = [
+            ArchiveKey::Range(RangeKey::parse(&key(0x10, 0x20)).unwrap()),
+            ArchiveKey::History {
+                system_id: 7401,
+                timeline: 2,
+            },
+            ArchiveKey::BackupPart {
+                system_id: 7401,
+                start: Lsn(0x1_0200_0028),
+                name: "base.tar".into(),
+                part: 2,
+            },
+            ArchiveKey::BackupDone {
+                system_id: 7401,
+                start: Lsn(0x1_0200_0028),
+            },
+        ];
+        let texts = [
+            "7401/00000001/0000000000000010-0000000000000020",
+            "7401/00000002.history",
+            "7401/base/0000000102000028/base.tar.000002",
+            "7401/base/0000000102000028/done",
+        ];
+        for (key, text) in keys.iter().zip(texts) {
+            assert_eq!(key.to_string(), text);
+            assert_eq!(ArchiveKey::parse(text).as_ref(), Some(key));
+        }
+        for bad in [
+            "7401/0000000002.history",
+            "7401/base/2000028/done",
+            "7401/base/0000000102000028/base.tar.2",
+            "7401/uploaded",
+        ] {
+            assert_eq!(ArchiveKey::parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn timeline_starts() {
         let history = "1\t0/3000148\tno recovery target specified\n\n2\t0/5000000\tno recovery target specified\n";
         assert_eq!(timeline_start(history), Some(Lsn(0x500_0000)));
         assert_eq!(timeline_start(""), None);

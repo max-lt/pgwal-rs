@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use pgwal::{ArchivedBackup, Lsn, backup_done_key, backup_part_key};
+use pgwal::{ArchiveKey, ArchivedBackup, Lsn};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::info;
 
@@ -93,7 +93,11 @@ where
     parts
         .sink
         .put(
-            &backup_done_key(backup.system_id, backup.start),
+            &ArchiveKey::BackupDone {
+                system_id: backup.system_id,
+                start: backup.start,
+            }
+            .to_string(),
             Bytes::from(backup.to_text()),
         )
         .await?;
@@ -147,8 +151,13 @@ impl Parts {
 
     async fn put(&mut self, part: Bytes) -> Result<(), Error> {
         let (name, written) = self.streams.last_mut().expect("a file has started");
-        let key = backup_part_key(self.system_id, self.start, name, *written);
-        self.sink.put(&key, part).await?;
+        let key = ArchiveKey::BackupPart {
+            system_id: self.system_id,
+            start: self.start,
+            name: name.clone(),
+            part: *written,
+        };
+        self.sink.put(&key.to_string(), part).await?;
         *written += 1;
         Ok(())
     }

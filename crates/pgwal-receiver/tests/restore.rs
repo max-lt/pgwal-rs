@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use pgwal::{ControlFile, assemble_segment, backup_done_key, backup_part_key, segment_file_name};
+use pgwal::{ArchiveKey, ClusterState, ControlFile, assemble_segment, segment_file_name};
 use pgwal_receiver::{
     ArchivedBackup, Confirm, ConnConfig, DirSink, Error, Lsn, RangeKey, StreamConfig, base_backup,
     forget_slot, receive,
@@ -336,8 +336,13 @@ fn unpack(backup: &ArchivedBackup, objects: &Path, out: &Path) {
     for (name, parts) in &backup.streams {
         let mut file = Vec::new();
         for part in 0..*parts {
-            let key = backup_part_key(backup.system_id, backup.start, name, part);
-            file.extend(std::fs::read(objects.join(key)).unwrap());
+            let key = ArchiveKey::BackupPart {
+                system_id: backup.system_id,
+                start: backup.start,
+                name: name.clone(),
+                part,
+            };
+            file.extend(std::fs::read(objects.join(key.to_string())).unwrap());
         }
         std::fs::write(out.join(name), file).unwrap();
     }
@@ -414,7 +419,11 @@ async fn a_base_backup_in_the_sink_restores_every_row() {
     let uploaded = finish(receiver).await.unwrap();
     assert!(uploaded >= backup.end, "{uploaded} < {}", backup.end);
 
-    let done = objects.join(backup_done_key(backup.system_id, backup.start));
+    let done = ArchiveKey::BackupDone {
+        system_id: backup.system_id,
+        start: backup.start,
+    };
+    let done = objects.join(done.to_string());
     let done = std::fs::read_to_string(done).unwrap();
     assert_eq!(ArchivedBackup::parse(&done).as_ref(), Some(&backup));
     let base_parts = backup.streams.iter().find(|(name, _)| name == "base.tar");
@@ -465,7 +474,7 @@ fn assert_matches_controldata(bin: &Path, data: &Path) {
         fields["Database system identifier"]
     );
     assert_eq!(
-        control.clean_shutdown,
+        control.state == ClusterState::ShutDown,
         fields["Database cluster state"] == "shut down"
     );
     assert_eq!(

@@ -56,9 +56,10 @@ impl BackupLabel {
     }
 }
 
-/// A base backup in an archive, as its `done` object describes it. The
-/// objects of the backup are under `{system_id}/base/{start}/`: the parts of
-/// each stream, then `done`.
+/// A base backup in an archive, as its [`ArchiveKey::BackupDone`] object
+/// describes it.
+///
+/// [`ArchiveKey::BackupDone`]: crate::ArchiveKey::BackupDone
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchivedBackup {
     pub system_id: u64,
@@ -124,30 +125,6 @@ impl ArchivedBackup {
     }
 }
 
-fn backup_dir(system_id: u64, start: Lsn) -> String {
-    format!("{system_id}/base/{:016X}", start.0)
-}
-
-/// Object key of part `part` of the stream `name` of the base backup that
-/// starts at `start`. The parts of a stream, in order, make the file.
-pub fn backup_part_key(system_id: u64, start: Lsn, name: &str, part: u32) -> String {
-    format!("{}/{name}.{part:06}", backup_dir(system_id, start))
-}
-
-/// Object key of the `done` object of a base backup. It goes last: a backup
-/// without it is incomplete.
-pub fn backup_done_key(system_id: u64, start: Lsn) -> String {
-    format!("{}/done", backup_dir(system_id, start))
-}
-
-/// Inverse of [`backup_done_key`]: `(system_id, start)`.
-pub fn parse_backup_done_key(key: &str) -> Option<(u64, Lsn)> {
-    let (system_id, rest) = key.split_once("/base/")?;
-    let start = Lsn(u64::from_str_radix(rest.strip_suffix("/done")?, 16).ok()?);
-    let parsed = (system_id.parse().ok()?, start);
-    (backup_done_key(parsed.0, parsed.1) == key).then_some(parsed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,21 +141,6 @@ mod tests {
         };
         assert_eq!(ArchivedBackup::parse(&backup.to_text()), Some(backup));
         assert_eq!(ArchivedBackup::parse("SYSTEM: 7401\nTIMELINE: 1\n"), None);
-    }
-
-    #[test]
-    fn backup_keys_parse_back() {
-        let key = backup_done_key(7401, Lsn(0x1_0200_0028));
-        assert_eq!(key, "7401/base/0000000102000028/done");
-        assert_eq!(
-            parse_backup_done_key(&key),
-            Some((7401, Lsn(0x1_0200_0028)))
-        );
-        assert_eq!(parse_backup_done_key("7401/base/2000028/done"), None);
-        assert_eq!(
-            backup_part_key(7401, Lsn(0x28), "base.tar", 2),
-            "7401/base/0000000000000028/base.tar.000002"
-        );
     }
 
     const LABEL: &str = "START WAL LOCATION: 0/5A3C128 (file 000000010000000000000005)\n\

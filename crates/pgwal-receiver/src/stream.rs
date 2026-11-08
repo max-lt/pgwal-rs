@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use pgwal::{Lsn, history_key, timeline_start};
+use pgwal::{ArchiveKey, Lsn, timeline_start};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -84,7 +84,11 @@ where
         .unwrap_or_default();
     if let Some(content) = &history {
         sink.put(
-            &history_key(system.system_id, system.timeline),
+            &ArchiveKey::History {
+                system_id: system.system_id,
+                timeline: system.timeline,
+            }
+            .to_string(),
             Bytes::from(content.clone()),
         )
         .await?;

@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
+use std::io;
+use std::path::Path;
 
-use crate::{ControlFile, Lsn, RangeKey, parse_history_key};
+use crate::{ArchiveKey, BackupLabel, ClusterState, ControlFile, Lsn, RangeKey, segment_size};
 
 /// How Postgres reaches the end of the replayed WAL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recovery {
-    /// The archive holds nothing after the base backup.
+    /// The archive holds nothing after the copy.
     Nothing,
     /// Crash recovery replays `pg_wal` up to `end`.
     Crash { end: Lsn },
@@ -15,52 +17,113 @@ pub enum Recovery {
     Archive { end: Lsn },
 }
 
-/// The archived WAL a restored base backup needs.
+/// What a copy of a data directory is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// A base backup with its `backup_label`.
+    BaseBackup,
+    /// A copy after a clean stop of a primary or of a standby.
+    ShutDown,
+    /// A copy of a server that did not stop cleanly, such as a snapshot.
+    Running,
+}
+
+/// Where the replay of a copy of a data directory starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayStart {
+    pub system_id: u64,
+    pub timeline: u32,
+    /// The archive must hold the WAL from here: the start of `backup_label`,
+    /// or the checkpoint of `pg_control`.
+    pub from: Lsn,
+    pub origin: Origin,
+    pub seg_size: u64,
+}
+
+impl ReplayStart {
+    /// Reads `backup_label` and `pg_control` of `data_dir`. The label wins:
+    /// a checkpoint during the copy moves `pg_control` past WAL that the
+    /// replay still needs.
+    pub fn read(data_dir: &Path) -> io::Result<Self> {
+        let control = ControlFile::read(data_dir)?;
+        let label = BackupLabel::read(data_dir)?;
+        let seg_size = match segment_size(&data_dir.join("pg_wal")) {
+            Ok(size) => size,
+            Err(e) => label
+                .as_ref()
+                .and_then(BackupLabel::segment_size)
+                .ok_or(e)?,
+        };
+        Ok(match label {
+            Some(label) => ReplayStart {
+                system_id: control.system_id,
+                timeline: label.timeline,
+                from: label.start,
+                origin: Origin::BaseBackup,
+                seg_size,
+            },
+            None => ReplayStart {
+                system_id: control.system_id,
+                timeline: control.timeline,
+                from: control.checkpoint,
+                origin: match control.state {
+                    ClusterState::ShutDown | ClusterState::ShutDownInRecovery => Origin::ShutDown,
+                    ClusterState::Running => Origin::Running,
+                },
+                seg_size,
+            },
+        })
+    }
+}
+
+/// The objects of one segment file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub timeline: u32,
+    pub segno: u64,
+    pub keys: Vec<RangeKey>,
+}
+
+/// The archived WAL a restored copy needs.
 #[derive(Debug)]
 pub struct ReplayPlan {
     /// Timelines whose history file goes into `pg_wal`.
     pub histories: Vec<u32>,
-    /// `(timeline, segno, objects)`, one entry per segment file.
-    pub segments: Vec<(u32, u64, Vec<RangeKey>)>,
+    pub segments: Vec<Segment>,
     pub recovery: Recovery,
-    /// Where the archive has a gap on the timeline of the base backup, if it has one.
+    /// Where the archive has its first gap, if it has one.
     pub gap: Option<Lsn>,
 }
 
-/// Plans the replay of the archive `keys` onto a base backup that `control`
-/// describes: its timeline after its checkpoint, and every later
-/// timeline. At the first gap on its timeline, the rest goes and the
-/// replay promotes: a server that went on from the gap on the same timeline
-/// would write other WAL at the LSNs the archive keeps after it.
-pub fn plan<'a>(
-    keys: impl IntoIterator<Item = &'a str>,
-    control: &ControlFile,
-    seg_size: u64,
-) -> ReplayPlan {
+/// Plans the replay of the archive `keys` onto the copy that `start`
+/// describes: its timeline from `start.from`, then each later timeline.
+/// The replay stops at the first gap and promotes, as a server that went on
+/// from the gap writes other WAL at the LSNs after it.
+pub fn plan<'a>(keys: impl IntoIterator<Item = &'a str>, start: &ReplayStart) -> ReplayPlan {
     let (mut ranges, mut histories) = (Vec::new(), Vec::new());
     for key in keys {
-        if let Some(range) = RangeKey::parse(key) {
-            let follows = (range.timeline == control.timeline && range.end > control.checkpoint)
-                || range.timeline > control.timeline;
-            if range.system_id == control.system_id && follows {
+        match ArchiveKey::parse(key) {
+            Some(ArchiveKey::Range(range))
+                if range.system_id == start.system_id
+                    && ((range.timeline == start.timeline && range.end > start.from)
+                        || range.timeline > start.timeline) =>
+            {
                 ranges.push(range);
             }
-        } else if let Some((system_id, timeline)) = parse_history_key(key)
-            && system_id == control.system_id
-        {
-            histories.push(timeline);
+            Some(ArchiveKey::History {
+                system_id,
+                timeline,
+            }) if system_id == start.system_id => histories.push(timeline),
+            _ => {}
         }
     }
-    let gap = drop_after_gap(&mut ranges, control);
+    let (end, gap) = drop_after_gap(&mut ranges, start);
 
-    let end = ranges.iter().map(|r| r.end).max();
-    let later_timeline = ranges.iter().any(|r| r.timeline > control.timeline);
+    let later_timeline = ranges.iter().any(|r| r.timeline > start.timeline);
     let recovery = match end {
         None if gap.is_none() => Recovery::Nothing,
-        None => Recovery::Archive {
-            end: control.checkpoint,
-        },
-        Some(end) if control.clean_shutdown || later_timeline || gap.is_some() => {
+        None => Recovery::Archive { end: start.from },
+        Some(end) if start.origin != Origin::Running || later_timeline || gap.is_some() => {
             Recovery::Archive { end }
         }
         Some(end) => Recovery::Crash { end },
@@ -70,8 +133,8 @@ pub fn plan<'a>(
     // touches. The uploader never makes one; another writer could.
     let mut segments: BTreeMap<(u32, u64), Vec<RangeKey>> = BTreeMap::new();
     for range in ranges {
-        let last = Lsn(range.end.0 - 1).segment_no(seg_size);
-        for segno in range.start.segment_no(seg_size)..=last {
+        let last = Lsn(range.end.0 - 1).segment_no(start.seg_size);
+        for segno in range.start.segment_no(start.seg_size)..=last {
             segments
                 .entry((range.timeline, segno))
                 .or_default()
@@ -80,7 +143,11 @@ pub fn plan<'a>(
     }
     let segments = segments
         .into_iter()
-        .map(|((timeline, segno), keys)| (timeline, segno, drop_contained(keys)))
+        .map(|((timeline, segno), keys)| Segment {
+            timeline,
+            segno,
+            keys: drop_contained(keys),
+        })
         .collect();
     ReplayPlan {
         histories,
@@ -88,6 +155,27 @@ pub fn plan<'a>(
         recovery,
         gap,
     }
+}
+
+/// How far the ranges of `timeline` hold the WAL from `from` with no hole.
+pub fn chain_end<'a>(
+    ranges: impl IntoIterator<Item = &'a RangeKey>,
+    timeline: u32,
+    from: Lsn,
+) -> Lsn {
+    let mut chain: Vec<&RangeKey> = ranges
+        .into_iter()
+        .filter(|r| r.timeline == timeline)
+        .collect();
+    chain.sort_by_key(|r| r.start);
+    let mut reached = from;
+    for range in chain {
+        if range.start > reached {
+            break;
+        }
+        reached = reached.max(range.end);
+    }
+    reached
 }
 
 /// Drops the keys whose range lies inside another key's range. A compaction
@@ -103,25 +191,39 @@ fn drop_contained(mut keys: Vec<RangeKey>) -> Vec<RangeKey> {
     keys
 }
 
-/// Keeps the ranges of the timeline of the base backup that chain from the checkpoint
-/// without a gap. After a gap, drops the rest, later timelines included, and
-/// returns where the gap starts.
-fn drop_after_gap(ranges: &mut Vec<RangeKey>, control: &ControlFile) -> Option<Lsn> {
-    let mut chain: Vec<&RangeKey> = ranges
-        .iter()
-        .filter(|r| r.timeline == control.timeline)
-        .collect();
-    chain.sort_by_key(|r| r.start);
-    let mut reached = control.checkpoint;
-    for range in chain {
-        if range.start > reached {
-            let gap = reached;
-            ranges.retain(|r| r.timeline == control.timeline && r.start <= gap);
-            return Some(gap);
+/// Chains each timeline in turn: the timeline of the copy from
+/// `start.from`, a later one from its first range. At the first hole, drops
+/// the rest of that timeline and every later timeline. Returns the end of
+/// the last chain, and where the hole starts.
+fn drop_after_gap(ranges: &mut Vec<RangeKey>, start: &ReplayStart) -> (Option<Lsn>, Option<Lsn>) {
+    let mut timelines: Vec<u32> = ranges.iter().map(|r| r.timeline).collect();
+    timelines.sort();
+    timelines.dedup();
+    let mut end = None;
+    for timeline in timelines {
+        let from = if timeline == start.timeline {
+            start.from
+        } else {
+            ranges
+                .iter()
+                .filter(|r| r.timeline == timeline)
+                .map(|r| r.start)
+                .min()
+                .expect("a timeline of the ranges has a range")
+        };
+        let reached = chain_end(ranges.iter(), timeline, from);
+        end = Some(reached);
+        let hole = ranges
+            .iter()
+            .any(|r| r.timeline == timeline && r.start > reached);
+        if hole {
+            ranges.retain(|r| {
+                r.timeline < timeline || (r.timeline == timeline && r.start <= reached)
+            });
+            return (end, Some(reached));
         }
-        reached = reached.max(range.end);
     }
-    None
+    (end, None)
 }
 
 #[cfg(test)]
@@ -130,13 +232,13 @@ mod tests {
 
     const SEG: u64 = 1 << 20;
 
-    fn control() -> ControlFile {
-        ControlFile {
+    fn start() -> ReplayStart {
+        ReplayStart {
             system_id: 7,
-            clean_shutdown: false,
-            checkpoint: Lsn(SEG + 0x100),
-            redo: Lsn(SEG + 0x100),
             timeline: 1,
+            from: Lsn(SEG + 0x100),
+            origin: Origin::Running,
+            seg_size: SEG,
         }
     }
 
@@ -153,7 +255,7 @@ mod tests {
     #[test]
     fn a_chain_after_the_checkpoint_gets_crash_recovery() {
         let keys = [key(1, SEG, SEG + 0x200), key(1, SEG + 0x200, SEG + 0x300)];
-        let plan = plan(keys.iter().map(String::as_str), &control(), SEG);
+        let plan = plan(keys.iter().map(String::as_str), &start());
         assert_eq!(
             plan.recovery,
             Recovery::Crash {
@@ -171,7 +273,7 @@ mod tests {
             key(1, SEG + 0x400, SEG + 0x500),
             key(2, SEG + 0x500, SEG + 0x600),
         ];
-        let plan = plan(keys.iter().map(String::as_str), &control(), SEG);
+        let plan = plan(keys.iter().map(String::as_str), &start());
         assert_eq!(plan.gap, Some(Lsn(SEG + 0x200)));
         assert_eq!(
             plan.recovery,
@@ -188,9 +290,59 @@ mod tests {
             key(1, SEG, SEG + 0x200),
             key(1, SEG + 0x200, 2 * SEG),
         ];
-        let plan = plan(keys.iter().map(String::as_str), &control(), SEG);
-        let (_, _, objects) = &plan.segments[0];
+        let plan = plan(keys.iter().map(String::as_str), &start());
+        let objects = &plan.segments[0].keys;
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].end, Lsn(2 * SEG));
+    }
+
+    #[test]
+    fn a_hole_on_a_later_timeline_stops_the_replay_there() {
+        let keys = [
+            key(1, SEG, SEG + 0x200),
+            key(2, SEG + 0x200, SEG + 0x300),
+            key(2, SEG + 0x400, SEG + 0x500),
+            key(3, SEG + 0x500, SEG + 0x600),
+        ];
+        let plan = plan(keys.iter().map(String::as_str), &start());
+        assert_eq!(plan.gap, Some(Lsn(SEG + 0x300)));
+        assert_eq!(
+            plan.recovery,
+            Recovery::Archive {
+                end: Lsn(SEG + 0x300)
+            }
+        );
+        let kept: Vec<_> = plan.segments.iter().flat_map(|s| &s.keys).collect();
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn the_end_is_the_end_of_the_last_timeline() {
+        // The old primary wrote past the switch point before the failover.
+        let keys = [key(1, SEG, SEG + 0x900), key(2, SEG + 0x200, SEG + 0x300)];
+        let plan = plan(keys.iter().map(String::as_str), &start());
+        assert_eq!(plan.gap, None);
+        assert_eq!(
+            plan.recovery,
+            Recovery::Archive {
+                end: Lsn(SEG + 0x300)
+            }
+        );
+    }
+
+    #[test]
+    fn a_clean_copy_gets_an_archive_recovery() {
+        let keys = [key(1, SEG, SEG + 0x200)];
+        let clean = ReplayStart {
+            origin: Origin::ShutDown,
+            ..start()
+        };
+        let plan = plan(keys.iter().map(String::as_str), &clean);
+        assert_eq!(
+            plan.recovery,
+            Recovery::Archive {
+                end: Lsn(SEG + 0x200)
+            }
+        );
     }
 }

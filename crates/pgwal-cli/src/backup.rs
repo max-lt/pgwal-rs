@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, Bytes};
 use clap::Args;
-use pgwal::{ArchivedBackup, RangeKey, backup_done_key, backup_part_key, parse_backup_done_key};
+use pgwal::{ArchiveKey, ArchivedBackup, Lsn, RangeKey, chain_end};
 use pgwal_receiver::{WalSink, base_backup};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -100,9 +100,12 @@ async fn latest(
     keys: &[String],
     system_id: Option<u64>,
 ) -> Result<ArchivedBackup> {
-    let mut found: Vec<(u64, pgwal::Lsn)> = keys
+    let mut found: Vec<(u64, Lsn)> = keys
         .iter()
-        .filter_map(|key| parse_backup_done_key(key))
+        .filter_map(|key| match ArchiveKey::parse(key)? {
+            ArchiveKey::BackupDone { system_id, start } => Some((system_id, start)),
+            _ => None,
+        })
         .filter(|(system, _)| system_id.is_none_or(|wanted| wanted == *system))
         .collect();
     let systems: BTreeSet<u64> = found.iter().map(|(system, _)| *system).collect();
@@ -111,7 +114,11 @@ async fn latest(
     }
     found.sort();
     for (system, start) in found.into_iter().rev() {
-        let key = backup_done_key(system, start);
+        let key = ArchiveKey::BackupDone {
+            system_id: system,
+            start,
+        }
+        .to_string();
         let text = archive::read(archive, &key).await?;
         let backup = std::str::from_utf8(&text)
             .ok()
@@ -128,20 +135,12 @@ async fn latest(
 
 /// The archive holds the WAL of `backup` from its start to its end.
 fn covered(keys: &[String], backup: &ArchivedBackup) -> bool {
-    let mut ranges: Vec<RangeKey> = keys
+    let ranges: Vec<RangeKey> = keys
         .iter()
         .filter_map(|key| RangeKey::parse(key))
-        .filter(|r| r.system_id == backup.system_id && r.timeline == backup.timeline)
+        .filter(|r| r.system_id == backup.system_id)
         .collect();
-    ranges.sort();
-    let mut at = backup.start;
-    for range in ranges {
-        if range.start > at {
-            break;
-        }
-        at = at.max(range.end);
-    }
-    at >= backup.end
+    chain_end(&ranges, backup.timeline, backup.start) >= backup.end
 }
 
 fn empty_dir(dir: &Path) -> Result<()> {
@@ -160,7 +159,13 @@ fn empty_dir(dir: &Path) -> Result<()> {
 }
 
 fn part_key(backup: &ArchivedBackup, name: &str, part: u32) -> String {
-    backup_part_key(backup.system_id, backup.start, name, part)
+    ArchiveKey::BackupPart {
+        system_id: backup.system_id,
+        start: backup.start,
+        name: name.to_owned(),
+        part,
+    }
+    .to_string()
 }
 
 /// Unpacks the tar file `name` into `dir` as its parts arrive.
@@ -222,7 +227,6 @@ impl Read for Parts {
 
 #[cfg(test)]
 mod tests {
-    use pgwal::Lsn;
 
     use super::*;
 

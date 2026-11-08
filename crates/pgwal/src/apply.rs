@@ -54,29 +54,25 @@ pub fn write_history(pg_wal: &Path, timeline: u32, content: &[u8]) -> io::Result
     std::fs::write(pg_wal.join(history_file_name(timeline)), content)
 }
 
-/// Makes the next start of Postgres an archive recovery that reads the WAL
-/// already in `pg_wal` and then promotes. Safe to call twice.
-pub fn request_archive_recovery(data_dir: &Path) -> io::Result<()> {
-    std::fs::write(data_dir.join("recovery.signal"), b"")?;
-    append_missing(
-        &data_dir.join("postgresql.auto.conf"),
-        &[
-            // The WAL is already in pg_wal; Postgres reads it there when the
-            // restore command fails.
-            "restore_command = 'false'",
-            // No reads during the replay. Without them, Postgres does not
-            // require settings at least as high as when the WAL was written.
-            "hot_standby = off",
-        ],
-    )
+/// What Postgres does once it has replayed the WAL in `pg_wal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterReplay {
+    /// It promotes to an unused timeline.
+    Promote,
+    /// It stays a standby on the timeline of the archive. Hot standby stays
+    /// on, so a client can watch `pg_last_wal_replay_lsn()`.
+    StayStandby,
 }
 
-/// Makes the next start of Postgres a standby that replays the WAL already
-/// in `pg_wal` and stays in recovery, on the timeline of the archive. Hot
-/// standby stays on, so a client can watch `pg_last_wal_replay_lsn()`. Safe
-/// to call twice.
-pub fn request_standby(data_dir: &Path) -> io::Result<()> {
-    std::fs::write(data_dir.join("standby.signal"), b"")?;
+/// Makes the next start of Postgres an archive recovery that reads the WAL
+/// already in `pg_wal`. Safe to call twice.
+pub fn request_recovery(data_dir: &Path, after: AfterReplay) -> io::Result<()> {
+    let signal = match after {
+        AfterReplay::Promote => "recovery.signal",
+        AfterReplay::StayStandby => "standby.signal",
+    };
+    std::fs::write(data_dir.join(signal), b"")?;
+    // Postgres reads the WAL in pg_wal when the restore command fails.
     append_missing(
         &data_dir.join("postgresql.auto.conf"),
         &["restore_command = 'false'"],
@@ -132,14 +128,16 @@ mod tests {
     }
 
     #[test]
-    fn an_archive_recovery_request_is_written_once() {
+    fn a_recovery_request_is_written_once() {
         let dir = tempfile::tempdir().unwrap();
-        request_archive_recovery(dir.path()).unwrap();
-        request_archive_recovery(dir.path()).unwrap();
+        request_recovery(dir.path(), AfterReplay::Promote).unwrap();
+        request_recovery(dir.path(), AfterReplay::Promote).unwrap();
         assert!(dir.path().join("recovery.signal").exists());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("postgresql.auto.conf")).unwrap(),
-            "restore_command = 'false'\nhot_standby = off\n"
+            "restore_command = 'false'\n"
         );
+        request_recovery(dir.path(), AfterReplay::StayStandby).unwrap();
+        assert!(dir.path().join("standby.signal").exists());
     }
 }
