@@ -148,6 +148,12 @@ fn covered(keys: &[String], backup: &ArchivedBackup) -> bool {
 }
 
 fn empty_dir(dir: &Path) -> Result<()> {
+    // The command creates what is missing of the path.
+    let existing = dir
+        .ancestors()
+        .find(|path| path.exists())
+        .unwrap_or(Path::new("."));
+    crate::restore::refuse_other_owner(existing)?;
     match std::fs::read_dir(dir) {
         Ok(mut entries) => {
             if entries.next().is_some() {

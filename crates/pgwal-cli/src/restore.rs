@@ -86,6 +86,7 @@ pub fn run_plan(args: PlanArgs) -> Result<()> {
         .filter_map(|line| line.strip_prefix(&args.prefix));
     // A plan from keys only: it does not read the switch points.
     let plan = plan(keys, &start, &[]);
+    plan_end(&plan, &start, "check the keys and --prefix")?;
     if let Some(gap) = plan.gap {
         warn!(%gap, "the archive has a gap: a restore stops there");
     }
@@ -111,6 +112,8 @@ fn replay_start(pgdata: &Path) -> Result<ReplayStart> {
 pub struct Prepared {
     pub start: ReplayStart,
     pub plan: ReplayPlan,
+    /// Where the replay ends.
+    pub end: Lsn,
 }
 
 /// Writes the archived WAL that follows the copy in `pgdata` into its
@@ -134,30 +137,38 @@ pub async fn apply(
 /// Reads the copy and plans its replay from the archive.
 pub async fn prepare(archive: &dyn WalSink, pgdata: &Path) -> Result<Prepared> {
     refuse_running(pgdata)?;
+    refuse_other_owner(pgdata)?;
     let start = replay_start(pgdata)?;
     let prefix = ArchiveKey::wal_prefix(start.system_id);
     let mut keys = archive.list(&prefix).await?;
-    let mut listed_again = false;
-    let plan = loop {
-        let switches = switches(archive, &keys, start.system_id).await?;
-        let plan = plan(keys.iter().map(String::as_str), &start, &switches);
-        if plan.gap.is_none() || listed_again {
-            break plan;
-        }
+    let mut plan = plan_archive(archive, &keys, &start).await?;
+    if plan.gap.is_some() {
         archive::list_again(archive, &prefix, &mut keys).await?;
-        listed_again = true;
-    };
-    // The archive holds the segment of the start of any copy that it serves.
-    // An empty plan is the archive of another cluster, or a wrong location.
-    if plan.segments.is_empty() {
-        bail!(
-            "the archive holds no WAL of system {} from {}: check --archive",
-            start.system_id,
-            start.from
-        );
+        plan = plan_archive(archive, &keys, &start).await?;
     }
+    let end = plan_end(&plan, &start, "check --archive")?;
+    Ok(Prepared { start, plan, end })
+}
 
-    Ok(Prepared { start, plan })
+async fn plan_archive(
+    archive: &dyn WalSink,
+    keys: &[String],
+    start: &ReplayStart,
+) -> Result<ReplayPlan> {
+    let switches = switches(archive, keys, start.system_id).await?;
+    Ok(plan(keys.iter().map(String::as_str), start, &switches))
+}
+
+/// Where the replay of `plan` ends. The archive holds the segment of the
+/// start of any copy that it serves: an empty plan is the archive of another
+/// cluster, or a wrong location.
+fn plan_end(plan: &ReplayPlan, start: &ReplayStart, hint: &str) -> Result<Lsn> {
+    plan.recovery.end().with_context(|| {
+        format!(
+            "the archive holds no WAL of system {} from {}: {hint}",
+            start.system_id, start.from
+        )
+    })
 }
 
 /// The WAL objects of `segment`. Once a segment is whole, the receiver puts
@@ -215,7 +226,7 @@ pub async fn write(
     prepared: Prepared,
     after: AfterReplay,
 ) -> Result<Lsn> {
-    let Prepared { start, plan } = prepared;
+    let Prepared { start, plan, end } = prepared;
     let pg_wal = pgdata.join("pg_wal");
     std::fs::create_dir_all(&pg_wal)?;
     for timeline in &plan.histories {
@@ -247,7 +258,6 @@ pub async fn write(
         )?;
     }
 
-    let end = plan.recovery.end();
     // A copy of a standby starts as a standby unless its standby.signal
     // goes, and promotes through an archive recovery.
     let archive_recovery =
@@ -258,14 +268,14 @@ pub async fn write(
     info!(
         system_id = start.system_id,
         from = %start.from,
-        end = %end.unwrap_or(start.from),
+        %end,
         segments = plan.segments.len(),
         histories = plan.histories.len(),
         archive_recovery,
         ?after,
         "WAL written to pg_wal; start Postgres to replay it"
     );
-    Ok(end.unwrap_or(start.from))
+    Ok(end)
 }
 
 /// The lines of the newest history file of `system_id` in the archive.
@@ -303,6 +313,24 @@ pub fn refuse_running(pgdata: &Path) -> Result<()> {
         bail!(
             "{} has a postmaster.pid: stop Postgres, or remove the file of a copy",
             pgdata.display()
+        );
+    }
+    Ok(())
+}
+
+/// Refuses a user other than the owner of `dir`, as under sudo: the files
+/// the command writes would be theirs, and Postgres could not read them.
+pub fn refuse_other_owner(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .uid();
+    // SAFETY: geteuid has no precondition and cannot fail.
+    let user = unsafe { libc::geteuid() };
+    if owner != user {
+        bail!(
+            "{} belongs to uid {owner}: run the command as that user, not uid {user}",
+            dir.display()
         );
     }
     Ok(())

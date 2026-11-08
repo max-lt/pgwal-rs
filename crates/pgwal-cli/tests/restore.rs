@@ -820,15 +820,23 @@ async fn plan_lists_the_keys_a_restore_reads() {
     let start = pgwal::BackupLabel::read(&backup).unwrap().unwrap().start;
 
     let input: String = keys.iter().map(|k| format!("bucket/{k}\n")).collect();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pgwal"))
-        .args(["plan", "--pgdata", path(&backup), "--prefix", "bucket/"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
-    drop(child.stdin.take());
-    let out = child.wait_with_output().unwrap();
+    let plan = |prefix: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pgwal"))
+            .args(["plan", "--pgdata", path(&backup), "--prefix", prefix])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        child.wait_with_output().unwrap()
+    };
+    // A wrong prefix matches no key.
+    let wrong = plan("other/");
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("--prefix"));
+    let out = plan("bucket/");
     assert!(out.status.success());
     let planned: Vec<String> = String::from_utf8(out.stdout)
         .unwrap()

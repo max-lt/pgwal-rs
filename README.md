@@ -253,12 +253,17 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   starts no logical replication worker.
 
 `pgwal plan` reads archive keys on stdin and prints the ones that a restore
-or a rebase of a copy reads. Fetch only these from object storage:
+or a rebase of a copy reads. Fetch only these from object storage, then
+restore from the local copy:
 
 ```sh
 aws s3 ls --recursive s3://bucket/wal/ | awk '{print $4}' \
-  | pgwal plan --pgdata /backups/2026-11-06 --prefix wal/
+  | pgwal plan --pgdata /backups/2026-11-06 --prefix wal/ \
+  | while read -r key; do aws s3 cp "s3://bucket/$key" "local/$key"; done
+pgwal restore --pgdata /backups/2026-11-06 --archive local/wal
 ```
+
+When no key holds WAL of the copy, the command fails.
 
 ## Requirements
 

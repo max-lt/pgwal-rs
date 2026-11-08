@@ -49,7 +49,7 @@ pub async fn run(mut args: RebaseArgs) -> Result<()> {
             "the archive has a gap at {gap}: a rebase needs the WAL up to the end of the archive"
         );
     }
-    let end = prepared.plan.recovery.end().unwrap_or(prepared.start.from);
+    let end = prepared.end;
     // A standby accepts no connection before it is consistent. The check
     // comes before the download.
     if let Some(consistent) = consistency_point(&pg, &args.pgdata)?
