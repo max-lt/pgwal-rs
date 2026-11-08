@@ -1,6 +1,5 @@
 /// A retry gets `Config`, `SystemMismatch` and `WalGone` again.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

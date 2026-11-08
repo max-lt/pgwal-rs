@@ -18,7 +18,6 @@ use crate::wire::{Conn, CopyMessage};
 /// Longest delay before a flush while WAL keeps arriving.
 const MAX_FLUSH_DELAY: Duration = Duration::from_millis(100);
 
-#[non_exhaustive]
 pub struct StreamConfig {
     /// Physical replication slot, created on first use.
     pub slot: String,
@@ -42,27 +41,9 @@ pub struct StreamConfig {
     pub confirm: Confirm,
 }
 
-impl StreamConfig {
-    /// Without a password, with the application name `pgwal`, an upload
-    /// every 2 s, a 60 s idle timeout and [`Confirm::Flushed`].
-    pub fn new(slot: impl Into<String>, user: impl Into<String>, dir: impl Into<PathBuf>) -> Self {
-        StreamConfig {
-            slot: slot.into(),
-            user: user.into(),
-            password: None,
-            application_name: "pgwal".into(),
-            dir: dir.into(),
-            upload_every: Duration::from_secs(2),
-            idle_timeout: Duration::from_secs(60),
-            confirm: Confirm::Flushed,
-        }
-    }
-}
-
 /// The position the receiver reports to the server as flushed. The slot keeps
 /// the WAL after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Confirm {
     /// Once the WAL is fsynced in the local store. A loss of the host loses
     /// the WAL of one upload interval.

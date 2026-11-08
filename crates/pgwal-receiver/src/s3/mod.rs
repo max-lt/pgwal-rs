@@ -40,7 +40,6 @@ const MAX_OBJECT: usize = 1 << 30;
 const MAX_SMALL: usize = 16 << 20;
 
 #[derive(Clone)]
-#[non_exhaustive]
 pub struct S3Config {
     /// `http://host[:port]` or `https://host[:port]`, with no path.
     pub endpoint: String,
@@ -55,28 +54,6 @@ pub struct S3Config {
     /// with a private CA.
     pub ca_pem: Option<Vec<u8>>,
     pub retry: Retry,
-}
-
-impl S3Config {
-    /// With no key prefix, the public roots only, and [`Retry::default`].
-    pub fn new(
-        endpoint: impl Into<String>,
-        bucket: impl Into<String>,
-        region: impl Into<String>,
-        access_key: impl Into<String>,
-        secret_key: impl Into<String>,
-    ) -> Self {
-        S3Config {
-            endpoint: endpoint.into(),
-            bucket: bucket.into(),
-            prefix: String::new(),
-            region: region.into(),
-            access_key: access_key.into(),
-            secret_key: secret_key.into(),
-            ca_pem: None,
-            retry: Retry::default(),
-        }
-    }
 }
 
 impl std::fmt::Debug for S3Config {

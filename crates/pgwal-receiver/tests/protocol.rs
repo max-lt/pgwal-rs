@@ -121,10 +121,16 @@ impl WalSink for DownSink {
 }
 
 fn config(dir: &Path) -> StreamConfig {
-    let mut cfg = StreamConfig::new(SLOT, "postgres", dir);
-    cfg.upload_every = Duration::from_millis(20);
-    cfg.idle_timeout = Duration::from_secs(5);
-    cfg
+    StreamConfig {
+        slot: SLOT.into(),
+        user: "postgres".into(),
+        password: None,
+        application_name: "pgwal".into(),
+        dir: dir.to_path_buf(),
+        upload_every: Duration::from_millis(20),
+        idle_timeout: Duration::from_secs(5),
+        confirm: Confirm::Flushed,
+    }
 }
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
@@ -421,8 +427,10 @@ async fn streams_across_segments_confirms_the_flush_and_uploads() {
 async fn confirm_uploaded_holds_the_flush_until_the_sink_has_the_wal() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(GateSink::default());
-    let mut cfg = config(tmp.path());
-    cfg.confirm = Confirm::Uploaded;
+    let cfg = StreamConfig {
+        confirm: Confirm::Uploaded,
+        ..config(tmp.path())
+    };
     let (client, server) = tokio::io::duplex(4 << 20);
     let dyn_sink: Arc<dyn WalSink> = sink.clone();
     let task =
@@ -696,8 +704,11 @@ async fn a_hang_up_mid_stream_is_an_error_and_what_was_flushed_is_uploaded() {
 async fn a_silent_server_times_out() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(MemSink::default());
-    let mut cfg = config(tmp.path());
-    cfg.idle_timeout = Duration::from_millis(300);
+    let cfg = StreamConfig {
+        idle_timeout: Duration::from_millis(300),
+        confirm: Confirm::Flushed,
+        ..config(tmp.path())
+    };
     let (task, mut server) = spawn_receiver(cfg, &sink);
     server.open().await;
     server.start(Some(Lsn(SEG))).await;
@@ -793,11 +804,16 @@ async fn a_second_receiver_on_the_same_directory_is_refused() {
 async fn invalid_config_is_refused_before_any_io() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(MemSink::default());
-    let mut bad_slot = config(tmp.path());
-    bad_slot.slot = "PgWal-Test".into();
-    let mut no_interval = config(tmp.path());
-    no_interval.upload_every = Duration::ZERO;
-    for cfg in [bad_slot, no_interval] {
+    for cfg in [
+        StreamConfig {
+            slot: "PgWal-Test".into(),
+            ..config(tmp.path())
+        },
+        StreamConfig {
+            upload_every: Duration::ZERO,
+            ..config(tmp.path())
+        },
+    ] {
         let (task, server) = spawn_receiver(cfg, &sink);
         let err = finish(task).await.unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");

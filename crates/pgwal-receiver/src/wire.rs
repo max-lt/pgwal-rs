@@ -6,8 +6,6 @@
 //!
 //! Without the `runtime` feature, reads have no idle timeout: the caller
 //! bounds the connection.
-//!
-//! For hosts without tokio. A minor version can change its API.
 
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

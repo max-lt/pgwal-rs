@@ -11,16 +11,21 @@
 //! through `restore_command`.
 //!
 //! ```no_run
-//! # #[cfg(feature = "s3")]
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! use std::sync::Arc;
+//! # async fn run(sink: std::sync::Arc<dyn pgwal_receiver::WalSink>) -> Result<(), Box<dyn std::error::Error>> {
+//! use std::time::Duration;
 //!
-//! use pgwal_receiver::s3::{S3Config, S3Sink};
-//! use pgwal_receiver::{Error, StreamConfig, receive};
+//! use pgwal_receiver::{Confirm, Error, StreamConfig, receive};
 //!
-//! let s3 = S3Config::new("https://s3.example", "wal", "auto", "key id", "secret");
-//! let sink = Arc::new(S3Sink::new(s3)?);
-//! let cfg = StreamConfig::new("pgwal", "replicator", "/var/lib/pgwal/db1");
+//! let cfg = StreamConfig {
+//!     slot: "pgwal".into(),
+//!     user: "replicator".into(),
+//!     password: None,
+//!     application_name: "pgwal".into(),
+//!     dir: "/var/lib/pgwal/db1".into(),
+//!     upload_every: Duration::from_secs(2),
+//!     idle_timeout: Duration::from_secs(60),
+//!     confirm: Confirm::Flushed,
+//! };
 //! loop {
 //!     let stream = tokio::net::TcpStream::connect("db1.example:5432").await?;
 //!     match receive(stream, &cfg, sink.clone(), std::future::pending()).await {
@@ -30,7 +35,7 @@
 //!         }
 //!         Err(e) => eprintln!("retrying: {e}"),
 //!     }
-//!     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+//!     tokio::time::sleep(Duration::from_secs(1)).await;
 //! }
 //! # }
 //! ```

@@ -42,10 +42,13 @@ pub struct BackupArgs {
 pub async fn run(args: BackupArgs) -> Result<()> {
     let tls = args.conn.tls()?;
     let sink = Archive::open(&args.archive, &args.s3)?.sink();
-    let mut cfg = BackupConfig::new(&args.conn.user, args.slot);
-    cfg.password = std::env::var("PGPASSWORD").ok();
-    cfg.application_name = args.application_name;
-    cfg.idle_timeout = Duration::from_secs(args.idle_timeout);
+    let cfg = BackupConfig {
+        user: args.conn.user.clone(),
+        password: std::env::var("PGPASSWORD").ok(),
+        application_name: args.application_name,
+        idle_timeout: Duration::from_secs(args.idle_timeout),
+        slot: args.slot,
+    };
     let stream = args.conn.connect(tls.as_ref()).await?;
     let backup = base_backup(stream, &cfg, sink).await?;
     println!("{} {}", backup.start, backup.end);

@@ -18,7 +18,6 @@ const PART_SIZE: usize = 16 << 20;
 
 const MANIFEST: &str = "backup_manifest";
 
-#[non_exhaustive]
 pub struct BackupConfig {
     /// A role with `REPLICATION`.
     pub user: String,
@@ -31,20 +30,6 @@ pub struct BackupConfig {
     /// The slot of [`receive`](crate::receive). It keeps the WAL of the
     /// backup on the server until the archive has it.
     pub slot: String,
-}
-
-impl BackupConfig {
-    /// Without a password, with the application name `pgwal_backup` and a
-    /// 300 s idle timeout.
-    pub fn new(user: impl Into<String>, slot: impl Into<String>) -> Self {
-        BackupConfig {
-            user: user.into(),
-            password: None,
-            application_name: "pgwal_backup".into(),
-            idle_timeout: Duration::from_secs(300),
-            slot: slot.into(),
-        }
-    }
 }
 
 /// Takes a base backup of the server behind `stream`, without its WAL, and

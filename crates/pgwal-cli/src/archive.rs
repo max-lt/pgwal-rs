@@ -82,19 +82,19 @@ fn open_s3(location: &str, s3: &S3Args) -> Result<Archive> {
         }
         None => None,
     };
-    let endpoint = s3
-        .s3_endpoint
-        .clone()
-        .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", s3.s3_region));
-    let mut config = pgwal_receiver::s3::S3Config::new(
-        endpoint,
-        bucket,
-        &s3.s3_region,
-        env("AWS_ACCESS_KEY_ID")?,
-        env("AWS_SECRET_ACCESS_KEY")?,
-    );
-    config.prefix = prefix;
-    config.ca_pem = ca_pem;
+    let config = pgwal_receiver::s3::S3Config {
+        endpoint: s3
+            .s3_endpoint
+            .clone()
+            .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", s3.s3_region)),
+        bucket: bucket.to_string(),
+        prefix,
+        region: s3.s3_region.clone(),
+        access_key: env("AWS_ACCESS_KEY_ID")?,
+        secret_key: env("AWS_SECRET_ACCESS_KEY")?,
+        ca_pem,
+        retry: pgwal_receiver::s3::Retry::default(),
+    };
     Ok(Archive::S3(Arc::new(pgwal_receiver::s3::S3Sink::new(
         config,
     )?)))
