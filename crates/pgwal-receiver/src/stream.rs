@@ -87,96 +87,67 @@ where
         .as_deref()
         .map(timeline_switches)
         .unwrap_or_default();
-    let server_start = match switches.last() {
-        Some((_, begin)) => Start::Begin(*begin),
-        None => Start::Slot,
-    };
 
-    // After a failover, a store on a parent timeline streams that timeline
-    // to its end, which the new server holds when this receiver lagged behind
-    // it. The next run uploads it, removes its files, and starts the next
-    // timeline there.
     let stored = read_flushed(&cfg.dir).await?;
-    let (timeline, start) = match stored {
-        Some((old, flushed)) if old != system.timeline => {
-            match switches.iter().position(|(tl, _)| *tl == old) {
-                Some(at) if flushed < switches[at].1 => (old, Start::Resume(flushed)),
-                Some(at) => {
-                    let next = switches.get(at + 1).map_or(system.timeline, |(tl, _)| *tl);
-                    salvage(&cfg.dir, sink.clone()).await?;
-                    remove_other_timelines(&cfg.dir, next, seg_size).await?;
-                    (next, Start::Resume(switches[at].1))
-                }
-                // Another branch of the history: its WAL goes up, and the
-                // stream follows the server.
-                None => {
-                    salvage(&cfg.dir, sink.clone()).await?;
-                    remove_other_timelines(&cfg.dir, system.timeline, seg_size).await?;
-                    (system.timeline, server_start)
-                }
-            }
-        }
-        Some(_) => (system.timeline, server_start),
-        // An empty store, as on a new host: the sink can end before the
-        // switch point of the parent timeline.
-        None => match switches.last() {
-            Some(&(parent, end)) => {
-                match sink_end(sink.as_ref(), system.system_id, parent).await? {
-                    Some(held) if held < end => (parent, Start::Resume(held)),
-                    _ => (system.timeline, server_start),
-                }
-            }
-            None => (system.timeline, server_start),
-        },
-    };
+    let (mut timeline, mut start) =
+        choose_start(cfg, &system, &switches, stored, &sink, seg_size).await?;
     let oldest = stored.map_or(timeline, |(tl, _)| tl.min(timeline));
     let histories = histories(&mut conn, &system, history.as_deref(), &switches, oldest).await?;
 
-    let mut store = WalStore::open(cfg.dir.clone(), system.system_id, timeline, seg_size).await?;
-    let start = match store.resume_point().await? {
-        Some(lsn) => Start::Resume(lsn),
-        None => match (read_watermark(&cfg.dir, timeline).await?, start) {
-            (Some(uploaded), Start::Resume(floor) | Start::Begin(floor)) => {
-                Start::Resume(uploaded.max(floor))
-            }
-            (Some(uploaded), Start::Slot) => Start::Resume(uploaded),
-            (None, start) => start,
-        },
-    };
-    let mut from = match start {
-        Start::Resume(lsn) | Start::Begin(lsn) => lsn,
-        Start::Slot => slot_position(&mut conn, &cfg.slot, system.xlogpos).await?,
-    }
-    .segment_start(seg_size);
-    let begin = match start {
-        Start::Begin(begin) => Some(begin),
-        _ => None,
-    };
-    let begun = begin_copy(&mut conn, &cfg.slot, from, timeline, begin.is_some()).await;
-    let first_message = match (begun, begin) {
-        // A timeline that began long ago can have lost its first WAL. The
-        // slot position is then the earliest WAL left.
-        (Err(Error::WalGone { .. }), Some(begin)) => {
-            let fallback = slot_position(&mut conn, &cfg.slot, system.xlogpos)
-                .await?
-                .max(begin)
-                .segment_start(seg_size);
-            warn!(%from, %fallback, "the first WAL of the timeline is gone; its archive starts later");
-            from = fallback;
-            conn.start_replication(&cfg.slot, from, timeline).await?;
-            None
+    let (mut store, from, first_message) = loop {
+        let store = WalStore::open(cfg.dir.clone(), system.system_id, timeline, seg_size).await?;
+        let resolved = match store.resume_point().await? {
+            Some(lsn) => Start::Resume(lsn),
+            None => match (read_watermark(&cfg.dir, timeline).await?, start) {
+                (Some(uploaded), Start::Begin(floor)) => Start::Begin(uploaded.max(floor)),
+                (Some(uploaded), Start::Resume(floor) | Start::ParentTail(floor)) => {
+                    Start::Resume(uploaded.max(floor))
+                }
+                (Some(uploaded), Start::Slot) => Start::Resume(uploaded),
+                (None, start) => start,
+            },
+        };
+        let from = match resolved {
+            Start::Resume(lsn) | Start::Begin(lsn) | Start::ParentTail(lsn) => lsn,
+            Start::Slot => slot_position(&mut conn, &cfg.slot, system.xlogpos).await?,
         }
-        (begun, _) => begun?,
+        .segment_start(seg_size);
+        let probe = matches!(resolved, Start::Begin(_) | Start::ParentTail(_));
+        match (
+            begin_copy(&mut conn, &cfg.slot, from, timeline, probe).await,
+            start,
+        ) {
+            // A timeline that began long ago can have lost its first WAL. The
+            // slot position is then the earliest WAL left.
+            (Err(Error::WalGone { .. }), Start::Begin(begin)) => {
+                let fallback = slot_position(&mut conn, &cfg.slot, system.xlogpos)
+                    .await?
+                    .max(begin)
+                    .segment_start(seg_size);
+                warn!(%from, %fallback, "the first WAL of the timeline is gone; its archive starts later");
+                conn.start_replication(&cfg.slot, fallback, timeline)
+                    .await?;
+                break (store, fallback, None);
+            }
+            // The server no longer has the rest of the parent: the archive
+            // has a gap there, and the stream follows the server.
+            (Err(Error::WalGone { .. }), Start::ParentTail(_)) => {
+                warn!(timeline, %from, "the end of the parent timeline is gone; the archive has a gap");
+                drop(store);
+                timeline = system.timeline;
+                start = server_start(&switches);
+            }
+            (begun, _) => break (store, from, begun?),
+        }
     };
-    let start = from;
-    store.start_at(start);
-    info!(slot = %cfg.slot, system_id = system.system_id, timeline, %start, "streaming WAL");
+    store.start_at(from);
+    info!(slot = %cfg.slot, system_id = system.system_id, timeline, start = %from, "streaming WAL");
 
     // Finished segments before the start can wait for their upload: a dead
     // run with the sink down leaves them.
     let first = first_segment(&cfg.dir, timeline)
         .await?
-        .map_or(start, |(lsn, _)| lsn.min(start));
+        .map_or(from, |(lsn, _)| lsn.min(from));
     let mut uploader = Uploader::new(
         cfg.dir.clone(),
         system.system_id,
@@ -187,7 +158,7 @@ where
     )
     .await?;
     uploader.pending = histories;
-    let (flushed_tx, flushed_rx) = watch::channel(start);
+    let (flushed_tx, flushed_rx) = watch::channel(from);
     let (uploaded_tx, uploaded_rx) = watch::channel(uploader.uploaded);
     let mut upload = AbortOnDrop(tokio::spawn(uploader.run(
         flushed_rx,
@@ -305,12 +276,81 @@ where
 /// Where a run starts streaming.
 #[derive(Clone, Copy)]
 enum Start {
-    /// After the WAL that the store or the sink holds.
+    /// After the WAL that the store holds.
     Resume(Lsn),
-    /// Where the timeline of the server begins. Its first WAL can be gone.
+    /// Where the timeline of the server begins, or after what the sink holds
+    /// of it. The slot when that WAL is gone.
     Begin(Lsn),
+    /// The parent timeline after what the sink holds of it. The timeline of
+    /// the server when that WAL is gone.
+    ParentTail(Lsn),
     /// At the slot.
     Slot,
+}
+
+fn server_start(switches: &[(u32, Lsn)]) -> Start {
+    match switches.last() {
+        Some((_, begin)) => Start::Begin(*begin),
+        None => Start::Slot,
+    }
+}
+
+/// The timeline a run streams, and where it starts. After a failover, a
+/// store on a parent timeline streams that timeline to its end, which the
+/// new server holds when this receiver lagged behind it. The next run
+/// uploads it, removes its files, and starts the next timeline there.
+async fn choose_start(
+    cfg: &StreamConfig,
+    system: &SystemInfo,
+    switches: &[(u32, Lsn)],
+    stored: Option<(u32, Lsn)>,
+    sink: &Arc<dyn WalSink>,
+    seg_size: u64,
+) -> Result<(u32, Start), Error> {
+    let Some((old, flushed)) = stored else {
+        return empty_store_start(system, switches, sink.as_ref()).await;
+    };
+    if old == system.timeline {
+        return Ok((system.timeline, server_start(switches)));
+    }
+    let Some(at) = switches.iter().position(|(tl, _)| *tl == old) else {
+        // Another branch of the history: its WAL goes up, and the stream
+        // follows the server.
+        salvage(&cfg.dir, sink.clone()).await?;
+        remove_other_timelines(&cfg.dir, system.timeline, seg_size).await?;
+        return Ok((system.timeline, server_start(switches)));
+    };
+    let end = switches[at].1;
+    if flushed < end {
+        return Ok((old, Start::Resume(flushed)));
+    }
+    let next = switches.get(at + 1).map_or(system.timeline, |(tl, _)| *tl);
+    salvage(&cfg.dir, sink.clone()).await?;
+    remove_other_timelines(&cfg.dir, next, seg_size).await?;
+    Ok((next, Start::Resume(end)))
+}
+
+/// The start of an empty store, as on a new host. The sink can end before
+/// the switch point of the parent timeline, or hold the timeline of the
+/// server already.
+async fn empty_store_start(
+    system: &SystemInfo,
+    switches: &[(u32, Lsn)],
+    sink: &dyn WalSink,
+) -> Result<(u32, Start), Error> {
+    let Some(&(parent, begin)) = switches.last() else {
+        return Ok((system.timeline, Start::Slot));
+    };
+    if let Some(held) = sink_end(sink, system.system_id, parent).await?
+        && held < begin
+    {
+        return Ok((parent, Start::ParentTail(held)));
+    }
+    let held = sink_end(sink, system.system_id, system.timeline).await?;
+    Ok((
+        system.timeline,
+        Start::Begin(held.unwrap_or_default().max(begin)),
+    ))
 }
 
 /// A dropped `receive` stops its uploader, which reads the store that the
@@ -450,8 +490,8 @@ enum Drain {
 
 /// Drops `slot` on the server behind `stream`, if it exists. After an
 /// [`Error::WalGone`], call [`salvage`], then this, then clear the store
-/// directory: the next [`receive`] creates the slot again and starts at it,
-/// or on a later timeline where the timeline begins. Without the salvage, the flushed WAL that is not in
+/// directory: the next [`receive`] creates the slot again. It starts at the
+/// slot, or on a later timeline after what the sink holds. Without the salvage, the flushed WAL that is not in
 /// the sink goes with the directory.
 pub async fn forget_slot<S>(stream: S, conn: &ConnConfig, slot: &str) -> Result<(), Error>
 where

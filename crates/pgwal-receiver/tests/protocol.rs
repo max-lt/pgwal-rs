@@ -926,6 +926,76 @@ async fn an_empty_store_streams_the_tail_of_the_parent_timeline() {
     assert_eq!(reached, Some(Lsn(0x300A00)));
 }
 
+/// An empty store, and the server no longer has the rest of the parent
+/// timeline after the end of the sink. The archive has a gap there, and the
+/// stream follows the timeline of the server on the same connection.
+#[tokio::test]
+async fn a_gone_parent_tail_falls_back_to_the_timeline_of_the_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let held = RangeKey {
+        system_id: 7401,
+        timeline: 1,
+        start: Lsn(SEG),
+        end: Lsn(SEG + 4096),
+    };
+    sink.0
+        .lock()
+        .unwrap()
+        .insert(held.to_string(), Bytes::from(pattern(4096, 1)));
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    assert!(
+        server
+            .start(None)
+            .await
+            .ends_with("PHYSICAL 0/100000 TIMELINE 1")
+    );
+    server
+        .error("58P01", "requested WAL segment has already been removed")
+        .await;
+    server.ready().await;
+    let query = server.expect_query().await;
+    assert!(query.ends_with("PHYSICAL 0/300000 TIMELINE 2"), "{query}");
+    server.send(b'W', &[0, 0, 0]).await;
+    let end = server.stream(Lsn(3 * SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+    server.end().await;
+    assert_eq!(finish(task).await.unwrap(), end);
+}
+
+/// An empty store, as on a new host, and a sink that holds the timeline of
+/// the server already: the run starts after what the sink holds.
+#[tokio::test]
+async fn an_empty_store_starts_after_what_the_sink_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    for (timeline, start, end) in [(1, SEG, 0x300A00), (2, 3 * SEG, 5 * SEG)] {
+        let key = RangeKey {
+            system_id: 7401,
+            timeline,
+            start: Lsn(start),
+            end: Lsn(end),
+        };
+        sink.0.lock().unwrap().insert(
+            key.to_string(),
+            Bytes::from(vec![0; (end - start) as usize]),
+        );
+    }
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    assert!(
+        server
+            .start(None)
+            .await
+            .ends_with("PHYSICAL 0/500000 TIMELINE 2")
+    );
+    let end = server.stream(Lsn(5 * SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+    server.end().await;
+    assert_eq!(finish(task).await.unwrap(), end);
+}
+
 /// The server ends the copy of a later timeline before its first message.
 /// The history file still goes up.
 #[tokio::test]
