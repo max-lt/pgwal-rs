@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use futures_util::{StreamExt, TryStreamExt};
 use pgwal::{
-    AfterReplay, ArchiveKey, Lsn, Recovery, ReplayStart, plan, request_recovery, timeline_switches,
-    write_history, write_segment,
+    AfterReplay, ArchiveKey, Lsn, Recovery, ReplayPlan, ReplayStart, plan, request_recovery,
+    timeline_switches, write_history, write_segment,
 };
 use tracing::{info, warn};
 
@@ -113,6 +113,12 @@ pub struct Applied {
     pub end: Lsn,
 }
 
+/// The plan of a restore of the copy in `pgdata`. It writes nothing.
+pub struct Prepared {
+    pub start: ReplayStart,
+    pub plan: ReplayPlan,
+}
+
 /// Writes the archived WAL that follows the copy in `pgdata` into its
 /// `pg_wal`.
 pub async fn apply(
@@ -121,11 +127,14 @@ pub async fn apply(
     on_gap: OnGap,
     after: AfterReplay,
 ) -> Result<Applied> {
+    let prepared = prepare(archive, pgdata, on_gap).await?;
+    write(archive, pgdata, prepared, after).await
+}
+
+/// Reads the copy and plans its replay from the archive.
+pub async fn prepare(archive: &dyn WalSink, pgdata: &Path, on_gap: OnGap) -> Result<Prepared> {
     refuse_running(pgdata)?;
     let start = replay_start(pgdata)?;
-    let pg_wal = pgdata.join("pg_wal");
-    std::fs::create_dir_all(&pg_wal)?;
-
     let keys = archive.list("").await?;
     let switches = switches(archive, &keys, start.system_id).await?;
     let plan = plan(keys.iter().map(String::as_str), &start, &switches);
@@ -145,6 +154,20 @@ pub async fn apply(
         );
     }
 
+    Ok(Prepared { start, plan })
+}
+
+/// Writes the WAL of `prepared` into the `pg_wal` of `pgdata`, and asks for
+/// the recovery that `after` says.
+pub async fn write(
+    archive: &dyn WalSink,
+    pgdata: &Path,
+    prepared: Prepared,
+    after: AfterReplay,
+) -> Result<Applied> {
+    let Prepared { start, plan } = prepared;
+    let pg_wal = pgdata.join("pg_wal");
+    std::fs::create_dir_all(&pg_wal)?;
     for timeline in &plan.histories {
         let key = ArchiveKey::History {
             system_id: start.system_id,

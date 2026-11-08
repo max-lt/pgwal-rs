@@ -76,7 +76,8 @@ pub fn start_server<'a>(
          -c archive_cleanup_command= -c recovery_end_command= -c primary_conninfo= \
          -c primary_slot_name= -c synchronous_standby_names= \
          -c max_logical_replication_workers=0 -c logging_collector=off \
-         -c recovery_min_apply_delay=0 -c ssl=off -c huge_pages=off -c lc_messages=C"
+         -c recovery_min_apply_delay=0 -c ssl=off -c huge_pages=off -c lc_messages=C \
+         -c log_destination=stderr"
     );
     // A scratch primary runs no job of the extensions of the copy.
     if role == Role::Scratch {
@@ -189,7 +190,14 @@ impl Server<'_> {
         let mut waiting_since = None;
         loop {
             check_interrupted()?;
-            if self.query("SELECT 1").is_ok() {
+            let ready = self.pg.exit_code(
+                "pg_isready",
+                &["-h", path(self.dir), "-p", PORT, "-U", self.user],
+            )?;
+            // 0: accepts connections. 1: starts up. 2: no answer yet.
+            if ready == Some(0) {
+                self.query("SELECT 1")
+                    .context("the server is ready, and a query of --user fails")?;
                 return Ok(());
             }
             let log = std::fs::read_to_string(self.log()).unwrap_or_default();

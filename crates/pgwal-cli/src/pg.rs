@@ -4,7 +4,7 @@
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -14,16 +14,19 @@ use tokio::signal::unix::{SignalKind, signal};
 /// Set on Ctrl-C or SIGTERM.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+/// Watches SIGINT, SIGTERM and SIGHUP, as of a closed ssh session.
 pub fn watch_signals() {
-    tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
-        INTERRUPTED.store(true, Ordering::SeqCst);
-    });
-    if let Ok(mut terminate) = signal(SignalKind::terminate()) {
-        tokio::spawn(async move {
-            terminate.recv().await;
-            INTERRUPTED.store(true, Ordering::SeqCst);
-        });
+    for kind in [
+        SignalKind::interrupt(),
+        SignalKind::terminate(),
+        SignalKind::hangup(),
+    ] {
+        if let Ok(mut stream) = signal(kind) {
+            tokio::spawn(async move {
+                stream.recv().await;
+                INTERRUPTED.store(true, Ordering::SeqCst);
+            });
+        }
     }
 }
 
@@ -58,6 +61,28 @@ impl Bin {
     }
 
     pub fn exec(&self, tool: &str, args: &[&str], on_signal: OnSignal) -> Result<String> {
+        let (status, stdout, stderr) = self.output(tool, args, on_signal)?;
+        if !status.success() {
+            bail!(
+                "{tool} failed: {}{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
+    }
+
+    /// The exit code of `tool`, for a tool that answers with it.
+    pub fn exit_code(&self, tool: &str, args: &[&str]) -> Result<Option<i32>> {
+        Ok(self.output(tool, args, OnSignal::Stop)?.0.code())
+    }
+
+    fn output(
+        &self,
+        tool: &str,
+        args: &[&str],
+        on_signal: OnSignal,
+    ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
         let mut child = self
             .command(tool)
             .args(args)
@@ -80,14 +105,7 @@ impl Bin {
         };
         let stdout = stdout.join().expect("the reader thread ends");
         let stderr = stderr.join().expect("the reader thread ends");
-        if !status.success() {
-            bail!(
-                "{tool} failed: {}{}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr)
-            );
-        }
-        Ok(String::from_utf8_lossy(&stdout).into_owned())
+        Ok((status, stdout, stderr))
     }
 }
 

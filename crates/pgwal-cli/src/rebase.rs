@@ -43,15 +43,10 @@ pub async fn run(mut args: RebaseArgs) -> Result<()> {
     check_version(&pg, &args.pgdata)?;
     let archive = args.archive.open()?;
     let t = Instant::now();
-    let applied = restore::apply(
-        archive.as_ref(),
-        &args.pgdata,
-        OnGap::Refuse,
-        AfterReplay::StayStandby,
-    )
-    .await?;
-    let end = applied.end;
-    // A standby accepts no connection before it is consistent.
+    let prepared = restore::prepare(archive.as_ref(), &args.pgdata, OnGap::Refuse).await?;
+    let end = prepared.plan.recovery.end().unwrap_or(prepared.start.from);
+    // A standby accepts no connection before it is consistent. The check
+    // comes before the download.
     if let Some(consistent) = consistency_point(&pg, &args.pgdata)?
         && end < consistent
     {
@@ -60,6 +55,13 @@ pub async fn run(mut args: RebaseArgs) -> Result<()> {
              rebase once the archive holds it"
         );
     }
+    let applied = restore::write(
+        archive.as_ref(),
+        &args.pgdata,
+        prepared,
+        AfterReplay::StayStandby,
+    )
+    .await?;
     info!(
         seconds = t.elapsed().as_secs_f64(),
         "archive written to pg_wal"
@@ -109,10 +111,12 @@ pub async fn run(mut args: RebaseArgs) -> Result<()> {
 fn consistency_point(pg: &Bin, pgdata: &Path) -> Result<Option<Lsn>> {
     if let Ok(manifest) = std::fs::read_to_string(pgdata.join("backup_manifest")) {
         // "WAL-Ranges": [{ "Timeline": 1, "Start-LSN": "0/2000028", "End-LSN": "0/2000120" }]
+        // A backup across a promotion has one range per timeline.
         let end = manifest
-            .rsplit_once("\"End-LSN\"")
-            .and_then(|(_, rest)| rest.split('"').nth(1))
-            .and_then(|lsn| lsn.parse().ok());
+            .split("\"End-LSN\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').nth(1)?.parse::<Lsn>().ok())
+            .max();
         return Ok(end);
     }
     let data = pg.run("pg_controldata", &[path(pgdata)])?;

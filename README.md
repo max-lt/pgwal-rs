@@ -204,7 +204,7 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   as `max_connections`, come from `pg_control`. When the primary raised one
   after the copy, the replay pauses, and the command starts the server again
   with the new value. A pause for another reason is an error.
-- Once the WAL is in the copy, Ctrl-C or SIGTERM stops the running tool and
+- Once the WAL is in the copy, Ctrl-C, SIGTERM or SIGHUP stops the running tool and
   the server, and removes their files. The tools run in process groups of
   their own, so a Ctrl-C in the terminal does not stop `pg_ctl stop`. During
   the download, a signal stops the command at once.

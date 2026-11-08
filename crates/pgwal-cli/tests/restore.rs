@@ -862,6 +862,20 @@ async fn verify_finds_a_broken_page() {
     );
     assert!(setup.verify().status.success());
 
+    // A --user that the copy lacks fails at once, with the reason.
+    let out = pgwal(&[
+        "verify",
+        "--pgdata",
+        path(&setup.path("backup")),
+        "--pg-bin",
+        path(&setup.bin),
+        "--user",
+        "nobody",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "verify passed with no role");
+    assert!(stderr.contains("does not exist"), "{stderr}");
+
     // The line pointers of the first page of t start at byte 24. A normal
     // line pointer (lp_flags 1) at offset 0x7ff0 points past the 8 kB page.
     let backup = setup.path("backup");
