@@ -303,7 +303,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     /// The read buffer holds a whole message: the next read does not wait.
     pub fn has_buffered_frame(&self) -> bool {
-        matches!(frame_len(&self.buf), Ok(Some(len)) if self.buf.len() > len)
+        matches!(frame_size(&self.buf), Ok(Some(size)) if self.buf.len() >= size)
     }
 
     /// Reports the written and flushed positions at `now`. The caller gives
@@ -464,14 +464,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     async fn read_frame(&mut self) -> Result<(u8, BytesMut), Error> {
         loop {
-            if let Some(len) = frame_len(&self.buf)? {
-                if self.buf.len() > len {
-                    let mut frame = self.buf.split_to(1 + len);
+            if let Some(size) = frame_size(&self.buf)? {
+                if self.buf.len() >= size {
+                    let mut frame = self.buf.split_to(size);
                     let tag = frame[0];
                     frame.advance(5);
                     return Ok((tag, frame));
                 }
-                self.buf.reserve(1 + len - self.buf.len());
+                self.buf.reserve(size - self.buf.len());
             }
             #[cfg(feature = "runtime")]
             let read =
@@ -554,8 +554,8 @@ fn col<'a>(row: &'a Row, i: usize, during: &str) -> Result<&'a str, Error> {
         .ok_or_else(|| protocol(format!("{during}: no column {i}")))
 }
 
-/// The frame length field (which counts itself, not the tag), once buffered.
-fn frame_len(buf: &[u8]) -> Result<Option<usize>, Error> {
+/// The size of the frame, tag included, once its length field is buffered.
+fn frame_size(buf: &[u8]) -> Result<Option<usize>, Error> {
     let Some(len) = buf.get(1..5) else {
         return Ok(None);
     };
@@ -563,7 +563,7 @@ fn frame_len(buf: &[u8]) -> Result<Option<usize>, Error> {
     if !(4..=MAX_FRAME).contains(&len) {
         return Err(protocol(format!("frame length {len} out of bounds")));
     }
-    Ok(Some(len))
+    Ok(Some(1 + len))
 }
 
 fn parse_copy_data(mut body: BytesMut) -> Result<CopyMessage, Error> {
@@ -771,7 +771,7 @@ mod tests {
         let mut huge = BytesMut::new();
         huge.put_u8(b'd');
         huge.put_u32(u32::MAX);
-        assert!(frame_len(&huge).is_err());
+        assert!(frame_size(&huge).is_err());
     }
 
     #[test]

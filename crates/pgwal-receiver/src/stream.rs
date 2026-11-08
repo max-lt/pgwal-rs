@@ -483,7 +483,7 @@ where
                     send_status(conn, store.written(), confirmed.position(flushed)).await;
                     continue;
                 }
-                () = sleep_until(flush_by), if flush_by.is_some() => {
+                () = sleep_until(flush_by) => {
                     flushed = flush(conn, store, flushed_tx, &confirmed).await?;
                     flush_by = None;
                     continue;
@@ -492,10 +492,9 @@ where
             },
         };
         let Some(msg) = msg else { break };
-        // The server has sent all it has: a synchronous commit waits for
-        // this flush.
-        let mut caught_up = false;
-        let reply_requested = match msg {
+        // A flush comes at once when the server has sent all it has, as a
+        // synchronous commit waits for it, or when the server asks for it.
+        let flush_now = match msg {
             CopyMessage::XLogData {
                 start,
                 wal_end,
@@ -506,8 +505,7 @@ where
                     target = target.max(wal_end);
                 }
                 flush_by.get_or_insert_with(|| Instant::now() + MAX_FLUSH_DELAY);
-                caught_up = store.written() >= wal_end && !conn.has_buffered_frame();
-                false
+                store.written() >= wal_end && !conn.has_buffered_frame()
             }
             CopyMessage::Keepalive {
                 wal_end,
@@ -521,7 +519,7 @@ where
             }
         };
         let done = drain == Drain::Answered && store.written() >= target;
-        if done || reply_requested || caught_up {
+        if done || flush_now {
             flushed = flush(conn, store, flushed_tx, &confirmed).await?;
             flush_by = None;
         }
