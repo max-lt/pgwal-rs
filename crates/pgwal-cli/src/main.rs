@@ -22,6 +22,7 @@ use tls::SslMode;
 
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -81,12 +82,10 @@ pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
 impl ConnArgs {
+    /// No TLS on a Unix socket, whatever `--sslmode` says, as libpq does.
     pub fn tls(&self) -> Result<Option<TlsConnector>> {
-        if self.host.starts_with('/') && self.sslmode != SslMode::Disable {
-            bail!(
-                "--sslmode applies to TCP only, not to the Unix socket in {}",
-                self.host
-            );
+        if self.host.starts_with('/') {
+            return Ok(None);
         }
         tls::connector(self.sslmode, self.sslrootcert.as_deref())
     }
@@ -186,7 +185,15 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
                 let _ = stop.wait_for(|stopped| *stopped).await;
             }
         };
-        let received = match args.conn.connect(tls.as_ref()).await {
+        let connected = tokio::select! {
+            connected = tokio::time::timeout(CONNECT_TIMEOUT, args.conn.connect(tls.as_ref())) => {
+                connected.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "no connection in 30 s"))
+                })
+            }
+            _ = stop.wait_for(|stopped| *stopped) => return Ok(()),
+        };
+        let received = match connected {
             Ok(stream) => receive(stream, &cfg, sink.clone(), stopped).await,
             Err(e) => Err(e.into()),
         };

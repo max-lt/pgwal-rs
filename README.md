@@ -47,8 +47,10 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
   `synchronous_standby_names` matches.
 - `--upload-every` (default 2 s) sets the upload interval. `--idle-timeout`
   (default 60 s) is the longest silence accepted from the server.
-- The command reconnects after an error. It stops on Ctrl-C or SIGTERM,
-  after it uploads the WAL it received.
+- The command reconnects after an error of the network or of the server.
+  It stops on a wrong setting, on a store of another cluster, on WAL that
+  the server no longer has, and on a server that refuses TLS.
+- It stops on Ctrl-C or SIGTERM, after it uploads the WAL it received.
 
 ### S3 archives
 
@@ -98,7 +100,7 @@ pg_ctl -D /restore/data start
 - `pgwal restore` writes the archived WAL that follows the copy into its
   `pg_wal`. Postgres replays it at its next start.
 - The archive must hold the WAL from `START WAL LOCATION` of `backup_label`,
-  or from the checkpoint of `pg_control` without a label.
+  or from the redo point of `pg_control` without a label.
 - A base backup, or a copy after a clean stop, replays as an archive
   recovery, then promotes to a new timeline. The command follows the
   timelines of the archive.
@@ -111,8 +113,8 @@ pg_ctl -D /restore/data start
 - The command prints the LSN where the replay ends.
 - With `--standby`, Postgres replays the archive as a standby and does not
   promote. A copy of the data directory after a clean stop is a new base backup,
-  on the timeline of the archive. Its replay starts at the last checkpoint
-  of the primary in the archive.
+  on the timeline of the archive. Its replay starts at the redo point of the
+  last checkpoint of the primary in the archive.
 
 ### Base backups in the archive
 
@@ -170,13 +172,19 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
 - The binaries must be of the major version of the copy, on the same
   platform as the primary. `--pg-bin` (or `PGWAL_PG_BIN`) gives their
   directory. Without it, they come from `PATH`.
-- `--user` is a superuser of the copy, for the local connection that
-  watches the replay. Its default is `postgres`.
+- `--user` is a superuser of the copy, for the local connections. Its
+  default is `postgres`. It does not read `PGUSER`, which names the
+  replication role of the other commands.
 - Then the command runs `pgwal verify` on the copy, and fails if the check
   fails.
 - The server listens on a socket in a directory that only the user of the
   command can enter, and trusts local connections there. The `pg_hba.conf`
-  of the copy stays as it is.
+  of the copy stays as it is. The server archives nothing and connects to no
+  primary, whatever the settings of the copy say.
+- A replay that pauses, as on a setting lower than on the primary, is an
+  error.
+- After the rebase, the copy has no `backup_label.old` and no
+  `backup_manifest`: they describe the copy before the rebase.
 - A copy without `postgresql.conf`, such as a copy of a Debian primary,
   starts with the settings that `pg_control` holds and the defaults for the
   rest.
@@ -185,11 +193,12 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
 `pgwal verify` checks a stopped copy:
 
 - `pg_checksums --check`, when the copy has page checksums.
-- `pg_amcheck --all --heapallindexed` on the heap and the B-tree indexes of
-  every database. It runs on a scratch copy next to the copy, because a
-  server on the copy itself would end its recovery and write WAL of its own.
-  The scratch copy uses file clones where the file system has them, and goes
-  away at the end.
+- `pg_amcheck --all --heapallindexed --install-missing` on the heap and the
+  B-tree indexes of every database. It runs on a scratch copy next to the
+  copy, because a server on the copy itself would end its recovery and write
+  WAL of its own. The scratch copy holds the targets of the links of the
+  copy, uses file clones where the file system has them, and goes away at
+  the end. It archives nothing and loads no `shared_preload_libraries`.
 
 `pgwal plan` reads archive keys on stdin and prints the ones that a restore
 or a rebase of a copy reads. Fetch only these from object storage:
@@ -204,6 +213,8 @@ aws s3 ls --recursive s3://bucket/wal/ | awk '{print $4}' \
 - A role with the `REPLICATION` attribute, and a `pg_hba.conf` line for the
   `replication` database.
 - Postgres 16, 17 or 18.
+- For `pgwal verify` and `pgwal rebase`: the `amcheck` extension, in the
+  contrib package of some distributions, such as `postgresql18-contrib`.
 
 ## Tests
 

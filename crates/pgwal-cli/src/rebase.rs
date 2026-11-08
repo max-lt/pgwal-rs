@@ -59,6 +59,13 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
     let reached = result?;
 
     std::fs::remove_file(args.pgdata.join("standby.signal"))?;
+    // The manifest of pgwal fetch no longer matches the files.
+    for stale in ["backup_label.old", "backup_manifest"] {
+        match std::fs::remove_file(args.pgdata.join(stale)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
     let control = ControlFile::read(&args.pgdata)?;
     if control.state != ClusterState::ShutDownInRecovery {
         bail!("the copy is not shut down in recovery: {:?}", control.state);
@@ -84,13 +91,18 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
 /// Starts the server, waits for the replay to reach `end`, and stops it.
 /// Returns the replay position.
 fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
-    let log = socket.join("postgres.log");
-    let server = start_server(pg, &args.pgdata, socket)?;
+    let server = start_server(pg, &args.pgdata, socket, &args.pg.user, Role::Standby)?;
+    let log = server.log();
 
     let stall = Duration::from_secs(args.stall_seconds);
     let mut last = (Lsn(0), Instant::now());
     let reached = loop {
-        let lsn = match server.replay_lsn(socket, &args.pg.user) {
+        let lsn = match server
+            .query("SELECT pg_last_wal_replay_lsn()")
+            .and_then(|out| {
+                out.parse()
+                    .map_err(|e| anyhow::anyhow!("pg_last_wal_replay_lsn: {e}"))
+            }) {
             Ok(lsn) => lsn,
             Err(e)
                 if pg
@@ -107,6 +119,11 @@ fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
         if lsn != last.0 {
             last = (lsn, Instant::now());
         } else if last.1.elapsed() >= stall {
+            // Recovery pauses on a setting lower than on the primary.
+            let paused = server.query("SELECT pg_get_wal_replay_pause_state()")?;
+            if paused != "not paused" {
+                bail!("the replay is {paused} at {lsn}:\n{}", tail(&log));
+            }
             warn!(
                 replayed = %lsn,
                 archive_end = %end,
@@ -136,8 +153,9 @@ struct PgArgs {
     /// Without it, they come from PATH.
     #[arg(long, env = "PGWAL_PG_BIN")]
     pg_bin: Option<PathBuf>,
-    /// A superuser of the copy, for the local connections.
-    #[arg(long, env = "PGUSER", default_value = "postgres")]
+    /// A superuser of the copy, for the local connections. It does not read
+    /// PGUSER, which names the replication role of the other commands.
+    #[arg(long, default_value = "postgres")]
     user: String,
 }
 
@@ -171,29 +189,7 @@ pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
         std::process::id()
     ));
     let socket = private_dir("verify")?;
-    let result = (|| {
-        copy_dir(pgdata, &scratch)?;
-        for signal in ["standby.signal", "recovery.signal"] {
-            let _ = std::fs::remove_file(scratch.join(signal));
-        }
-        let server = start_server(pg, &scratch, &socket)?;
-        let amcheck = pg.run(
-            "pg_amcheck",
-            &[
-                "-h",
-                path(&socket),
-                "-p",
-                PORT,
-                "-U",
-                user,
-                "--all",
-                "--install-missing",
-                "--heapallindexed",
-            ],
-        );
-        server.stop()?;
-        amcheck.context("pg_amcheck found corruption in the copy")
-    })();
+    let result = amcheck(pg, pgdata, &scratch, &socket, user);
     let _ = std::fs::remove_dir_all(&scratch);
     let _ = std::fs::remove_dir_all(&socket);
     result?;
@@ -202,6 +198,32 @@ pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
         seconds = t.elapsed().as_secs_f64(),
         "copy verified"
     );
+    Ok(())
+}
+
+/// Runs `pg_amcheck` on a scratch copy of `pgdata`, served on `socket`.
+fn amcheck(pg: &Bin, pgdata: &Path, scratch: &Path, socket: &Path, user: &str) -> Result<()> {
+    copy_dir(pgdata, scratch)?;
+    for signal in ["standby.signal", "recovery.signal"] {
+        let _ = std::fs::remove_file(scratch.join(signal));
+    }
+    let server = start_server(pg, scratch, socket, user, Role::Scratch)?;
+    let amcheck = pg.run(
+        "pg_amcheck",
+        &[
+            "-h",
+            path(socket),
+            "-p",
+            PORT,
+            "-U",
+            user,
+            "--all",
+            "--install-missing",
+            "--heapallindexed",
+        ],
+    );
+    server.stop()?;
+    amcheck.context("pg_amcheck found corruption in the copy")?;
     Ok(())
 }
 
@@ -217,16 +239,37 @@ fn private_dir(purpose: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// What a private server is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// A standby that replays the archive onto the copy.
+    Standby,
+    /// A primary on a scratch copy, which goes away.
+    Scratch,
+}
+
 /// Starts Postgres on `pgdata`, on a socket in the private directory `dir`
 /// only, with local connections trusted. The copy keeps its own
-/// `pg_hba.conf`.
-fn start_server<'a>(pg: &'a Bin, pgdata: &'a Path, dir: &Path) -> Result<Server<'a>> {
+/// `pg_hba.conf`. The server archives nothing, follows no primary, and
+/// logs to `dir`.
+fn start_server<'a>(
+    pg: &'a Bin,
+    pgdata: &'a Path,
+    dir: &'a Path,
+    user: &'a str,
+    role: Role,
+) -> Result<Server<'a>> {
     let dir_name = path(dir);
     std::fs::write(dir.join("pg_hba.conf"), "local all all trust\n")?;
     let mut opts = format!(
         "-c listen_addresses= -k {dir_name} -p {PORT} -c unix_socket_permissions=0700 \
-         -c hot_standby=on -c hba_file={dir_name}/pg_hba.conf"
+         -c hba_file={dir_name}/pg_hba.conf -c hot_standby=on -c archive_mode=off \
+         -c primary_conninfo= -c primary_slot_name= -c logging_collector=off"
     );
+    // A scratch primary runs no job of the extensions of the copy.
+    if role == Role::Scratch {
+        opts.push_str(" -c shared_preload_libraries=");
+    }
     // A copy of a Debian primary has no postgresql.conf. The settings that a
     // standby needs at least as high as on the primary come from pg_control.
     if !pgdata.join("postgresql.conf").exists() {
@@ -244,8 +287,16 @@ fn start_server<'a>(pg: &'a Bin, pgdata: &'a Path, dir: &Path) -> Result<Server<
             opts.push_str(&format!(" -c {setting}={}", value.trim()));
         }
     }
-    let log = dir.join("postgres.log");
-    let started = pg.run(
+    let server = Server {
+        pg,
+        pgdata,
+        dir,
+        user,
+    };
+    let log = server.log();
+    // A standby accepts connections once it is consistent, which can take
+    // a whole checkpoint cycle of WAL.
+    pg.run(
         "pg_ctl",
         &[
             "-D",
@@ -254,14 +305,18 @@ fn start_server<'a>(pg: &'a Bin, pgdata: &'a Path, dir: &Path) -> Result<Server<
             path(&log),
             "-o",
             &opts,
+            "-t",
+            START_TIMEOUT_SECONDS,
             "-w",
             "start",
         ],
-    );
-    let server = Server { pg, pgdata };
-    started.with_context(|| format!("starting Postgres:\n{}", tail(&log)))?;
+    )
+    .with_context(|| format!("starting Postgres:\n{}", tail(&log)))?;
     Ok(server)
 }
+
+/// How long `pg_ctl start` waits. It stops waiting when the server exits.
+const START_TIMEOUT_SECONDS: &str = "86400";
 
 /// The `pg_controldata` field of each setting a standby needs at least as
 /// high as on the primary.
@@ -349,10 +404,18 @@ fn check_version(pg: &Bin, pgdata: &Path) -> Result<()> {
 struct Server<'a> {
     pg: &'a Bin,
     pgdata: &'a Path,
+    /// The private directory of the socket and the log.
+    dir: &'a Path,
+    user: &'a str,
 }
 
 impl Server<'_> {
-    fn replay_lsn(&self, socket: &Path, user: &str) -> Result<Lsn> {
+    fn log(&self) -> PathBuf {
+        self.dir.join("postgres.log")
+    }
+
+    /// The one value that `sql` returns.
+    fn query(&self, sql: &str) -> Result<String> {
         let out = self.pg.run(
             "psql",
             &[
@@ -360,20 +423,18 @@ impl Server<'_> {
                 "-A",
                 "-t",
                 "-h",
-                path(socket),
+                path(self.dir),
                 "-p",
                 PORT,
                 "-U",
-                user,
+                self.user,
                 "-d",
                 "postgres",
                 "-c",
-                "SELECT pg_last_wal_replay_lsn()",
+                sql,
             ],
         )?;
-        out.trim()
-            .parse()
-            .map_err(|e| anyhow::anyhow!("pg_last_wal_replay_lsn: {e}"))
+        Ok(out.trim().to_owned())
     }
 
     /// A fast stop of a standby writes a restartpoint at the last checkpoint

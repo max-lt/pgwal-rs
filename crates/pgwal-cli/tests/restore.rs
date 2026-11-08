@@ -554,6 +554,19 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
     let backup = setup.path("backup");
     let label = pgwal::BackupLabel::read(&backup).unwrap().unwrap();
     let hba = std::fs::read(backup.join("pg_hba.conf")).unwrap();
+    // The private servers of rebase and verify must not run the archiving
+    // of the copy.
+    let archived = setup.path("archived");
+    let auto_conf = backup.join("postgresql.auto.conf");
+    let conf = std::fs::read_to_string(&auto_conf).unwrap_or_default();
+    std::fs::write(
+        &auto_conf,
+        format!(
+            "{conf}archive_mode = on\narchive_command = 'touch {}'\n",
+            archived.display()
+        ),
+    )
+    .unwrap();
 
     let out = setup.rebase();
     assert!(
@@ -577,6 +590,8 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
     assert!(!backup.join("standby.signal").exists());
     assert!(!backup.join("postmaster.pid").exists());
     assert_eq!(std::fs::read(backup.join("pg_hba.conf")).unwrap(), hba);
+    assert!(!archived.exists(), "a private server archived WAL");
+    std::fs::write(&auto_conf, conf).unwrap();
 
     // Nothing new in the archive: the redo point stays. The copy has no
     // configuration files, as a copy of a Debian primary.
