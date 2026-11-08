@@ -231,17 +231,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     }
 
     /// The history file of `timeline`: `(file name, content)`.
-    pub async fn timeline_history(&mut self, timeline: u32) -> Result<(String, String), Error> {
+    /// The content of the history file of `timeline`.
+    pub async fn timeline_history(&mut self, timeline: u32) -> Result<String, Error> {
         let row = self
             .single_row(&format!("TIMELINE_HISTORY {timeline}"))
             .await?;
-        let col = |i: usize| {
-            row.get(i)
-                .cloned()
-                .flatten()
-                .ok_or_else(|| protocol("TIMELINE_HISTORY: missing column"))
-        };
-        Ok((col(0)?, col(1)?))
+        row.get(1)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| protocol("TIMELINE_HISTORY: missing column"))
     }
 
     /// The errors of missing WAL come back as [`Error::WalGone`].
@@ -304,15 +302,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         matches!(frame_len(&self.buf), Ok(Some(len)) if self.buf.len() > len)
     }
 
-    /// Reports the written and flushed positions at `now`. With
-    /// `reply_requested`, the server answers at once with a keepalive. The
-    /// caller gives the time: `SystemTime::now()` panics on wasm32.
+    /// Reports the written and flushed positions at `now`. The caller gives
+    /// the time: `SystemTime::now()` panics on wasm32.
     pub async fn send_status(
         &mut self,
         written: Lsn,
         flushed: Lsn,
-        reply_requested: bool,
         now: SystemTime,
+    ) -> Result<(), Error> {
+        self.status(written, flushed, now, false).await
+    }
+
+    /// Sends a status that the server answers at once with a keepalive
+    /// that holds its position.
+    pub async fn ask_position(
+        &mut self,
+        written: Lsn,
+        flushed: Lsn,
+        now: SystemTime,
+    ) -> Result<(), Error> {
+        self.status(written, flushed, now, true).await
+    }
+
+    async fn status(
+        &mut self,
+        written: Lsn,
+        flushed: Lsn,
+        now: SystemTime,
+        reply_requested: bool,
     ) -> Result<(), Error> {
         let now = now
             .duration_since(UNIX_EPOCH)

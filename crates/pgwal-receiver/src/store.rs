@@ -232,6 +232,24 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+/// Removes the segment files of every timeline but `timeline`.
+pub(crate) async fn remove_other_timelines(
+    dir: &Path,
+    timeline: u32,
+    seg_size: u64,
+) -> Result<(), Error> {
+    let mut entries = fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let base = name.strip_suffix(PARTIAL_SUFFIX).unwrap_or(name);
+        if parse_segment_file_name(base, seg_size).is_some_and(|(found, _)| found != timeline) {
+            fs::remove_file(entry.path()).await?;
+        }
+    }
+    Ok(())
+}
+
 /// The system id a store directory holds WAL of.
 pub(crate) async fn read_system_id(dir: &Path) -> Result<Option<u64>, Error> {
     match fs::read_to_string(dir.join(SYSTEM_ID_FILE)).await {

@@ -509,8 +509,8 @@ impl Receiver {
             t => Some(conn.timeline_history(t).await?),
         };
         let switch_point = history
-            .as_ref()
-            .and_then(|(_, content)| timeline_start(content))
+            .as_deref()
+            .and_then(timeline_start)
             .unwrap_or_default();
         let flushed_key = format!("flushed/{timeline}");
         let resumed = self.get(&flushed_key).and_then(|v| v.parse().ok()).map(Lsn);
@@ -548,7 +548,7 @@ impl Receiver {
                 .await
                 .map_err(|e| Stop::fatal(format!("gap in the archive: {e}")))?;
         }
-        if let Some((_, content)) = &history {
+        if let Some(content) = &history {
             let key = format!("{}{}", cfg.prefix, history_key(system.system_id, timeline));
             self.bucket()?
                 .put(key, content.clone().into_bytes())
@@ -602,7 +602,7 @@ impl Receiver {
                         synced = durable;
                         self.live.borrow_mut().synced = synced;
                         self.step("status", async {
-                            conn.send_status(Lsn(synced), Lsn(synced), false, system_time())
+                            conn.send_status(Lsn(synced), Lsn(synced), system_time())
                                 .await
                                 .map_err(Stop::from)
                         })
@@ -659,7 +659,7 @@ impl Receiver {
                     }
                     Some(CopyMessage::Keepalive { reply_requested, .. }) => {
                         if reply_requested && !copy_done {
-                            conn.send_status(Lsn(synced), Lsn(synced), false, system_time())
+                            conn.send_status(Lsn(synced), Lsn(synced), system_time())
                                 .await?;
                         }
                     }

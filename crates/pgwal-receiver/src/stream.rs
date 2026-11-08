@@ -11,8 +11,8 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::error::Error;
-use crate::store::WalStore;
-use crate::upload::{Uploader, WalSink, read_watermark};
+use crate::store::{WalStore, read_flushed, remove_other_timelines};
+use crate::upload::{Uploader, WalSink, read_watermark, salvage};
 use crate::wire::{Conn, CopyMessage};
 
 /// Longest delay before a flush while WAL keeps arriving.
@@ -96,10 +96,25 @@ where
         timeline => Some(conn.timeline_history(timeline).await?),
     };
     let switch_point = history
-        .as_ref()
-        .and_then(|(_, content)| timeline_start(content))
+        .as_deref()
+        .and_then(timeline_start)
         .unwrap_or_default();
+    if let Some(content) = &history {
+        sink.put(
+            &history_key(system.system_id, system.timeline),
+            Bytes::from(content.clone()),
+        )
+        .await?;
+    }
 
+    // After a failover, the WAL of the old timeline goes up before its files
+    // go.
+    if let Some((timeline, _)) = read_flushed(&cfg.dir).await?
+        && timeline != system.timeline
+    {
+        salvage(&cfg.dir, sink.clone()).await?;
+        remove_other_timelines(&cfg.dir, system.timeline, seg_size).await?;
+    }
     let mut store =
         WalStore::open(cfg.dir.clone(), system.system_id, system.timeline, seg_size).await?;
     // Nothing local on a later timeline: start at its switch point, not at the
@@ -143,14 +158,6 @@ where
     store.start_at(start);
     info!(slot = %cfg.slot, system_id = system.system_id, timeline = system.timeline, %start, "streaming WAL");
 
-    if let Some((_, content)) = history {
-        sink.put(
-            &history_key(system.system_id, system.timeline),
-            Bytes::from(content),
-        )
-        .await?;
-    }
-
     let uploader = Uploader::new(
         cfg.dir.clone(),
         system.system_id,
@@ -162,7 +169,11 @@ where
     .await?;
     let (flushed_tx, flushed_rx) = watch::channel(start);
     let (uploaded_tx, uploaded_rx) = watch::channel(uploader.uploaded);
-    let upload = tokio::spawn(uploader.run(flushed_rx, cfg.upload_every, uploaded_tx));
+    let mut upload = AbortOnDrop(tokio::spawn(uploader.run(
+        flushed_rx,
+        cfg.upload_every,
+        uploaded_tx,
+    )));
 
     let confirmed = Confirmed {
         confirm: cfg.confirm,
@@ -172,11 +183,21 @@ where
     // Closing the channel makes the uploader send the rest and stop, even when
     // the stream failed. The store lock stays held until it has stopped.
     drop(flushed_tx);
-    let uploaded = upload.await.expect("uploader panicked");
+    let uploaded = (&mut upload.0).await.expect("uploader panicked");
     let flushed = streamed?;
     let uploaded = uploaded?;
     debug!(%flushed, %uploaded, "replication ended");
     Ok(uploaded)
+}
+
+/// A dropped `receive` stops its uploader, which reads the store that the
+/// next `receive` opens.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The flushed position the server sees, and the uploads it can wait for.
@@ -186,17 +207,17 @@ struct Confirmed {
 }
 
 impl Confirmed {
-    fn of(&self, flushed: Lsn) -> Lsn {
+    fn position(&self, flushed: Lsn) -> Lsn {
         match self.confirm {
             Confirm::Flushed => flushed,
             Confirm::Uploaded => flushed.min(*self.uploaded.borrow()),
         }
     }
 
-    /// Resolves when an upload moves the confirmed position. Never resolves
-    /// with [`Confirm::Flushed`], or once the uploader has stopped.
-    async fn moved(&mut self) {
-        if self.confirm == Confirm::Flushed || self.uploaded.changed().await.is_err() {
+    /// Resolves when an upload ends. Never resolves once the uploader has
+    /// stopped.
+    async fn uploaded(&mut self) {
+        if self.uploaded.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
     }
@@ -213,20 +234,21 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut stop = pin!(stop);
-    let mut drain = Drain::default();
+    let mut drain = Drain::Streaming;
+    // The highest WAL end the server announced up to its answer to a stop.
+    let mut target = Lsn(0);
     let mut flushed = store.flush().await?;
     let mut last_flush = Instant::now();
     loop {
         let msg = tokio::select! {
-            () = &mut stop, if !drain.requested => {
-                drain.requested = true;
-                // The answer is a keepalive with the server's position.
-                conn.send_status(store.written(), confirmed.of(flushed), true, SystemTime::now())
+            () = &mut stop, if drain == Drain::Streaming => {
+                drain = Drain::Asked;
+                conn.ask_position(store.written(), confirmed.position(flushed), SystemTime::now())
                     .await?;
                 continue;
             }
-            () = confirmed.moved() => {
-                conn.send_status(store.written(), confirmed.of(flushed), false, SystemTime::now())
+            () = confirmed.uploaded(), if confirmed.confirm == Confirm::Uploaded => {
+                conn.send_status(store.written(), confirmed.position(flushed), SystemTime::now())
                     .await?;
                 continue;
             }
@@ -240,8 +262,8 @@ where
                 data,
             } => {
                 store.write(start, &data).await?;
-                if !drain.answered {
-                    drain.target = drain.target.max(wal_end);
+                if drain != Drain::Answered {
+                    target = target.max(wal_end);
                 }
                 false
             }
@@ -249,14 +271,14 @@ where
                 wal_end,
                 reply_requested,
             } => {
-                if drain.requested {
-                    drain.answered = true;
-                    drain.target = drain.target.max(wal_end);
+                if drain == Drain::Asked {
+                    drain = Drain::Answered;
+                    target = target.max(wal_end);
                 }
                 reply_requested
             }
         };
-        let done = drain.done(store.written());
+        let done = drain == Drain::Answered && store.written() >= target;
         // Flush once a burst is drained rather than per message, but never
         // later than MAX_FLUSH_DELAY under a continuous stream.
         if done
@@ -272,8 +294,7 @@ where
             if let Err(e) = conn
                 .send_status(
                     store.written(),
-                    confirmed.of(flushed),
-                    false,
+                    confirmed.position(flushed),
                     SystemTime::now(),
                 )
                 .await
@@ -293,20 +314,13 @@ where
     Ok(flushed)
 }
 
-/// A stop in progress: the receiver ends the stream once the server has
-/// answered and everything it announced is written.
-#[derive(Default)]
-struct Drain {
-    requested: bool,
-    answered: bool,
-    /// The highest WAL end the server announced up to its answer.
-    target: Lsn,
-}
-
-impl Drain {
-    fn done(&self, written: Lsn) -> bool {
-        self.answered && written >= self.target
-    }
+/// A stop: the receiver asks the server for its position, and ends the
+/// stream once the WAL up to the answer is written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    Streaming,
+    Asked,
+    Answered,
 }
 
 /// Drops the slot of `cfg` on the server behind `stream`. After a

@@ -607,6 +607,53 @@ async fn a_later_timeline_starts_at_its_switch_point_and_archives_its_history() 
     sink.assert_tiles(Lsn(3 * SEG), end);
 }
 
+/// A failover while the sink is down: the run on the new timeline first
+/// uploads the WAL of the old one, then removes its files.
+#[tokio::test]
+async fn a_failover_uploads_then_removes_the_old_timeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (client, server) = tokio::io::duplex(4 << 20);
+    let mut server = Walsender {
+        io: server,
+        buf: BytesMut::new(),
+    };
+    let cfg = config(tmp.path());
+    let task = tokio::spawn(async move {
+        receive(client, &cfg, Arc::new(DownSink), std::future::pending()).await
+    });
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let old_end = server.stream(Lsn(SEG), &pattern(4096, 3)).await;
+    server.await_flush(old_end).await;
+    drop(server);
+    assert!(finish(task).await.is_err(), "the run dies");
+
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    server.start(None).await;
+    let end = server.stream(Lsn(3 * SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+    server.end().await;
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    let old: Vec<RangeKey> = sink
+        .0
+        .lock()
+        .unwrap()
+        .keys()
+        .filter_map(|key| RangeKey::parse(key))
+        .filter(|key| key.timeline == 1)
+        .collect();
+    assert_eq!((old[0].start, old.last().unwrap().end), (Lsn(SEG), old_end));
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("00000001"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
 #[tokio::test]
 async fn an_invalidated_slot_is_reported_as_wal_gone() {
     let tmp = tempfile::tempdir().unwrap();
