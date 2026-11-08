@@ -4,7 +4,7 @@ use std::io;
 use std::path::Path;
 
 use crate::archive::{history_file_name, overlay_segment};
-use crate::lsn::{Lsn, parse_segment_file_name, segment_file_name};
+use crate::lsn::{Lsn, is_segment_size, parse_segment_file_name, segment_file_name};
 
 /// The size of the segments in `pg_wal`, from the size of any segment file.
 pub fn segment_size(pg_wal: &Path) -> io::Result<u64> {
@@ -15,7 +15,7 @@ pub fn segment_size(pg_wal: &Path) -> io::Result<u64> {
         // Every segment name parses with the smallest segment size.
         if parse_segment_file_name(name, 1 << 20).is_some() {
             let size = entry.metadata()?.len();
-            if size.is_power_of_two() && (1 << 20..=1 << 30).contains(&size) {
+            if is_segment_size(size) {
                 return Ok(size);
             }
         }

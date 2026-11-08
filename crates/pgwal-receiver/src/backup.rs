@@ -27,7 +27,9 @@ const MANIFEST: &str = "backup_manifest";
 /// an idle timeout that covers it.
 ///
 /// The `done` object goes last. On an error, the parts written so far stay
-/// in the sink without it.
+/// in the sink without it, and the next backup with the same start removes
+/// them. A standby starts its backups at its last restartpoint: when the
+/// sink holds a whole backup with that start, that backup is the result.
 pub async fn base_backup<S>(
     stream: S,
     conn: &ConnConfig,
@@ -45,6 +47,26 @@ where
         )));
     }
     let begun = conn.start_base_backup().await?;
+    let done = ArchiveKey::BackupDone {
+        system_id: system.system_id,
+        start: begun.start,
+    }
+    .to_string();
+    if let Some(text) = sink.get(&done).await? {
+        let backup = std::str::from_utf8(&text)
+            .ok()
+            .and_then(ArchivedBackup::parse)
+            .ok_or_else(|| Error::Store(format!("unreadable {done}")))?;
+        info!(start = %backup.start, "the sink holds a base backup with this start");
+        return Ok(backup);
+    }
+    let prefix = done
+        .strip_suffix("done")
+        .expect("a done key ends with done");
+    let leftovers = sink.list(prefix).await?;
+    if !leftovers.is_empty() {
+        sink.delete(&leftovers).await?;
+    }
     info!(start = %begun.start, timeline = begun.timeline, "base backup started");
 
     let mut parts = Parts {
@@ -88,17 +110,7 @@ where
             backup.streams
         )));
     }
-    parts
-        .sink
-        .put(
-            &ArchiveKey::BackupDone {
-                system_id: backup.system_id,
-                start: backup.start,
-            }
-            .to_string(),
-            Bytes::from(backup.to_text()),
-        )
-        .await?;
+    parts.sink.put(&done, Bytes::from(backup.to_text())).await?;
     info!(start = %backup.start, end = %backup.end, "base backup written");
     Ok(backup)
 }

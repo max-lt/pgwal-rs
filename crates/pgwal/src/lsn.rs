@@ -54,6 +54,11 @@ pub fn segment_file_name(timeline: u32, segno: u64, seg_size: u64) -> String {
     format!("{timeline:08X}{:08X}{:08X}", segno / per_id, segno % per_id)
 }
 
+/// A segment size that Postgres accepts: a power of two from 1 MiB to 1 GiB.
+pub fn is_segment_size(size: u64) -> bool {
+    size.is_power_of_two() && (1 << 20..=1 << 30).contains(&size)
+}
+
 /// Inverse of [`segment_file_name`]: `(timeline, segno)`.
 pub fn parse_segment_file_name(name: &str, seg_size: u64) -> Option<(u32, u64)> {
     if name.len() != 24 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {

@@ -14,8 +14,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use pgwal::{ArchiveKey, ClusterState, ControlFile, assemble_segment, segment_file_name};
 use pgwal_receiver::{
-    ArchivedBackup, Confirm, ConnConfig, DirSink, Error, Lsn, RangeKey, StreamConfig, base_backup,
-    forget_slot, receive,
+    ArchivedBackup, Confirm, ConnConfig, DirSink, Error, Lsn, RangeKey, StreamConfig, WalSink,
+    base_backup, forget_slot, receive,
 };
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
@@ -449,6 +449,113 @@ async fn a_base_backup_in_the_sink_restores_every_row() {
     assert_eq!(sum, 3 * ROWS * (3 * ROWS + 1) / 2);
     drop(client);
     stop(&bin, &copy);
+}
+
+/// A sink that keeps an object for good, as `S3Sink` does: a put of other
+/// bytes under a key fails.
+struct Immutable(DirSink);
+
+#[async_trait::async_trait]
+impl WalSink for Immutable {
+    async fn put(&self, key: &str, data: Bytes) -> std::io::Result<()> {
+        match self.0.get(key).await? {
+            Some(old) if old != data => Err(std::io::Error::other(format!("{key}: other bytes"))),
+            _ => self.0.put(key, data).await,
+        }
+    }
+
+    async fn get(&self, key: &str) -> std::io::Result<Option<Bytes>> {
+        self.0.get(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.0.list(prefix).await
+    }
+
+    async fn delete(&self, keys: &[String]) -> std::io::Result<()> {
+        self.0.delete(keys).await
+    }
+}
+
+/// A standby starts each backup at its last restartpoint, so with no new
+/// checkpoint on the primary two backups have the same start. The parts of
+/// a failed backup make way, and a whole backup is the result.
+#[tokio::test(flavor = "multi_thread")]
+async fn backups_of_an_idle_standby_share_their_start() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let tmp = tempfile::Builder::new()
+        .prefix("bsb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = tmp.path();
+    let (data, standby, sb_sock) = (root.join("data"), root.join("standby"), root.join("sb"));
+    std::fs::create_dir(&sb_sock).unwrap();
+    run(
+        &bin,
+        "initdb",
+        &[
+            "-D",
+            path(&data),
+            "-U",
+            "postgres",
+            "-A",
+            "trust",
+            "--no-sync",
+            "--no-instructions",
+        ],
+    );
+    start(&bin, &data, root, &root.join("primary.log"));
+    run(
+        &bin,
+        "pg_basebackup",
+        &[
+            "-D",
+            path(&standby),
+            "-R",
+            "-h",
+            path(root),
+            "-U",
+            "postgres",
+            "--no-sync",
+        ],
+    );
+    std::fs::set_permissions(&standby, std::fs::Permissions::from_mode(0o700)).unwrap();
+    start(&bin, &standby, &sb_sock, &root.join("standby.log"));
+    connect(&sb_sock)
+        .await
+        .batch_execute(&format!(
+            "SELECT pg_create_physical_replication_slot('{SLOT}', true)"
+        ))
+        .await
+        .unwrap();
+
+    let sink: Arc<dyn WalSink> = Arc::new(Immutable(DirSink::new(root.join("objects"))));
+    let socket = sb_sock.join(".s.PGSQL.5432");
+    let backup = || async {
+        // The backup_label gives the start time in seconds: a new second
+        // gives other bytes.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let stream = UnixStream::connect(&socket).await.unwrap();
+        base_backup(stream, &conn("pgwal_backup"), SLOT, sink.clone())
+            .await
+            .unwrap()
+    };
+    let first = backup().await;
+    let done = ArchiveKey::BackupDone {
+        system_id: first.system_id,
+        start: first.start,
+    };
+    sink.delete(&[done.to_string()]).await.unwrap();
+    let second = backup().await;
+    assert_eq!(second.start, first.start);
+    assert!(sink.get(&done.to_string()).await.unwrap().is_some());
+    assert_eq!(backup().await, second);
+
+    stop(&bin, &standby);
+    stop(&bin, &data);
 }
 
 /// `pg_controldata` output as `label -> value`.

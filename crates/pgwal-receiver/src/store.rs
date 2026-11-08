@@ -2,7 +2,7 @@ use std::fs::TryLockError;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use pgwal::{Lsn, parse_segment_file_name, segment_file_name};
+use pgwal::{Lsn, is_segment_size, parse_segment_file_name, segment_file_name};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -304,7 +304,12 @@ pub(crate) async fn first_segment(dir: &Path, timeline: u32) -> Result<Option<(L
             continue;
         }
         if first.as_ref().is_none_or(|(f, _)| base < f.as_str()) {
-            first = Some((base.to_owned(), entry.metadata().await?.len()));
+            // A crash between the truncate and the set_len of a segment
+            // leaves it empty, with no WAL.
+            let len = entry.metadata().await?.len();
+            if is_segment_size(len) {
+                first = Some((base.to_owned(), len));
+            }
         }
     }
     let Some((name, seg_size)) = first else {
@@ -446,6 +451,12 @@ mod tests {
             Some((1, Lsn(SEG + 300)))
         );
         assert_eq!(read_system_id(tmp.path()).await.unwrap(), Some(7401));
+        assert_eq!(
+            first_segment(tmp.path(), 1).await.unwrap(),
+            Some((Lsn(SEG), SEG))
+        );
+        // A crash before the set_len of a new segment leaves it empty.
+        fs::write(partial_path(tmp.path(), 0), b"").await.unwrap();
         assert_eq!(
             first_segment(tmp.path(), 1).await.unwrap(),
             Some((Lsn(SEG), SEG))
