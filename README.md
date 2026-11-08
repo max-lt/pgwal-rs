@@ -112,7 +112,8 @@ pg_ctl -D /restore/data start
   timelines of the archive.
 - The command refuses an archive with a gap after the start, on any
   timeline. With `--accept-gap`, it restores up to the gap.
-- The command refuses a data directory with a `postmaster.pid`.
+- The command refuses an archive that holds no WAL of the copy, such as a
+  wrong `--archive`, and a data directory with a `postmaster.pid`.
 - An archive recovery accepts read-only connections once the copy is
   consistent, which is when `pg_ctl start -w` returns. Writes wait for the
   promotion at the end of the replay: wait for `pg_is_in_recovery()` to be
@@ -177,7 +178,10 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   archive, and stops it. The copy is then a base backup at the last
   checkpoint of the primary in the archive. The command prints its redo
   point.
-- The command refuses an archive with a gap.
+- The command refuses an archive with a gap, and an archive that ends before
+  the copy is consistent: the end of the backup in `backup_manifest`, or the
+  minimum recovery point of a rebased copy. A standby that waits for WAL
+  before it is consistent is an error too.
 - The replay can stand still before the end of the archive when the last
   object ends inside a WAL record. After `--stall-seconds` (default 10) of
   no progress, the command takes the replay position as the end once
@@ -201,8 +205,9 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   after the copy, the replay pauses, and the command starts the server again
   with the new value. A pause for another reason is an error.
 - Once the WAL is in the copy, Ctrl-C or SIGTERM stops the running tool and
-  the server, and removes their files. During the download, it stops the
-  command at once.
+  the server, and removes their files. The tools run in process groups of
+  their own, so a Ctrl-C in the terminal does not stop `pg_ctl stop`. During
+  the download, a signal stops the command at once.
 - After the rebase, the copy has no `backup_label.old` and no
   `backup_manifest`: they describe the copy before the rebase.
 - A copy without `postgresql.conf`, such as a copy of a Debian primary,

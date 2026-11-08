@@ -2,6 +2,7 @@
 //! them.
 
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,9 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio::signal::unix::{SignalKind, signal};
 
-/// Stops the long commands of rebase and verify on Ctrl-C or SIGTERM. The
-/// process then stops its private server and removes its files before it
-/// exits.
+/// Set on Ctrl-C or SIGTERM.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 pub fn watch_signals() {
@@ -40,13 +39,15 @@ pub fn check_interrupted() -> Result<()> {
 pub struct Bin(pub Option<PathBuf>);
 
 impl Bin {
-    /// The output of `pg_controldata` is translated in other locales.
+    /// LC_ALL=C: the output of `pg_controldata` is translated in other
+    /// locales. A process group of its own: a Ctrl-C in the terminal reaches
+    /// pgwal only, which then stops the tool or lets it end.
     fn command(&self, tool: &str) -> Command {
         let mut command = match &self.0 {
             Some(dir) => Command::new(dir.join(tool)),
             None => Command::new(tool),
         };
-        command.env("LC_ALL", "C");
+        command.env("LC_ALL", "C").process_group(0);
         command
     }
 

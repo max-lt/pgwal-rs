@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use futures_util::{StreamExt, TryStreamExt};
 use pgwal::{
-    AfterReplay, ArchiveKey, Lsn, Origin, Recovery, ReplayStart, plan, request_recovery,
-    timeline_switches, write_history, write_segment,
+    AfterReplay, ArchiveKey, Lsn, Recovery, ReplayStart, plan, request_recovery, timeline_switches,
+    write_history, write_segment,
 };
 use tracing::{info, warn};
 
@@ -59,8 +59,8 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
     } else {
         AfterReplay::Promote
     };
-    let end = apply(archive.as_ref(), &args.pgdata, on_gap, after).await?;
-    println!("{end}");
+    let applied = apply(archive.as_ref(), &args.pgdata, on_gap, after).await?;
+    println!("{}", applied.end);
     Ok(())
 }
 
@@ -106,18 +106,25 @@ fn replay_start(pgdata: &Path) -> Result<ReplayStart> {
         .with_context(|| format!("reading the start point of {}", pgdata.display()))
 }
 
+/// What a restore wrote.
+pub struct Applied {
+    pub start: ReplayStart,
+    /// Where the replay ends.
+    pub end: Lsn,
+}
+
 /// Writes the archived WAL that follows the copy in `pgdata` into its
-/// `pg_wal`, and returns the LSN where the replay ends.
+/// `pg_wal`.
 pub async fn apply(
     archive: &dyn WalSink,
     pgdata: &Path,
     on_gap: OnGap,
     after: AfterReplay,
-) -> Result<Lsn> {
+) -> Result<Applied> {
     refuse_running(pgdata)?;
+    let start = replay_start(pgdata)?;
     let pg_wal = pgdata.join("pg_wal");
     std::fs::create_dir_all(&pg_wal)?;
-    let start = replay_start(pgdata)?;
 
     let keys = archive.list("").await?;
     let switches = switches(archive, &keys, start.system_id).await?;
@@ -128,9 +135,12 @@ pub async fn apply(
         }
         warn!(%gap, "the archive has a gap: the replay stops there");
     }
-    if start.origin == Origin::BaseBackup && plan.segments.is_empty() {
+    // The archive holds the segment of the start of any copy that it serves.
+    // An empty plan is the archive of another cluster, or a wrong location.
+    if plan.segments.is_empty() {
         bail!(
-            "the archive has no WAL after the backup start {}",
+            "the archive holds no WAL of system {} from {}: check --archive",
+            start.system_id,
             start.from
         );
     }
@@ -189,7 +199,10 @@ pub async fn apply(
         ?after,
         "WAL written to pg_wal; start Postgres to replay it"
     );
-    Ok(end.unwrap_or(start.from))
+    Ok(Applied {
+        end: end.unwrap_or(start.from),
+        start,
+    })
 }
 
 /// The lines of the newest history file of `system_id` in the archive.

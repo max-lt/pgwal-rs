@@ -636,6 +636,79 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
     assert_eq!((rows, sum), (ROWS, ROWS * (ROWS + 1) / 2));
 }
 
+/// A wrong --archive holds nothing of the copy: the restore fails rather
+/// than leave the copy without the WAL after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_refuses_an_archive_with_nothing_of_the_copy() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let setup = Setup::new(bin);
+    setup.archived_backup().await;
+    let empty = setup.path("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let out = pgwal(&[
+        "restore",
+        "--archive",
+        path(&empty),
+        "--pgdata",
+        path(&setup.path("backup")),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the restore passed:\n{stderr}");
+    assert!(stderr.contains("holds no WAL"), "{stderr}");
+}
+
+/// The archive ends before the end of the base backup, as just after
+/// pg_basebackup -X none. The rebase fails at once: a standby would wait
+/// for consistency without end.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebase_refuses_an_archive_short_of_the_backup_end() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let setup = Setup::new(bin);
+    let keys = setup.archived_backup().await;
+    let label = pgwal::BackupLabel::read(&setup.path("backup"))
+        .unwrap()
+        .unwrap();
+    let archive = setup.path("archive");
+    for key in &keys {
+        let Some(range) = pgwal::RangeKey::parse(key) else {
+            continue;
+        };
+        let file = archive.join(key);
+        if range.start > label.start {
+            std::fs::remove_file(&file).unwrap();
+        } else if range.end > label.start {
+            // Keep the head of the object, up to just after the start.
+            let wal = std::fs::read(&file).unwrap();
+            let short = pgwal::RangeKey {
+                end: pgwal::Lsn(label.start.0 + 8),
+                ..range
+            };
+            let len = (short.end.0 - short.start.0) as usize;
+            std::fs::remove_file(&file).unwrap();
+            std::fs::write(archive.join(short.to_string()), &wal[..len]).unwrap();
+        }
+    }
+
+    let out = setup.rebase();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the rebase passed:\n{stderr}");
+    assert!(stderr.contains("before the copy is consistent"), "{stderr}");
+
+    // Without the manifest, the standby itself shows that it waits for WAL
+    // before it is consistent.
+    std::fs::remove_file(setup.path("backup/backup_manifest")).unwrap();
+    let out = setup.rebase();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the rebase passed:\n{stderr}");
+    assert!(stderr.contains("before the copy is consistent"), "{stderr}");
+}
+
 /// An archived object is damaged a few segments before the end. Postgres
 /// takes the damage for the end of the WAL: the rebase must fail, not stop
 /// there.

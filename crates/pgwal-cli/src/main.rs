@@ -17,7 +17,9 @@ mod backup;
 mod pg;
 mod rebase;
 mod restore;
+mod server;
 mod tls;
+mod verify;
 
 use tls::SslMode;
 
@@ -56,7 +58,7 @@ enum Cmd {
     Rebase(rebase::RebaseArgs),
     /// Check a stopped copy of the data directory: page checksums, and
     /// pg_amcheck on a scratch copy.
-    Verify(rebase::VerifyArgs),
+    Verify(verify::VerifyArgs),
 }
 
 /// Where to reach the server, as a role with the REPLICATION attribute.
@@ -152,7 +154,7 @@ async fn main() -> Result<()> {
         Cmd::Restore(args) => restore::run(args).await,
         Cmd::Plan(args) => restore::run_plan(args),
         Cmd::Rebase(args) => rebase::run(args).await,
-        Cmd::Verify(args) => rebase::run_verify(args),
+        Cmd::Verify(args) => verify::run_verify(args),
     }
 }
 
