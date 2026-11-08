@@ -6,6 +6,8 @@
 //!
 //! Without the `runtime` feature, reads have no idle timeout: the caller
 //! bounds the connection.
+//!
+//! For hosts without tokio. A minor version can change its API.
 
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,6 +50,7 @@ const AUTH_SASL_FINAL: i32 = 12;
 pub struct SystemInfo {
     pub system_id: u64,
     pub timeline: u32,
+    /// The flush position.
     pub xlogpos: Lsn,
 }
 
@@ -60,10 +63,8 @@ pub enum CopyMessage {
         wal_end: Lsn,
         data: Bytes,
     },
-    Keepalive {
-        wal_end: Lsn,
-        reply_requested: bool,
-    },
+    /// Without a status in reply, the server ends the stream after `wal_sender_timeout`.
+    Keepalive { wal_end: Lsn, reply_requested: bool },
 }
 
 pub struct BackupStart {
@@ -219,6 +220,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
     }
 
+    /// `None` if the slot is missing or holds no WAL.
     pub async fn slot_restart_lsn(&mut self, slot: &str) -> Result<Option<Lsn>, Error> {
         let row = self
             .single_row(&format!("READ_REPLICATION_SLOT {slot}"))

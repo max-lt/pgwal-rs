@@ -47,6 +47,7 @@ pub struct S3Config {
     pub bucket: String,
     /// Put before every key. Empty, or ends with `/`.
     pub prefix: String,
+    /// R2 takes `auto`.
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
@@ -201,6 +202,7 @@ pub struct S3Sink {
 }
 
 impl S3Sink {
+    /// Sends no request.
     pub fn new(config: S3Config) -> io::Result<S3Sink> {
         let (scheme, authority) = match config.endpoint.split_once("://") {
             Some(("http", rest)) => ("http", rest),

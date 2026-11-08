@@ -9,6 +9,31 @@
 //! To restore, rebuild each segment with [`pgwal::assemble_segment`] from the
 //! objects whose keys [`RangeKey::parse`] reads, and give the segments to Postgres
 //! through `restore_command`.
+//!
+//! ```no_run
+//! # #[cfg(feature = "s3")]
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::sync::Arc;
+//!
+//! use pgwal_receiver::s3::{S3Config, S3Sink};
+//! use pgwal_receiver::{Error, StreamConfig, receive};
+//!
+//! let s3 = S3Config::new("https://s3.example", "wal", "auto", "key id", "secret");
+//! let sink = Arc::new(S3Sink::new(s3)?);
+//! let cfg = StreamConfig::new("pgwal", "replicator", "/var/lib/pgwal/db1");
+//! loop {
+//!     let stream = tokio::net::TcpStream::connect("db1.example:5432").await?;
+//!     match receive(stream, &cfg, sink.clone(), std::future::pending()).await {
+//!         Ok(_) => {}
+//!         Err(e @ (Error::Config(_) | Error::SystemMismatch { .. } | Error::WalGone { .. })) => {
+//!             return Err(e.into());
+//!         }
+//!         Err(e) => eprintln!("retrying: {e}"),
+//!     }
+//!     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+//! }
+//! # }
+//! ```
 
 #[cfg(feature = "runtime")]
 mod backup;

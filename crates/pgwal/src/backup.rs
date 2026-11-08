@@ -90,6 +90,7 @@ impl ArchivedBackup {
         text
     }
 
+    /// `None` for an unknown or missing field, or `start` after `end`.
     pub fn parse(text: &str) -> Option<Self> {
         let (mut system_id, mut timeline, mut start, mut end) = (None, None, None, None);
         let (mut streams, mut tablespaces) = (Vec::new(), Vec::new());

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 use tracing::warn;
 
+/// Applies to network errors, timeouts and statuses such as 503 or 429.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Retry {

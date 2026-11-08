@@ -22,6 +22,7 @@ const MAX_FLUSH_DELAY: Duration = Duration::from_millis(100);
 pub struct StreamConfig {
     /// Physical replication slot, created on first use.
     pub slot: String,
+    /// A role with `REPLICATION`.
     pub user: String,
     /// For SCRAM-SHA-256. `None` when the server trusts `user`.
     pub password: Option<String>,
