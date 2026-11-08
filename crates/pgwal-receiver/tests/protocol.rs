@@ -71,6 +71,26 @@ impl MemSink {
             .collect()
     }
 
+    /// Asserts that the objects of `timeline` cover `[from, to)` with no
+    /// gap. They can overlap.
+    fn assert_covers(&self, timeline: u32, from: Lsn, to: Lsn) {
+        let mut ranges: Vec<RangeKey> = self
+            .0
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|key| RangeKey::parse(key))
+            .filter(|range| range.timeline == timeline)
+            .collect();
+        ranges.sort();
+        let mut at = from;
+        for range in ranges {
+            assert!(range.start <= at, "a gap on timeline {timeline} at {at}");
+            at = at.max(range.end);
+        }
+        assert_eq!(at, to, "timeline {timeline}");
+    }
+
     /// Asserts that the objects tile `[from, to)` exactly: no gap, no overlap.
     fn assert_tiles(&self, from: Lsn, to: Lsn) {
         let mut at = from;
@@ -710,20 +730,8 @@ async fn a_failover_archives_the_old_timeline_up_to_its_end() {
     server.end().await;
     assert_eq!(finish(task).await.unwrap(), end);
 
-    let ranges: Vec<RangeKey> = sink
-        .0
-        .lock()
-        .unwrap()
-        .keys()
-        .filter_map(|key| RangeKey::parse(key))
-        .collect();
     for (timeline, from, to) in [(1, Lsn(SEG), switch), (2, Lsn(3 * SEG), end)] {
-        let mut at = from;
-        for range in ranges.iter().filter(|r| r.timeline == timeline) {
-            assert!(range.start <= at, "a gap on timeline {timeline} at {at}");
-            at = at.max(range.end);
-        }
-        assert_eq!(at, to, "timeline {timeline}");
+        sink.assert_covers(timeline, from, to);
     }
     let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()
@@ -787,21 +795,12 @@ async fn a_chain_of_failovers_archives_every_timeline_and_history() {
     let objects = sink.0.lock().unwrap().clone();
     assert_eq!(&objects["7401/00000002.history"][..], HISTORY_2.as_bytes());
     assert_eq!(&objects["7401/00000003.history"][..], HISTORY_3.as_bytes());
-    let ranges: Vec<RangeKey> = objects
-        .keys()
-        .filter_map(|key| RangeKey::parse(key))
-        .collect();
     for (timeline, from, to) in [
         (1, Lsn(SEG), Lsn(0x300A00)),
         (2, Lsn(3 * SEG), Lsn(0x500A00)),
         (3, Lsn(5 * SEG), Lsn(5 * SEG + 4096)),
     ] {
-        let mut at = from;
-        for range in ranges.iter().filter(|r| r.timeline == timeline) {
-            assert!(range.start <= at, "a gap on timeline {timeline} at {at}");
-            at = at.max(range.end);
-        }
-        assert_eq!(at, to, "timeline {timeline}");
+        sink.assert_covers(timeline, from, to);
     }
 }
 
@@ -994,6 +993,73 @@ async fn an_empty_store_starts_after_what_the_sink_holds() {
     server.await_flush(end).await;
     server.end().await;
     assert_eq!(finish(task).await.unwrap(), end);
+}
+
+/// A store on timeline 1 past the switch point, after a failover. The new
+/// server recycled the first segment of timeline 2 since its promotion: the
+/// stream starts at the slot, not with WalGone.
+#[tokio::test]
+async fn a_store_past_the_switch_falls_back_to_the_slot_of_the_new_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let end = server
+        .stream(Lsn(SEG), &pattern((0x301000 - SEG) as usize, 1))
+        .await;
+    server.await_flush(end).await;
+    server.end().await;
+    finish(task).await.unwrap();
+
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    assert!(
+        server
+            .start(None)
+            .await
+            .ends_with("PHYSICAL 0/300000 TIMELINE 2")
+    );
+    server
+        .error("58P01", "requested WAL segment has already been removed")
+        .await;
+    server.ready().await;
+    assert_eq!(
+        server.expect_query().await,
+        format!("READ_REPLICATION_SLOT {SLOT}")
+    );
+    server
+        .row(&[Some("physical"), Some("0/500123"), Some("2")])
+        .await;
+    assert!(
+        server
+            .expect_query()
+            .await
+            .ends_with("PHYSICAL 0/500000 TIMELINE 2")
+    );
+    server.send(b'W', &[0, 0, 0]).await;
+    let end = server.stream(Lsn(5 * SEG), &pattern(4096, 2)).await;
+    server.await_flush(end).await;
+    server.end().await;
+    assert_eq!(finish(task).await.unwrap(), end);
+}
+
+/// Postgres 16 and 17 stream from an invalidated slot, which keeps no WAL
+/// and has no restart position. The receiver refuses it.
+#[tokio::test]
+async fn a_slot_with_no_restart_position_is_wal_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    assert_eq!(
+        server.expect_query().await,
+        format!("READ_REPLICATION_SLOT {SLOT}")
+    );
+    server.row(&[Some("physical"), None, None]).await;
+
+    let err = finish(task).await.unwrap_err();
+    assert!(matches!(err, Error::WalGone { .. }), "{err}");
 }
 
 /// The server ends the copy of a later timeline before its first message.
