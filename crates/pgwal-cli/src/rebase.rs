@@ -55,7 +55,8 @@ pub async fn run(mut args: RebaseArgs) -> Result<()> {
              rebase once the archive holds it"
         );
     }
-    let applied = restore::write(
+    let seg_size = prepared.start.seg_size;
+    restore::write(
         archive.as_ref(),
         &args.pgdata,
         prepared,
@@ -70,7 +71,6 @@ pub async fn run(mut args: RebaseArgs) -> Result<()> {
     // From here a signal stops the private server and removes its files.
     watch_signals();
 
-    let seg_size = applied.start.seg_size;
     let socket = private_dir("rebase")?;
     let result = replay(&pg, &args, &socket, end, seg_size);
     let _ = std::fs::remove_dir_all(&socket);

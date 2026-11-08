@@ -11,16 +11,20 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio::signal::unix::{SignalKind, signal};
 
-/// Set on Ctrl-C or SIGTERM.
+/// Set on a watched signal.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-/// Watches SIGINT, SIGTERM and SIGHUP, as of a closed ssh session.
+/// Watches SIGINT, SIGTERM and SIGHUP, as of a closed ssh session. A signal
+/// that the process ignores, as nohup makes SIGHUP, stays ignored.
 pub fn watch_signals() {
-    for kind in [
-        SignalKind::interrupt(),
-        SignalKind::terminate(),
-        SignalKind::hangup(),
+    for (kind, number) in [
+        (SignalKind::interrupt(), libc::SIGINT),
+        (SignalKind::terminate(), libc::SIGTERM),
+        (SignalKind::hangup(), libc::SIGHUP),
     ] {
+        if ignored(number) {
+            continue;
+        }
         if let Ok(mut stream) = signal(kind) {
             tokio::spawn(async move {
                 stream.recv().await;
@@ -30,7 +34,17 @@ pub fn watch_signals() {
     }
 }
 
-/// Fails once Ctrl-C or SIGTERM came.
+fn ignored(number: libc::c_int) -> bool {
+    // SAFETY: with no new action, sigaction only reads the current one into
+    // a zeroed struct.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(number, std::ptr::null(), &mut current) == 0
+            && current.sa_sigaction == libc::SIG_IGN
+    }
+}
+
+/// Fails once a watched signal came.
 pub fn check_interrupted() -> Result<()> {
     if INTERRUPTED.load(Ordering::SeqCst) {
         bail!("interrupted");
@@ -55,7 +69,7 @@ impl Bin {
     }
 
     /// Runs `tool`, and returns its stdout. A failure carries its stderr.
-    /// Ctrl-C or SIGTERM stops it.
+    /// A watched signal stops it.
     pub fn run(&self, tool: &str, args: &[&str]) -> Result<String> {
         self.exec(tool, args, OnSignal::Stop)
     }

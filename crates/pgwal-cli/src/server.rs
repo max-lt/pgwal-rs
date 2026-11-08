@@ -3,7 +3,7 @@
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -39,8 +39,16 @@ pub fn canonical(pgdata: &Path) -> Result<PathBuf> {
 /// A directory that only this user can enter, for the socket, the log and
 /// the trust rules of a private server. It must not exist yet.
 pub fn private_dir(purpose: &str) -> Result<PathBuf> {
-    // A short path: a Unix socket path holds about 100 bytes.
-    let dir = PathBuf::from(format!("/tmp/pgwal-{purpose}-{}", std::process::id()));
+    // A short path: a Unix socket path holds about 100 bytes. The time in
+    // the name keeps a later run with the same pid off a leftover.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after 1970")
+        .subsec_nanos();
+    let dir = PathBuf::from(format!(
+        "/tmp/pgwal-{purpose}-{}-{nanos:08x}",
+        std::process::id()
+    ));
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&dir)
@@ -77,7 +85,7 @@ pub fn start_server<'a>(
          -c primary_slot_name= -c synchronous_standby_names= \
          -c max_logical_replication_workers=0 -c logging_collector=off \
          -c recovery_min_apply_delay=0 -c ssl=off -c huge_pages=off -c lc_messages=C \
-         -c log_destination=stderr"
+         -c log_destination=stderr -c log_min_messages=warning"
     );
     // A scratch primary runs no job of the extensions of the copy.
     if role == Role::Scratch {

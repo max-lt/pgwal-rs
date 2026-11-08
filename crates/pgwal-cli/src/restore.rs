@@ -59,8 +59,8 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
     } else {
         AfterReplay::Promote
     };
-    let applied = apply(archive.as_ref(), &args.pgdata, on_gap, after).await?;
-    println!("{}", applied.end);
+    let end = apply(archive.as_ref(), &args.pgdata, on_gap, after).await?;
+    println!("{end}");
     Ok(())
 }
 
@@ -106,13 +106,6 @@ fn replay_start(pgdata: &Path) -> Result<ReplayStart> {
         .with_context(|| format!("reading the start point of {}", pgdata.display()))
 }
 
-/// What a restore wrote.
-pub struct Applied {
-    pub start: ReplayStart,
-    /// Where the replay ends.
-    pub end: Lsn,
-}
-
 /// The plan of a restore of the copy in `pgdata`. It writes nothing.
 pub struct Prepared {
     pub start: ReplayStart,
@@ -126,7 +119,7 @@ pub async fn apply(
     pgdata: &Path,
     on_gap: OnGap,
     after: AfterReplay,
-) -> Result<Applied> {
+) -> Result<Lsn> {
     let prepared = prepare(archive, pgdata, on_gap).await?;
     write(archive, pgdata, prepared, after).await
 }
@@ -157,14 +150,14 @@ pub async fn prepare(archive: &dyn WalSink, pgdata: &Path, on_gap: OnGap) -> Res
     Ok(Prepared { start, plan })
 }
 
-/// Writes the WAL of `prepared` into the `pg_wal` of `pgdata`, and asks for
-/// the recovery that `after` says.
+/// Writes the WAL of `prepared` into the `pg_wal` of `pgdata`, asks for the
+/// recovery that `after` says, and returns where the replay ends.
 pub async fn write(
     archive: &dyn WalSink,
     pgdata: &Path,
     prepared: Prepared,
     after: AfterReplay,
-) -> Result<Applied> {
+) -> Result<Lsn> {
     let Prepared { start, plan } = prepared;
     let pg_wal = pgdata.join("pg_wal");
     std::fs::create_dir_all(&pg_wal)?;
@@ -222,10 +215,7 @@ pub async fn write(
         ?after,
         "WAL written to pg_wal; start Postgres to replay it"
     );
-    Ok(Applied {
-        end: end.unwrap_or(start.from),
-        start,
-    })
+    Ok(end.unwrap_or(start.from))
 }
 
 /// The lines of the newest history file of `system_id` in the archive.

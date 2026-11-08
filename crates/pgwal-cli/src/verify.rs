@@ -51,8 +51,9 @@ pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
     let checksums = controldata_field(&data, "Data page checksum version")
         .is_some_and(|version| version != "0");
     if checksums {
-        pg.run("pg_checksums", &["--check", "-D", path(pgdata)])
-            .context("the page checksums of the copy are wrong")?;
+        let checked = pg.run("pg_checksums", &["--check", "-D", path(pgdata)]);
+        check_interrupted()?;
+        checked.context("the page checksums of the copy are wrong")?;
     }
 
     let name = pgdata.file_name().context("a data directory has a name")?;
@@ -101,6 +102,7 @@ fn amcheck(pg: &Bin, pgdata: &Path, scratch: &Path, socket: &Path, user: &str) -
         ],
     );
     server.stop()?;
+    check_interrupted()?;
     amcheck.context("pg_amcheck found corruption in the copy")?;
     Ok(())
 }

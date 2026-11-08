@@ -87,6 +87,8 @@ impl Setup {
                 "-A",
                 "trust",
                 "--no-sync",
+                // Postgres 18 has page checksums by default; 16 and 17 not.
+                "--data-checksums",
             ],
         );
         setup.start("data");

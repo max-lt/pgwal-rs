@@ -739,6 +739,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "libc",
  "pgwal",
  "pgwal-receiver",
  "rcgen",

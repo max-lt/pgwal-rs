@@ -30,6 +30,7 @@ clap = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-rustls = { workspace = true }
 tar = { version = "0.4.46", default-features = false }
+libc = "0.2"
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
 tracing = { workspace = true }
