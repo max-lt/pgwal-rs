@@ -2,10 +2,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
-use crate::{
-    ArchiveKey, BackupLabel, ClusterState, ControlFile, Lsn, RangeKey, segment_file_name,
-    segment_size,
-};
+use crate::{ArchiveKey, BackupLabel, ClusterState, ControlFile, Lsn, RangeKey, segment_file_name};
 
 /// How Postgres reaches the end of the replayed WAL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,13 +58,7 @@ impl ReplayStart {
     pub fn read(data_dir: &Path) -> io::Result<Self> {
         let control = ControlFile::read(data_dir)?;
         let label = BackupLabel::read(data_dir)?;
-        let seg_size = match segment_size(&data_dir.join("pg_wal")) {
-            Ok(size) => size,
-            Err(e) => label
-                .as_ref()
-                .and_then(BackupLabel::segment_size)
-                .ok_or(e)?,
-        };
+        let seg_size = control.seg_size;
         let (timeline, from, origin) = match label {
             Some(label) => (label.timeline, label.start, Origin::BaseBackup),
             None => {

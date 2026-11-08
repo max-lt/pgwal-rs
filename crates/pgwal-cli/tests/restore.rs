@@ -728,7 +728,7 @@ async fn rebase_fails_on_unreadable_wal() {
     let damaged = keys
         .iter()
         .filter_map(|key| pgwal::RangeKey::parse(key).map(|range| (range, key)))
-        .filter(|(range, _)| range.start.0 >= label.start.0 + label.segment_size().unwrap())
+        .filter(|(range, _)| range.start.0 >= label.start.0 + (16 << 20))
         .min_by_key(|(range, _)| range.start)
         .map(|(_, key)| setup.path("archive").join(key))
         .unwrap();

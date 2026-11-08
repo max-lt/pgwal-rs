@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use pgwal::{ArchiveKey, ClusterState, ControlFile, assemble_segment, segment_file_name};
+use pgwal::{
+    ArchiveKey, ClusterState, ControlFile, ReplayStart, assemble_segment, segment_file_name,
+};
 use pgwal_receiver::{
     ArchivedBackup, Confirm, ConnConfig, DirSink, Error, Lsn, RangeKey, StreamConfig, WalSink,
     base_backup, forget_slot, receive,
@@ -634,6 +636,63 @@ async fn a_failed_backup_leaves_no_part() {
     stop(&bin, &data);
 }
 
+/// A backup that starts in the first segment of a WAL file id names that
+/// segment the same way for every segment size from 16 MiB. With no WAL in
+/// the copy, the size comes from pg_control.
+#[test]
+fn a_backup_at_the_start_of_a_wal_file_id_reads_its_segment_size() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let tmp = tempfile::Builder::new()
+        .prefix("bxl")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = tmp.path();
+    let (data, copy) = (root.join("data"), root.join("copy"));
+    run(
+        &bin,
+        "initdb",
+        &[
+            "-D",
+            path(&data),
+            "-U",
+            "postgres",
+            "-A",
+            "trust",
+            "--no-sync",
+            "--no-instructions",
+        ],
+    );
+    run(
+        &bin,
+        "pg_resetwal",
+        &["-l", "0000000100000000000000FF", path(&data)],
+    );
+    start(&bin, &data, root, &root.join("primary.log"));
+    run(
+        &bin,
+        "pg_basebackup",
+        &[
+            "-D",
+            path(&copy),
+            "-X",
+            "none",
+            "-h",
+            path(root),
+            "-U",
+            "postgres",
+            "--no-sync",
+        ],
+    );
+    stop(&bin, &data);
+
+    let start = ReplayStart::read(&copy).unwrap();
+    assert_eq!(start.seg_size, SEG);
+    assert_eq!(start.from.segment_no(SEG) % 256, 0, "{}", start.from);
+}
+
 /// `pg_controldata` output as `label -> value`.
 fn controldata(bin: &Path, data: &Path) -> BTreeMap<String, String> {
     let out = Command::new(bin.join("pg_controldata"))
@@ -671,6 +730,10 @@ fn assert_matches_controldata(bin: &Path, data: &Path) {
     assert_eq!(
         control.timeline.to_string(),
         fields["Latest checkpoint's TimeLineID"]
+    );
+    assert_eq!(
+        control.seg_size.to_string(),
+        fields["Bytes per WAL segment"]
     );
 }
 

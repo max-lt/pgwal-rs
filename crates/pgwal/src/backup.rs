@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 
-use crate::lsn::{Lsn, segment_file_name};
+use crate::lsn::Lsn;
 
 /// The `backup_label` of a base backup taken while the server ran. Its start
 /// point overrides `pg_control`: a checkpoint during the copy moves
@@ -12,8 +12,6 @@ pub struct BackupLabel {
     pub start: Lsn,
     /// `START TIMELINE`.
     pub timeline: u32,
-    /// The segment file that holds `start`.
-    start_file: String,
 }
 
 impl BackupLabel {
@@ -24,11 +22,10 @@ impl BackupLabel {
                 .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
         };
         // START WAL LOCATION: 0/2000028 (file 000000010000000000000002)
-        let (start, file) = field("START WAL LOCATION")?.split_once(" (file ")?;
+        let (start, _file) = field("START WAL LOCATION")?.split_once(" (file ")?;
         Some(BackupLabel {
             start: start.parse().ok()?,
             timeline: field("START TIMELINE")?.parse().ok()?,
-            start_file: file.strip_suffix(')')?.to_owned(),
         })
     }
 
@@ -43,16 +40,6 @@ impl BackupLabel {
         Self::parse(&text)
             .map(Some)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unreadable backup_label"))
-    }
-
-    /// The WAL segment size: the one size under which `start` falls in the
-    /// file the label names. `None` if no size or more than one size fits.
-    pub fn segment_size(&self) -> Option<u64> {
-        let mut fits = (20..=30).map(|shift| 1u64 << shift).filter(|&size| {
-            segment_file_name(self.timeline, self.start.segment_no(size), size) == self.start_file
-        });
-        let size = fits.next()?;
-        fits.next().is_none().then_some(size)
     }
 }
 
@@ -152,15 +139,9 @@ mod tests {
                          START TIMELINE: 1\n";
 
     #[test]
-    fn reads_the_start_and_the_segment_size() {
+    fn reads_the_start() {
         let label = BackupLabel::parse(LABEL).unwrap();
         assert_eq!((label.start, label.timeline), (Lsn(0x5A3_C128), 1));
-        assert_eq!(label.segment_size(), Some(16 << 20));
-        let small = LABEL.replace("000000010000000000000005", "00000001000000000000005A");
-        assert_eq!(
-            BackupLabel::parse(&small).unwrap().segment_size(),
-            Some(1 << 20)
-        );
     }
 
     #[test]
@@ -170,7 +151,5 @@ mod tests {
             BackupLabel::parse(&LABEL.replace("START TIMELINE: 1\n", "")),
             None
         );
-        let wrong = LABEL.replace("000000010000000000000005", "000000010000000000000099");
-        assert_eq!(BackupLabel::parse(&wrong).unwrap().segment_size(), None);
     }
 }

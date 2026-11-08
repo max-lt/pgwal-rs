@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 
-use crate::lsn::Lsn;
+use crate::lsn::{Lsn, is_segment_size};
 
 /// `DBState` in `pg_control.h`.
 const DB_SHUTDOWNED: u32 = 1;
@@ -23,8 +23,8 @@ pub enum ClusterState {
     Running,
 }
 
-/// The fields of `global/pg_control` a restore reads. They lead the file, at
-/// the same offsets in Postgres 13 to 18.
+/// The fields of `global/pg_control` a restore reads, at the same offsets in
+/// Postgres 13 to 18.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControlFile {
     pub system_id: u64,
@@ -33,6 +33,7 @@ pub struct ControlFile {
     /// Where replay starts.
     pub redo: Lsn,
     pub timeline: u32,
+    pub seg_size: u64,
 }
 
 impl ControlFile {
@@ -54,8 +55,12 @@ impl ControlFile {
             checkpoint: Lsn(u64_at(32)?),
             redo: Lsn(u64_at(40)?),
             timeline: u32_at(48)?,
+            seg_size: u64::from(u32_at(228)?),
         };
-        (control.redo <= control.checkpoint && control.timeline > 0).then_some(control)
+        (control.redo <= control.checkpoint
+            && control.timeline > 0
+            && is_segment_size(control.seg_size))
+        .then_some(control)
     }
 
     /// Reads `global/pg_control` of the data directory `data_dir`.
@@ -78,6 +83,7 @@ mod tests {
         b[32..40].copy_from_slice(&checkpoint.to_ne_bytes());
         b[40..48].copy_from_slice(&redo.to_ne_bytes());
         b[48..52].copy_from_slice(&tli.to_ne_bytes());
+        b[228..232].copy_from_slice(&(16u32 << 20).to_ne_bytes());
         b
     }
 
@@ -93,6 +99,7 @@ mod tests {
                 checkpoint: Lsn(0x300_0148),
                 redo: Lsn(0x300_0148),
                 timeline: 1,
+                seg_size: 16 << 20,
             }
         );
         let running =
@@ -104,5 +111,8 @@ mod tests {
         assert_eq!(ControlFile::parse(&control_bytes(1900, 1, 1, 1, 1)), None);
         assert_eq!(ControlFile::parse(&control_bytes(1800, 1, 1, 2, 1)), None);
         assert_eq!(ControlFile::parse(&[0; 20]), None);
+        let mut odd = control_bytes(1800, 1, 1, 1, 1);
+        odd[228..232].copy_from_slice(&3u32.to_ne_bytes());
+        assert_eq!(ControlFile::parse(&odd), None);
     }
 }
