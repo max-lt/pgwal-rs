@@ -497,7 +497,7 @@ async fn a_standby_restore_makes_a_new_base_backup() {
 
     let rebased = pgwal::ControlFile::read(&setup.path("backup")).unwrap();
     assert_eq!(rebased.timeline, 1);
-    std::fs::remove_file(setup.path("backup/standby.signal")).unwrap();
+    // The copy keeps its standby.signal: the restore must still promote.
     let out = setup.restore(&[]);
     assert!(
         out.status.success(),
@@ -555,7 +555,8 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
     let label = pgwal::BackupLabel::read(&backup).unwrap().unwrap();
     let hba = std::fs::read(backup.join("pg_hba.conf")).unwrap();
     // The private servers of rebase and verify must not run the archiving
-    // of the copy, nor wait for its synchronous standby.
+    // of the copy, wait for its synchronous standby, delay the replay, or
+    // load the certificate of the primary.
     let archived = setup.path("archived");
     let auto_conf = backup.join("postgresql.auto.conf");
     let conf = std::fs::read_to_string(&auto_conf).unwrap_or_default();
@@ -563,7 +564,8 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
         &auto_conf,
         format!(
             "{conf}archive_mode = on\narchive_command = 'touch {}'\n\
-             synchronous_standby_names = 'pgwal'\n",
+             synchronous_standby_names = 'pgwal'\nrecovery_min_apply_delay = '1h'\n\
+             ssl = on\nssl_cert_file = '/nonexistent/server.crt'\n",
             archived.display()
         ),
     )

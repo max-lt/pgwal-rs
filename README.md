@@ -105,8 +105,10 @@ pg_ctl -D /restore/data start
   whose `pg_wal` holds that segment needs the WAL from the LSN itself.
 - A timeline needs its WAL up to its switch point only. The command reads the
   switch points in the newest history file of the archive.
-- A base backup, or a copy after a clean stop, replays as an archive
-  recovery, then promotes to a new timeline. The command follows the
+- A base backup, a copy after a clean stop, or a copy of a standby replays
+  as an archive recovery, then promotes to a new timeline. A snapshot of a
+  running primary gets crash recovery and keeps its timeline, unless the
+  archive goes on to a later timeline or has a gap. The command follows the
   timelines of the archive.
 - The command refuses an archive with a gap after the start, on any
   timeline. With `--accept-gap`, it restores up to the gap.
@@ -173,6 +175,11 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   archive, and stops it. The copy is then a base backup at the last
   checkpoint of the primary in the archive. The command prints its redo
   point.
+- The command refuses an archive with a gap.
+- The replay can stand still before the end of the archive when the last
+  object ends inside a WAL record. After `--stall-seconds` (default 10) of
+  no progress, the command takes the replay position as the end once
+  Postgres waits for more WAL.
 - The binaries must be of the major version of the copy, on the same
   platform as the primary. `--pg-bin` (or `PGWAL_PG_BIN`) gives their
   directory. Without it, they come from `PATH`.
@@ -184,13 +191,14 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
 - The server listens on a socket in a directory that only the user of the
   command can enter, and trusts local connections there. The `pg_hba.conf`
   of the copy stays as it is. The server archives nothing, cleans no archive,
-  connects to no primary and waits for no synchronous standby, whatever the
-  settings of the copy say.
+  connects to no primary, waits for no synchronous standby, delays no replay,
+  and runs without TLS, whatever the settings of the copy say.
 - The settings that a standby needs at least as high as on the primary, such
   as `max_connections`, come from `pg_control`. When the primary raised one
   after the copy, the replay pauses, and the command starts the server again
   with the new value. A pause for another reason is an error.
-- Ctrl-C or SIGTERM stops the server and removes its files.
+- Ctrl-C or SIGTERM stops the running tool and the server, and removes their
+  files.
 - After the rebase, the copy has no `backup_label.old` and no
   `backup_manifest`: they describe the copy before the rebase.
 - A copy without `postgresql.conf`, such as a copy of a Debian primary,

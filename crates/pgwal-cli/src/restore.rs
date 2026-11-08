@@ -172,7 +172,10 @@ pub async fn apply(
     }
 
     let end = plan.recovery.end();
-    let archive_recovery = matches!(plan.recovery, Recovery::Archive { .. });
+    // A copy of a standby starts as a standby unless its standby.signal
+    // goes, and promotes through an archive recovery.
+    let archive_recovery =
+        matches!(plan.recovery, Recovery::Archive { .. }) || pgdata.join("standby.signal").exists();
     if after == AfterReplay::StayStandby || archive_recovery {
         request_recovery(pgdata, after)?;
     }

@@ -1,7 +1,7 @@
+use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,7 @@ pub struct RebaseArgs {
 /// then a base backup at the last checkpoint of the primary in the archive.
 /// Prints its redo point.
 pub async fn run(args: RebaseArgs) -> Result<()> {
+    watch_signals();
     let pg = Bin(args.pg.pg_bin.clone());
     check_version(&pg, &args.pgdata)?;
     let archive = args.archive.open()?;
@@ -94,16 +95,11 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
 /// Starts the server, waits for the replay to reach `end`, and stops it.
 /// Returns the replay position.
 fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
-    let interrupted = interrupted();
     let stall = Duration::from_secs(args.stall_seconds);
-    let mut restarts = 0;
     'server: loop {
         let server = start_server(pg, &args.pgdata, socket, &args.pg.user, Role::Standby)?;
         let mut last = (Lsn(0), Instant::now());
         loop {
-            if interrupted.load(Ordering::SeqCst) {
-                bail!("interrupted");
-            }
             let lsn = match server.replay_lsn() {
                 Ok(lsn) => lsn,
                 Err(e) => {
@@ -123,43 +119,50 @@ fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
                 server.stop()?;
                 return Ok(lsn);
             }
-            if lsn != last.0 {
-                last = (lsn, Instant::now());
-            } else if last.1.elapsed() >= stall {
-                let paused = server.query("SELECT pg_get_wal_replay_pause_state()")?;
-                if paused == "not paused" {
-                    warn!(
-                        replayed = %lsn,
-                        archive_end = %end,
-                        "the replay stands still before the end of the archive: the last object ends inside a record"
-                    );
-                    server.stop()?;
-                    return Ok(lsn);
+            if lsn != last.0 || last.1.elapsed() < stall {
+                if lsn != last.0 {
+                    last = (lsn, Instant::now());
                 }
+                std::thread::sleep(POLL);
+                continue;
+            }
+            let paused = server.query("SELECT pg_get_wal_replay_pause_state()")?;
+            if paused != "not paused" {
                 // A setting raised on the primary pauses the replay. The
                 // replay wrote the new value into pg_control, and the next
                 // start passes it.
-                if restarts == MAX_RESTARTS {
+                if !server.has_raised_settings()? {
                     bail!("the replay is {paused} at {lsn}:\n{}", tail(&server.log()));
                 }
-                restarts += 1;
-                warn!(replayed = %lsn, "the replay paused: starting again with the settings of pg_control");
+                warn!(replayed = %lsn, "the replay paused on a raised setting: starting again");
                 server.stop()?;
                 continue 'server;
             }
-            std::thread::sleep(POLL);
+            // The end of the archive: the startup process waits for more WAL.
+            let waits = server
+                .query("SELECT wait_event FROM pg_stat_activity WHERE backend_type = 'startup'")?;
+            if waits == "RecoveryRetrieveRetryInterval" {
+                if lsn < end {
+                    warn!(
+                        replayed = %lsn,
+                        archive_end = %end,
+                        "the replay ends before the end of the archive: the last object ends inside a record"
+                    );
+                }
+                server.stop()?;
+                return Ok(lsn);
+            }
+            last.1 = Instant::now();
         }
     }
 }
 
-/// Starts of the rebase server after a pause on a setting.
-const MAX_RESTARTS: u32 = 3;
+/// Stops the long commands of rebase and verify on Ctrl-C or SIGTERM. The
+/// process then stops its private server and removes its files before it
+/// exits.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-/// Becomes true on Ctrl-C or SIGTERM. The process then stops its private
-/// server and removes its files before it exits.
-fn interrupted() -> Arc<AtomicBool> {
-    let flag = Arc::new(AtomicBool::new(false));
-    let set = flag.clone();
+fn watch_signals() {
     tokio::spawn(async move {
         let Ok(mut terminate) = signal(SignalKind::terminate()) else {
             return;
@@ -168,9 +171,8 @@ fn interrupted() -> Arc<AtomicBool> {
             _ = tokio::signal::ctrl_c() => {}
             _ = terminate.recv() => {}
         }
-        set.store(true, Ordering::SeqCst);
+        INTERRUPTED.store(true, Ordering::SeqCst);
     });
-    flag
 }
 
 #[derive(Args, Debug)]
@@ -196,6 +198,7 @@ struct PgArgs {
 }
 
 pub fn run_verify(args: VerifyArgs) -> Result<()> {
+    watch_signals();
     let pg = Bin(args.pg.pg_bin);
     check_version(&pg, &args.pgdata)?;
     verify(&pg, &args.pgdata, &args.pg.user)
@@ -207,7 +210,6 @@ pub fn run_verify(args: VerifyArgs) -> Result<()> {
 /// would end its recovery and write WAL of its own.
 pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
     restore::refuse_running(pgdata)?;
-    let interrupted = interrupted();
     let t = Instant::now();
     let data = pg.run("pg_controldata", &[path(pgdata)])?;
     let checksums = controldata_field(&data, "Data page checksum version")
@@ -227,9 +229,6 @@ pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
     let result = amcheck(pg, pgdata, &scratch, &socket, user);
     let _ = std::fs::remove_dir_all(&scratch);
     let _ = std::fs::remove_dir_all(&socket);
-    if interrupted.load(Ordering::SeqCst) {
-        bail!("interrupted");
-    }
     result?;
     info!(
         checksums,
@@ -309,7 +308,8 @@ fn start_server<'a>(
          -c hba_file={dir_name}/pg_hba.conf -c hot_standby=on -c archive_mode=off \
          -c archive_cleanup_command= -c recovery_end_command= -c primary_conninfo= \
          -c primary_slot_name= -c synchronous_standby_names= \
-         -c max_logical_replication_workers=0 -c logging_collector=off"
+         -c max_logical_replication_workers=0 -c logging_collector=off \
+         -c recovery_min_apply_delay=0 -c ssl=off -c huge_pages=off"
     );
     // A scratch primary runs no job of the extensions of the copy.
     if role == Role::Scratch {
@@ -350,7 +350,7 @@ fn start_server<'a>(
             "-o",
             &opts,
             "-t",
-            START_TIMEOUT_SECONDS,
+            PG_CTL_TIMEOUT_SECONDS,
             "-w",
             "start",
         ],
@@ -367,7 +367,7 @@ fn controldata_field<'a>(data: &'a str, field: &str) -> Option<&'a str> {
 }
 
 /// How long `pg_ctl start` and `pg_ctl stop` wait. It stops waiting when the server exits.
-const START_TIMEOUT_SECONDS: &str = "86400";
+const PG_CTL_TIMEOUT_SECONDS: &str = "86400";
 
 /// The `pg_controldata` field of each setting a standby needs at least as
 /// high as on the primary.
@@ -413,21 +413,63 @@ impl Bin {
     }
 
     /// Runs `tool`, and returns its stdout. A failure carries its stderr.
+    /// Ctrl-C or SIGTERM stops it.
     fn run(&self, tool: &str, args: &[&str]) -> Result<String> {
-        let out = self
+        self.exec(tool, args, OnSignal::Stop)
+    }
+
+    fn exec(&self, tool: &str, args: &[&str], on_signal: OnSignal) -> Result<String> {
+        let mut child = self
             .command(tool)
             .args(args)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("running {tool}"))?;
-        if !out.status.success() {
+        let stdout = read_all(child.stdout.take().expect("piped"));
+        let stderr = read_all(child.stderr.take().expect("piped"));
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if on_signal == OnSignal::Stop && INTERRUPTED.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("interrupted during {tool}");
+            }
+            std::thread::sleep(CHILD_POLL);
+        };
+        let stdout = stdout.join().expect("the reader thread ends");
+        let stderr = stderr.join().expect("the reader thread ends");
+        if !status.success() {
             bail!(
                 "{tool} failed: {}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
             );
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
+}
+
+/// What a signal does to a command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnSignal {
+    Stop,
+    /// For the stop of a server after a signal.
+    Finish,
+}
+
+const CHILD_POLL: Duration = Duration::from_millis(20);
+
+/// Reads `pipe` to its end in a thread, so that a full pipe never blocks
+/// the command.
+fn read_all(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut data = Vec::new();
+        let _ = pipe.read_to_end(&mut data);
+        data
+    })
 }
 
 /// Refuses binaries of another major version than the copy.
@@ -471,6 +513,24 @@ impl Server<'_> {
             .map_err(|e| anyhow::anyhow!("pg_last_wal_replay_lsn: {e}"))
     }
 
+    /// A setting of pg_control is higher than the one the server runs with.
+    fn has_raised_settings(&self) -> Result<bool> {
+        let data = self.pg.run("pg_controldata", &[path(self.pgdata)])?;
+        for (field, setting) in PRIMARY_SETTINGS {
+            let needed: u64 = controldata_field(&data, field)
+                .and_then(|value| value.parse().ok())
+                .with_context(|| format!("pg_controldata has no {field}"))?;
+            let running: u64 = self
+                .query(&format!("SELECT current_setting('{setting}')"))?
+                .parse()
+                .with_context(|| format!("current_setting of {setting}"))?;
+            if needed > running {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The one value that `sql` returns.
     fn query(&self, sql: &str) -> Result<String> {
         let out = self.pg.run(
@@ -509,7 +569,7 @@ impl Server<'_> {
                 "-m",
                 "fast",
                 "-t",
-                START_TIMEOUT_SECONDS,
+                PG_CTL_TIMEOUT_SECONDS,
                 "-w",
                 "stop",
             ],
@@ -520,9 +580,10 @@ impl Server<'_> {
 
 impl Drop for Server<'_> {
     fn drop(&mut self) {
-        let _ = self.pg.run(
+        let _ = self.pg.exec(
             "pg_ctl",
             &["-D", path(self.pgdata), "-m", "immediate", "-w", "stop"],
+            OnSignal::Finish,
         );
     }
 }
