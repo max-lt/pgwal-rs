@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::error::Error;
-use crate::store::{WalStore, read_flushed, remove_other_timelines};
+use crate::store::{WalStore, first_segment, read_flushed, remove_other_timelines};
 use crate::upload::{Uploader, WalSink, read_watermark, salvage};
 use crate::wire::{Conn, ConnConfig, CopyMessage, check_slot};
 
@@ -141,13 +141,18 @@ where
     store.start_at(start);
     info!(slot = %cfg.slot, system_id = system.system_id, timeline = system.timeline, %start, "streaming WAL");
 
+    // Finished segments before the start can wait for their upload: a dead
+    // run with the sink down leaves them.
+    let first = first_segment(&cfg.dir, system.timeline)
+        .await?
+        .map_or(start, |(lsn, _)| lsn.min(start));
     let uploader = Uploader::new(
         cfg.dir.clone(),
         system.system_id,
         system.timeline,
         seg_size,
         sink,
-        start,
+        first,
     )
     .await?;
     let (flushed_tx, flushed_rx) = watch::channel(start);

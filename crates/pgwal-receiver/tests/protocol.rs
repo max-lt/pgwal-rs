@@ -624,6 +624,42 @@ async fn a_later_timeline_starts_at_its_switch_point_and_archives_its_history() 
     sink.assert_tiles(Lsn(3 * SEG), end);
 }
 
+/// The sink is down while a segment finishes, and the run dies. The next
+/// run streams from the unfinished segment, and still uploads the finished
+/// one before it.
+#[tokio::test]
+async fn a_restart_uploads_the_finished_segments_that_a_dead_run_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (client, server) = tokio::io::duplex(4 << 20);
+    let mut server = Walsender {
+        io: server,
+        buf: BytesMut::new(),
+    };
+    let cfg = config(tmp.path());
+    let task = tokio::spawn(async move {
+        receive(client, &cfg, Arc::new(DownSink), std::future::pending()).await
+    });
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let wal = pattern((SEG + SEG / 2) as usize, 7);
+    let end = server.stream(Lsn(SEG), &wal).await;
+    server.await_flush(end).await;
+    drop(server);
+    assert!(finish(task).await.is_err(), "the run dies");
+
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    let query = server.start(None).await;
+    assert!(query.contains("PHYSICAL 0/200000 "), "{query}");
+    let end = server.stream(Lsn(2 * SEG), &wal[SEG as usize..]).await;
+    server.await_flush(end).await;
+    server.end().await;
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    sink.assert_tiles(Lsn(SEG), end);
+}
+
 /// A failover while the sink is down: the run on the new timeline first
 /// uploads the WAL of the old one, then removes its files.
 #[tokio::test]
