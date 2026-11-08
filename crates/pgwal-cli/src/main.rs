@@ -141,6 +141,12 @@ struct ReceiveArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The archive and the store hold every row and the password verifiers:
+    // only this user reads what the command writes.
+    // SAFETY: umask only sets the mask of the process.
+    unsafe {
+        libc::umask(0o077);
+    }
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     // stdout is for command output, such as the end LSN of pgwal restore.
     tracing_subscriber::fmt()
@@ -191,7 +197,10 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
         let connected = tokio::select! {
             connected = tokio::time::timeout(CONNECT_TIMEOUT, args.conn.connect(tls.as_ref())) => {
                 connected.unwrap_or_else(|_| {
-                    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "no connection in 30 s"))
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("no connection in {CONNECT_TIMEOUT:?}"),
+                    ))
                 })
             }
             _ = stop.wait_for(|stopped| *stopped) => return Ok(()),
@@ -212,7 +221,18 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
             Err(e @ (Error::Config(_) | Error::SystemMismatch { .. } | Error::WalGone { .. })) => {
                 bail!(e)
             }
-            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => bail!(e),
+            // A server that refuses TLS, or a certificate that fails the
+            // check, fails every retry the same way.
+            Err(Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                bail!(e)
+            }
+            // The WAL that the last upload could not send stays in the store.
+            Err(e) if *stop.borrow() => bail!(e),
             Err(e) => warn!(retry_in = ?backoff, "receive failed: {e}"),
         }
         tokio::select! {

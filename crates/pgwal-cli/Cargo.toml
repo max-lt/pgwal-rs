@@ -24,7 +24,6 @@ pgwal = { workspace = true }
 pgwal-receiver = { workspace = true }
 futures-util = { workspace = true }
 anyhow = { workspace = true }
-async-trait = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

@@ -24,6 +24,15 @@ pub enum SslMode {
     Require,
     /// TLS, with a check of the certificate chain and of the host name.
     VerifyFull,
+    /// Values of libpq that pgwal refuses: it never falls back to clear
+    /// text, and checks the host name with the chain. They parse, so that a
+    /// PGSSLMODE set for psql gives a clear error.
+    #[value(hide = true)]
+    Allow,
+    #[value(hide = true)]
+    Prefer,
+    #[value(hide = true)]
+    VerifyCa,
 }
 
 /// The TLS connector for `mode`, or `None` for `disable`. `root_cert` is
@@ -41,6 +50,9 @@ pub fn connector(mode: SslMode, root_cert: Option<&Path>) -> Result<Option<TlsCo
     };
     let mut config = match mode {
         SslMode::Disable => return Ok(None),
+        SslMode::Allow | SslMode::Prefer | SslMode::VerifyCa => {
+            bail!("sslmode {mode:?} is not supported: give disable, require or verify-full")
+        }
         SslMode::Require => builder()?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AnyCert(provider.clone())))
@@ -95,7 +107,22 @@ pub async fn connect(
     }
     let name = ServerName::try_from(host.to_owned())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    connector.connect(name, stream).await
+    connector.connect(name, stream).await.map_err(|e| {
+        let refused = e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+            .is_some_and(|tls| matches!(tls, rustls::Error::InvalidCertificate(_)));
+        if !refused {
+            return e;
+        }
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the certificate of {host} fails the check: {e}. It needs the host \
+                 name in its subjectAltName, and cannot be a CA certificate"
+            ),
+        )
+    })
 }
 
 /// Accepts any server certificate, but checks the handshake signatures.
@@ -157,5 +184,6 @@ mod tests {
         assert!(connector(SslMode::Require, Some(root)).is_err());
         assert!(connector(SslMode::Require, None).unwrap().is_some());
         assert!(connector(SslMode::Disable, Some(root)).unwrap().is_none());
+        assert!(connector(SslMode::Prefer, None).is_err());
     }
 }

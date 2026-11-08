@@ -735,7 +735,6 @@ name = "pgwal-cli"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "bytes",
  "clap",
  "futures-util",

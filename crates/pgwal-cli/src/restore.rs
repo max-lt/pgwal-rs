@@ -208,7 +208,7 @@ pub async fn write(
     info!(
         system_id = start.system_id,
         from = %start.from,
-        ?end,
+        end = %end.unwrap_or(start.from),
         segments = plan.segments.len(),
         histories = plan.histories.len(),
         archive_recovery,

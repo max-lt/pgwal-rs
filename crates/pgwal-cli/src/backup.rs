@@ -2,10 +2,12 @@ use std::collections::BTreeSet;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, Bytes};
 use clap::Args;
+use futures_util::{StreamExt, TryStreamExt};
 use pgwal::{ArchiveKey, ArchivedBackup, Lsn, RangeKey, chain_end};
 use pgwal_receiver::{WalSink, base_backup};
 use tokio::sync::mpsc;
@@ -14,8 +16,10 @@ use tracing::{info, warn};
 use crate::ConnArgs;
 use crate::archive::{self, ArchiveArgs};
 
-/// Parts read ahead of the unpacking: about 32 MiB.
+/// Parts read ahead of the unpacking: about 32 MiB, and the reads in flight.
 const PARTS_AHEAD: usize = 2;
+/// Parts read from the archive at one time.
+const PARTS_IN_FLIGHT: usize = 8;
 
 #[derive(Args, Debug)]
 pub struct BackupArgs {
@@ -182,8 +186,14 @@ async fn unpack(
         tar.unpack(dir)
     });
     let fetched: Result<()> = async {
-        for part in 0..parts {
-            let data = archive::read(archive, &part_key(backup, name, part)).await?;
+        let mut reads = pin!(
+            futures_util::stream::iter(0..parts)
+                .map(|part| async move {
+                    archive::read(archive, &part_key(backup, name, part)).await
+                })
+                .buffered(PARTS_IN_FLIGHT)
+        );
+        while let Some(data) = reads.try_next().await? {
             // A closed channel means the unpacker failed: its error says why.
             if tx.send(data).await.is_err() {
                 break;

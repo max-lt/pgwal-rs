@@ -261,6 +261,22 @@ async fn archive_and_stop(cluster: &Cluster, mut pgwal: Receiver) {
     assert_eq!(slot_active(&client).await, Some(true));
     let status = pgwal.interrupt();
     assert!(status.success(), "pgwal exited with {status}");
+    // The archive holds every row: no other user reads it.
+    assert_private(&cluster.path("archive"));
+}
+
+/// Asserts that no file or directory under `dir` grants any access to the
+/// group or to others.
+fn assert_private(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{} has mode {mode:o}", path.display());
+        if path.is_dir() {
+            assert_private(&path);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -305,7 +321,7 @@ async fn require_archives_wal_without_a_ca() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn verify_full_refuses_a_certificate_of_another_ca() {
+async fn verify_full_stops_on_a_certificate_of_another_ca() {
     let Some(bin) = pg_bin() else {
         eprintln!("skipping: postgres binaries not found");
         return;
@@ -319,8 +335,20 @@ async fn verify_full_refuses_a_certificate_of_another_ca() {
         "--sslrootcert",
         ca.to_str().unwrap(),
     ]);
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(pgwal.0.try_wait().unwrap().is_none(), "pgwal exited");
+    // A certificate that fails the check fails every retry: the command
+    // stops.
+    let mut status = None;
+    for _ in 0..50 {
+        status = pgwal.0.try_wait().unwrap();
+        if status.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "pgwal still runs or passed"
+    );
     assert_eq!(slot_active(&cluster.client().await).await, None);
     assert_eq!(objects_under(&cluster.path("archive")), 0);
 }

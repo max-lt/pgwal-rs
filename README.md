@@ -39,9 +39,15 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
     `--sslrootcert`, the command refuses to start.
   - `verify-full`: TLS, with a check of the chain and of the host name.
     `--sslrootcert` (or `PGSSLROOTCERT`) gives a PEM file of the CAs to trust.
-    Without it, the command trusts the Mozilla roots.
+    Without it, the command trusts the Mozilla roots. The server certificate
+    needs the host name in its subjectAltName, and cannot be a CA
+    certificate: a self-signed certificate made with `openssl req -x509`
+    fails.
+  - The other values of libpq, `allow`, `prefer` and `verify-ca`, are an
+    error.
 - With `require` or `verify-full`, the command never falls back to clear
-  text. A server that refuses TLS stops it.
+  text. A server that refuses TLS, or a certificate that fails the check,
+  stops it.
 - `--slot` (default `pgwal`) names the slot. The command creates it on first
   use. `--application-name` (default `pgwal`) is the name that
   `synchronous_standby_names` matches.
@@ -50,7 +56,11 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
 - The command reconnects after an error of the network or of the server.
   It stops on a wrong setting, on a store of another cluster, on WAL that
   the server no longer has, and on a server that refuses TLS.
-- It stops on Ctrl-C or SIGTERM, after it uploads the WAL it received.
+- It stops on Ctrl-C or SIGTERM, after it uploads the WAL it received. When
+  that upload fails, the exit status is not 0, and the WAL stays in the
+  store.
+- Every command writes its files with mode 0600 and its directories with
+  mode 0700: the archive and the store hold every row of the server.
 
 ### S3 archives
 
@@ -121,8 +131,9 @@ pg_ctl -D /restore/data start
 - The replay goes to the end of the archive. There is no target time.
 - The command prints the LSN where the replay ends.
 - With `--standby`, Postgres replays the archive as a standby and does not
-  promote. A copy of the data directory after a clean stop is a new base backup,
-  on the timeline of the archive. Its replay starts at the redo point of the
+  promote. It connects to no primary: the command clears `primary_conninfo`
+  and `primary_slot_name` of the copy. A copy of the data directory after a
+  clean stop is a new base backup, on the timeline of the archive. Its replay starts at the redo point of the
   last checkpoint of the primary in the archive.
 
 ### Base backups in the archive
