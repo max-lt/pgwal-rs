@@ -7,7 +7,7 @@ use clap::Args;
 use pgwal::{ControlFile, Lsn};
 use tracing::{info, warn};
 
-use crate::archive::{Archive, S3Args};
+use crate::archive::{self, S3Args};
 use crate::restore;
 
 /// Port of the private socket. The server listens on no TCP port.
@@ -47,9 +47,9 @@ pub struct RebaseArgs {
 pub async fn run(args: RebaseArgs) -> Result<()> {
     let pg = Bin(args.pg_bin.clone());
     check_version(&pg, &args.pgdata)?;
-    let archive = Archive::open(&args.archive, &args.s3)?;
+    let archive = archive::open(&args.archive, &args.s3)?;
     let t = Instant::now();
-    let end = restore::apply(&archive, &args.pgdata, false, true).await?;
+    let end = restore::apply(archive.as_ref(), &args.pgdata, false, true).await?;
     info!(
         seconds = t.elapsed().as_secs_f64(),
         "archive written to pg_wal"

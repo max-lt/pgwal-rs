@@ -7,12 +7,12 @@ use anyhow::{Context, Result, bail};
 use bytes::{Buf, Bytes};
 use clap::Args;
 use pgwal::{ArchivedBackup, RangeKey, backup_done_key, backup_part_key, parse_backup_done_key};
-use pgwal_receiver::base_backup;
+use pgwal_receiver::{WalSink, base_backup};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::ConnArgs;
-use crate::archive::{Archive, S3Args};
+use crate::archive::{self, S3Args};
 
 /// Parts read ahead of the unpacking: about 32 MiB.
 const PARTS_AHEAD: usize = 2;
@@ -40,7 +40,7 @@ pub struct BackupArgs {
 /// Takes a base backup into the archive and prints its start and end LSN.
 pub async fn run(args: BackupArgs) -> Result<()> {
     let tls = args.conn.tls()?;
-    let sink = Archive::open(&args.archive, &args.s3)?.sink();
+    let sink = archive::open(&args.archive, &args.s3)?;
     let conn = args.conn.config(args.application_name, args.idle_timeout);
     let stream = args.conn.connect(tls.as_ref()).await?;
     let backup = base_backup(stream, &conn, &args.slot, sink).await?;
@@ -65,9 +65,9 @@ pub struct FetchArgs {
 /// Writes the latest backup whose WAL the archive holds up to its end, and
 /// prints its start LSN. Then `pgwal restore` writes the WAL.
 pub async fn run_fetch(args: FetchArgs) -> Result<()> {
-    let archive = Archive::open(&args.archive, &args.s3)?;
-    let keys = archive.keys().await?;
-    let backup = latest(&archive, &keys, args.system_id).await?;
+    let archive = archive::open(&args.archive, &args.s3)?;
+    let keys = archive.list("").await?;
+    let backup = latest(archive.as_ref(), &keys, args.system_id).await?;
     if !backup.tablespaces.is_empty() {
         bail!(
             "the backup at {} has tablespaces, and pgwal fetch writes the data directory only",
@@ -77,11 +77,13 @@ pub async fn run_fetch(args: FetchArgs) -> Result<()> {
     empty_dir(&args.pgdata)?;
     for (name, parts) in &backup.streams {
         match name.as_str() {
-            "base.tar" => unpack(&archive, &backup, name, *parts, &args.pgdata).await?,
+            "base.tar" => unpack(archive.as_ref(), &backup, name, *parts, &args.pgdata).await?,
             "backup_manifest" => {
                 let mut manifest = Vec::new();
                 for part in 0..*parts {
-                    manifest.extend(archive.read(&part_key(&backup, name, part)).await?);
+                    manifest.extend(
+                        archive::read(archive.as_ref(), &part_key(&backup, name, part)).await?,
+                    );
                 }
                 tokio::fs::write(args.pgdata.join(name), manifest).await?;
             }
@@ -94,7 +96,7 @@ pub async fn run_fetch(args: FetchArgs) -> Result<()> {
 }
 
 async fn latest(
-    archive: &Archive,
+    archive: &dyn WalSink,
     keys: &[String],
     system_id: Option<u64>,
 ) -> Result<ArchivedBackup> {
@@ -110,7 +112,7 @@ async fn latest(
     found.sort();
     for (system, start) in found.into_iter().rev() {
         let key = backup_done_key(system, start);
-        let text = archive.read(&key).await?;
+        let text = archive::read(archive, &key).await?;
         let backup = std::str::from_utf8(&text)
             .ok()
             .and_then(ArchivedBackup::parse)
@@ -163,7 +165,7 @@ fn part_key(backup: &ArchivedBackup, name: &str, part: u32) -> String {
 
 /// Unpacks the tar file `name` into `dir` as its parts arrive.
 async fn unpack(
-    archive: &Archive,
+    archive: &dyn WalSink,
     backup: &ArchivedBackup,
     name: &str,
     parts: u32,
@@ -181,7 +183,7 @@ async fn unpack(
     });
     let fetched: Result<()> = async {
         for part in 0..parts {
-            let data = archive.read(&part_key(backup, name, part)).await?;
+            let data = archive::read(archive, &part_key(backup, name, part)).await?;
             // A closed channel means the unpacker failed: its error says why.
             if tx.send(data).await.is_err() {
                 break;

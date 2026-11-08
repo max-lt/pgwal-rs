@@ -10,7 +10,9 @@ use pgwal::{
 };
 use tracing::{info, warn};
 
-use crate::archive::{Archive, S3Args};
+use pgwal_receiver::WalSink;
+
+use crate::archive::{self, S3Args};
 
 /// Segments fetched at the same time, and objects of one segment. They bound
 /// a restore to 64 reads in flight and about 64 MiB of segments in memory.
@@ -42,8 +44,8 @@ pub struct RestoreArgs {
 /// Writes the archived WAL that follows the copy into its `pg_wal`. The
 /// next start of Postgres replays it. Prints the LSN where the replay ends.
 pub async fn run(args: RestoreArgs) -> Result<()> {
-    let archive = Archive::open(&args.archive, &args.s3)?;
-    let end = apply(&archive, &args.pgdata, args.accept_gap, args.standby).await?;
+    let archive = archive::open(&args.archive, &args.s3)?;
+    let end = apply(archive.as_ref(), &args.pgdata, args.accept_gap, args.standby).await?;
     println!("{end}");
     Ok(())
 }
@@ -128,7 +130,7 @@ fn replay_start(pgdata: &Path) -> Result<Start> {
 /// Writes the archived WAL that follows the copy in `pgdata` into its
 /// `pg_wal`, and returns the LSN where the replay ends.
 pub async fn apply(
-    archive: &Archive,
+    archive: &dyn WalSink,
     pgdata: &Path,
     accept_gap: bool,
     standby: bool,
@@ -148,7 +150,7 @@ pub async fn apply(
         seg_size,
     } = replay_start(pgdata)?;
 
-    let keys = archive.keys().await?;
+    let keys = archive.list("").await?;
     let plan = plan(keys.iter().map(String::as_str), &from, seg_size);
     if let Some(gap) = plan.gap {
         if !accept_gap {
@@ -165,14 +167,14 @@ pub async fn apply(
 
     for timeline in &plan.histories {
         let key = history_key(control.system_id, *timeline);
-        write_history(&pg_wal, *timeline, &archive.read(&key).await?)?;
+        write_history(&pg_wal, *timeline, &archive::read(archive, &key).await?)?;
     }
     let mut segments = pin!(
         futures_util::stream::iter(&plan.segments)
             .map(|(timeline, segno, keys)| async move {
                 let objects: Vec<_> = futures_util::stream::iter(keys)
                     .map(|key| async move {
-                        let wal = archive.read(&key.to_string()).await?;
+                        let wal = archive::read(archive, &key.to_string()).await?;
                         if wal.len() as u64 != key.end.0 - key.start.0 {
                             bail!("archived object {key} holds {} bytes", wal.len());
                         }

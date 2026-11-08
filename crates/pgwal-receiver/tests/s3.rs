@@ -44,7 +44,7 @@ async fn put_get_list_delete_and_a_second_put() {
     let wal = Bytes::from(vec![7u8; 256]);
     sink.put(key, wal.clone()).await.unwrap();
     assert_eq!(sink.get(key).await.unwrap(), Some(wal.clone()));
-    assert_eq!(sink.list("7401/00000001").await.unwrap(), [key]);
+    assert_eq!(sink.list("7401/00000001/").await.unwrap(), [key]);
 
     // The same key with the same bytes: an earlier attempt of this upload.
     sink.put(key, wal.clone()).await.unwrap();
@@ -59,7 +59,7 @@ async fn put_get_list_delete_and_a_second_put() {
     sink.delete(&[key.to_string(), "7401/00000001/gone".to_string()])
         .await
         .unwrap();
-    assert!(sink.list("7401/00000001").await.unwrap().is_empty());
+    assert!(sink.list("7401/00000001/").await.unwrap().is_empty());
     assert_eq!(sink.get(key).await.unwrap(), None);
 }
 
@@ -82,9 +82,9 @@ async fn lists_and_deletes_past_one_page() {
         .try_collect::<()>()
         .await
         .unwrap();
-    let mut listed = sink.list("7401/00000001").await.unwrap();
+    let mut listed = sink.list("7401/00000001/").await.unwrap();
     listed.sort();
     assert_eq!(listed, keys);
     sink.delete(&keys).await.unwrap();
-    assert!(sink.list("7401/00000001").await.unwrap().is_empty());
+    assert!(sink.list("7401/00000001/").await.unwrap().is_empty());
 }

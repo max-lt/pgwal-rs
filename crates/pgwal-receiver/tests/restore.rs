@@ -5,18 +5,16 @@
 //! directory, or put `initdb` on PATH.
 
 use std::collections::BTreeMap;
-use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use pgwal::{ControlFile, assemble_segment, backup_done_key, backup_part_key, segment_file_name};
 use pgwal_receiver::{
-    ArchivedBackup, Confirm, ConnConfig, Error, Lsn, RangeKey, StreamConfig, WalSink, base_backup,
+    ArchivedBackup, Confirm, ConnConfig, DirSink, Error, Lsn, RangeKey, StreamConfig, base_backup,
     forget_slot, receive,
 };
 use tokio::net::UnixStream;
@@ -27,34 +25,6 @@ const ROWS: i64 = 10_000;
 const SLOT: &str = "pgwal_receiver";
 /// The `initdb` default.
 const SEG: u64 = 16 << 20;
-
-/// Stores each object as a file named by its key.
-struct DirSink(PathBuf);
-
-#[async_trait]
-impl WalSink for DirSink {
-    async fn put(&self, key: &str, wal: Bytes) -> io::Result<()> {
-        let path = self.0.join(key);
-        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-        tokio::fs::write(path, wal).await
-    }
-
-    async fn list(&self, dir: &str) -> io::Result<Vec<String>> {
-        let Ok(entries) = std::fs::read_dir(self.0.join(dir)) else {
-            return Ok(Vec::new());
-        };
-        Ok(entries
-            .map(|e| format!("{dir}/{}", e.unwrap().file_name().to_str().unwrap()))
-            .collect())
-    }
-
-    async fn delete(&self, keys: &[String]) -> io::Result<()> {
-        for key in keys {
-            let _ = tokio::fs::remove_file(self.0.join(key)).await;
-        }
-        Ok(())
-    }
-}
 
 type Ranges = Vec<(Lsn, Lsn, Bytes)>;
 
@@ -200,7 +170,7 @@ async fn wait_for_slot(client: &tokio_postgres::Client, active: bool) {
 
 fn spawn_receiver(root: &Path, wal: &Path, objects: &Path) -> JoinHandle<Result<Lsn, Error>> {
     let cfg = stream_config(wal);
-    let sink = Arc::new(DirSink(objects.to_path_buf()));
+    let sink = Arc::new(DirSink::new(objects));
     let socket = root.join(".s.PGSQL.5432");
     tokio::spawn(async move {
         let stream = UnixStream::connect(socket).await?;
@@ -425,7 +395,7 @@ async fn a_base_backup_in_the_sink_restores_every_row() {
 
     let backup = {
         let conn = conn("pgwal_backup");
-        let sink = Arc::new(DirSink(objects.clone()));
+        let sink = Arc::new(DirSink::new(&objects));
         let socket = root.join(".s.PGSQL.5432");
         let stream = UnixStream::connect(&socket).await.unwrap();
         let err = base_backup(stream, &conn, "missing", sink.clone())
@@ -598,7 +568,7 @@ async fn a_lost_slot_is_reported_then_recreated() {
         "-c max_slot_wal_keep_size=1MB -c max_wal_size=32MB",
     );
     let socket = root.join(".s.PGSQL.5432");
-    let sink = Arc::new(DirSink(objects));
+    let sink = Arc::new(DirSink::new(objects));
     let client = connect(root).await;
     client
         .batch_execute(&format!(

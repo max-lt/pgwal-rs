@@ -33,12 +33,15 @@ impl WalSink for MemSink {
         Ok(())
     }
 
-    async fn list(&self, dir: &str) -> io::Result<Vec<String>> {
-        let prefix = format!("{dir}/");
+    async fn get(&self, key: &str) -> io::Result<Option<Bytes>> {
+        Ok(self.0.lock().unwrap().get(key).cloned())
+    }
+
+    async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
         let objects = self.0.lock().unwrap();
         Ok(objects
             .keys()
-            .filter(|k| k.starts_with(&prefix))
+            .filter(|k| k.starts_with(prefix))
             .cloned()
             .collect())
     }
@@ -95,8 +98,12 @@ impl WalSink for GateSink {
         self.inner.put(key, wal).await
     }
 
-    async fn list(&self, dir: &str) -> io::Result<Vec<String>> {
-        self.inner.list(dir).await
+    async fn get(&self, key: &str) -> io::Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix).await
     }
 
     async fn delete(&self, keys: &[String]) -> io::Result<()> {
@@ -113,7 +120,11 @@ impl WalSink for DownSink {
         Err(io::Error::other("object store down"))
     }
 
-    async fn list(&self, _dir: &str) -> io::Result<Vec<String>> {
+    async fn get(&self, _key: &str) -> io::Result<Option<Bytes>> {
+        Err(io::Error::other("object store down"))
+    }
+
+    async fn list(&self, _prefix: &str) -> io::Result<Vec<String>> {
         Err(io::Error::other("object store down"))
     }
 

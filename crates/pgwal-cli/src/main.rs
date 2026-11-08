@@ -16,7 +16,6 @@ mod archive;
 mod backup;
 mod rebase;
 mod restore;
-mod sink;
 mod tls;
 
 use tls::SslMode;
@@ -170,7 +169,7 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
         upload_every: Duration::from_secs(args.upload_every),
         confirm: Confirm::Flushed,
     };
-    let sink: Arc<dyn WalSink> = archive::Archive::open(&args.archive, &args.s3)?.sink();
+    let sink = archive::open(&args.archive, &args.s3)?;
 
     let (stop_tx, mut stop) = watch::channel(false);
     tokio::spawn(async move {

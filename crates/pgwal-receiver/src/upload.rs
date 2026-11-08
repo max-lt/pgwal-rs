@@ -33,10 +33,13 @@ pub(crate) const MAX_OBJECT: u64 = 16 << 20;
 pub trait WalSink: Send + Sync {
     /// Stores one object. After a crash, the same key can arrive again with the
     /// same bytes.
-    async fn put(&self, key: &str, wal: Bytes) -> io::Result<()>;
+    async fn put(&self, key: &str, data: Bytes) -> io::Result<()>;
 
-    /// The keys under the directory `dir`, such as `7401/00000001`.
-    async fn list(&self, dir: &str) -> io::Result<Vec<String>>;
+    /// The object at `key`, or `None` if there is none.
+    async fn get(&self, key: &str) -> io::Result<Option<Bytes>>;
+
+    /// The keys that start with `prefix`, such as `7401/00000001/`.
+    async fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
 
     /// Deletes `keys`. A key that is gone already is no error.
     async fn delete(&self, keys: &[String]) -> io::Result<()>;
@@ -299,9 +302,18 @@ impl Uploader {
 /// whole object goes up before the parts go: a crash between the two leaves
 /// overlapping objects with the same bytes.
 async fn compact(sink: Arc<dyn WalSink>, whole: RangeKey, wal: Bytes) -> Result<(), Error> {
-    let dir = format!("{}/{:08X}", whole.system_id, whole.timeline);
+    // The parts start inside `whole`, so their keys share the hex digits of
+    // the start above its size. The listing stays a few segments long.
+    let varying = ((whole.end.0 - whole.start.0 - 1).ilog2() / 4 + 1) as usize;
+    let start = format!("{:016X}", whole.start.0);
+    let prefix = format!(
+        "{}/{:08X}/{}",
+        whole.system_id,
+        whole.timeline,
+        &start[..16 - varying]
+    );
     let parts: Vec<String> = sink
-        .list(&dir)
+        .list(&prefix)
         .await?
         .into_iter()
         .filter(|key| {
@@ -371,12 +383,15 @@ mod tests {
             Ok(())
         }
 
-        async fn list(&self, dir: &str) -> io::Result<Vec<String>> {
-            let prefix = format!("{dir}/");
+        async fn get(&self, key: &str) -> io::Result<Option<Bytes>> {
+            Ok(self.objects.lock().unwrap().get(key).cloned())
+        }
+
+        async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
             let objects = self.objects.lock().unwrap();
             Ok(objects
                 .keys()
-                .filter(|k| k.starts_with(&prefix))
+                .filter(|k| k.starts_with(prefix))
                 .cloned()
                 .collect())
         }

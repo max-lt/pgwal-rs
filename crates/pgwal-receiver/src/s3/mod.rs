@@ -340,51 +340,6 @@ impl S3Sink {
         })
         .await
     }
-
-    /// The object at `key`, or `None` if there is none.
-    pub async fn get(&self, key: &str) -> io::Result<Option<Bytes>> {
-        let mut call = Call::new(Method::GET, Some(key));
-        call.max_reply = MAX_OBJECT;
-        let reply = self.send(call).await?;
-        match reply.status {
-            status if status.is_success() => Ok(Some(reply.body)),
-            StatusCode::NOT_FOUND => Ok(None),
-            _ => Err(reply.error()),
-        }
-    }
-
-    /// Every key that starts with `prefix`, under the prefix of the store,
-    /// without that prefix.
-    pub async fn list_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
-        let full = format!("{}{prefix}", self.config.prefix);
-        let mut keys = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let mut call = Call::new(Method::GET, None);
-            call.query.push(("list-type", "2"));
-            call.query.push(("prefix", &full));
-            if let Some(token) = &token {
-                call.query.push(("continuation-token", token));
-            }
-            let reply = self.send(call).await?;
-            if !reply.status.is_success() {
-                return Err(reply.error());
-            }
-            let page = xml::list_page(&reply.body).ok_or_else(|| {
-                io::Error::other(format!("{}: unreadable list page", reply.target))
-            })?;
-            for key in page.keys {
-                let Some(key) = key.strip_prefix(&self.config.prefix) else {
-                    return Err(io::Error::other(format!("listed {key} outside the prefix")));
-                };
-                keys.push(key.to_string());
-            }
-            match page.next_token {
-                Some(next) => token = Some(next),
-                None => return Ok(keys),
-            }
-        }
-    }
 }
 
 #[async_trait]
@@ -415,8 +370,47 @@ impl WalSink for S3Sink {
         }
     }
 
-    async fn list(&self, dir: &str) -> io::Result<Vec<String>> {
-        self.list_prefix(&format!("{dir}/")).await
+    /// The object at `key`, or `None` if there is none.
+    async fn get(&self, key: &str) -> io::Result<Option<Bytes>> {
+        let mut call = Call::new(Method::GET, Some(key));
+        call.max_reply = MAX_OBJECT;
+        let reply = self.send(call).await?;
+        match reply.status {
+            status if status.is_success() => Ok(Some(reply.body)),
+            StatusCode::NOT_FOUND => Ok(None),
+            _ => Err(reply.error()),
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let full = format!("{}{prefix}", self.config.prefix);
+        let mut keys = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut call = Call::new(Method::GET, None);
+            call.query.push(("list-type", "2"));
+            call.query.push(("prefix", &full));
+            if let Some(token) = &token {
+                call.query.push(("continuation-token", token));
+            }
+            let reply = self.send(call).await?;
+            if !reply.status.is_success() {
+                return Err(reply.error());
+            }
+            let page = xml::list_page(&reply.body).ok_or_else(|| {
+                io::Error::other(format!("{}: unreadable list page", reply.target))
+            })?;
+            for key in page.keys {
+                let Some(key) = key.strip_prefix(&self.config.prefix) else {
+                    return Err(io::Error::other(format!("listed {key} outside the prefix")));
+                };
+                keys.push(key.to_string());
+            }
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => return Ok(keys),
+            }
+        }
     }
 
     async fn delete(&self, keys: &[String]) -> io::Result<()> {

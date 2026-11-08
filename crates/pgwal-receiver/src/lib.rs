@@ -44,6 +44,8 @@
 
 #[cfg(feature = "runtime")]
 mod backup;
+#[cfg(feature = "runtime")]
+mod dir;
 mod error;
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -57,6 +59,8 @@ pub mod wire;
 
 #[cfg(feature = "runtime")]
 pub use backup::base_backup;
+#[cfg(feature = "runtime")]
+pub use dir::DirSink;
 pub use error::Error;
 #[cfg(feature = "runtime")]
 pub use stream::{Confirm, StreamConfig, forget_slot, receive};
