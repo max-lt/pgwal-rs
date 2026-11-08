@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 description = "Streams the WAL of a Postgres server over physical replication and uploads it by LSN range."
+keywords = ["postgres", "replication", "wal", "backup", "s3"]
+categories = ["database", "asynchronous"]
 
 [features]
 default = ["runtime"]

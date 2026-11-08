@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 description = "Postgres WAL archive format and restore steps, in plain std."
+keywords = ["postgres", "wal", "backup", "pitr", "restore"]
+categories = ["database"]
 
 
 [dev-dependencies]

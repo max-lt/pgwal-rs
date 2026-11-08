@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-description = "The pgwal command: archives the WAL of a Postgres server."
+description = "The pgwal command: archives the WAL of a Postgres server, takes base backups and restores them."
+keywords = ["postgres", "wal", "backup", "restore", "pitr"]
+categories = ["database", "command-line-utilities"]
 
 [features]
 default = ["s3"]
