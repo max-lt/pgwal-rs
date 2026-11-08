@@ -341,18 +341,23 @@ impl Walsender {
     }
 
     /// Answers the rest of the handshake and returns the START_REPLICATION
-    /// query. `restart` is the slot position, asked only by an empty store.
+    /// query. `restart` is the slot position, `SEG` by default.
     async fn start(&mut self, restart: Option<Lsn>) -> String {
-        let mut query = self.expect_query().await;
-        if let Some(restart) = restart {
-            assert_eq!(query, format!("READ_REPLICATION_SLOT {SLOT}"));
-            self.row(&[Some("physical"), Some(&restart.to_string()), Some("1")])
-                .await;
-            query = self.expect_query().await;
-        }
+        self.slot(restart.unwrap_or(Lsn(SEG))).await;
+        let query = self.expect_query().await;
         assert!(query.starts_with("START_REPLICATION"), "{query}");
         self.send(b'W', &[0, 0, 0]).await;
         query
+    }
+
+    /// Answers READ_REPLICATION_SLOT with the restart position `restart`.
+    async fn slot(&mut self, restart: Lsn) {
+        assert_eq!(
+            self.expect_query().await,
+            format!("READ_REPLICATION_SLOT {SLOT}")
+        );
+        self.row(&[Some("physical"), Some(&restart.to_string()), Some("1")])
+            .await;
     }
 
     async fn xlogdata(&mut self, start: Lsn, wal: &[u8], wal_end: Lsn) {
@@ -1016,7 +1021,7 @@ async fn a_store_past_the_switch_falls_back_to_the_slot_of_the_new_server() {
     server.open_on(2).await;
     assert!(
         server
-            .start(None)
+            .start(Some(Lsn(0x500123)))
             .await
             .ends_with("PHYSICAL 0/300000 TIMELINE 2")
     );
@@ -1024,13 +1029,6 @@ async fn a_store_past_the_switch_falls_back_to_the_slot_of_the_new_server() {
         .error("58P01", "requested WAL segment has already been removed")
         .await;
     server.ready().await;
-    assert_eq!(
-        server.expect_query().await,
-        format!("READ_REPLICATION_SLOT {SLOT}")
-    );
-    server
-        .row(&[Some("physical"), Some("0/500123"), Some("2")])
-        .await;
     assert!(
         server
             .expect_query()
@@ -1062,6 +1060,31 @@ async fn a_slot_with_no_restart_position_is_wal_gone() {
     assert!(matches!(err, Error::WalGone { .. }), "{err}");
 }
 
+/// A restart with a store, on Postgres 16 or 17, from a slot that was
+/// invalidated meanwhile: the receiver refuses it too.
+#[tokio::test]
+async fn a_restart_on_a_slot_with_no_restart_position_is_wal_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let end = server.stream(Lsn(SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+    server.end().await;
+    finish(task).await.unwrap();
+
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    assert_eq!(
+        server.expect_query().await,
+        format!("READ_REPLICATION_SLOT {SLOT}")
+    );
+    server.row(&[Some("physical"), None, None]).await;
+    let err = finish(task).await.unwrap_err();
+    assert!(matches!(err, Error::WalGone { .. }), "{err}");
+}
+
 /// The server ends the copy of a later timeline before its first message.
 /// The history file still goes up.
 #[tokio::test]
@@ -1086,18 +1109,16 @@ async fn a_removed_first_segment_inside_the_copy_falls_back_to_the_slot() {
     let sink = Arc::new(MemSink::default());
     let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
     server.open_on(2).await;
-    assert!(server.start(None).await.contains("PHYSICAL 0/300000 "));
+    assert!(
+        server
+            .start(Some(Lsn(0x500123)))
+            .await
+            .contains("PHYSICAL 0/300000 ")
+    );
     server
         .error("58P01", "requested WAL segment has already been removed")
         .await;
     server.ready().await;
-    assert_eq!(
-        server.expect_query().await,
-        format!("READ_REPLICATION_SLOT {SLOT}")
-    );
-    server
-        .row(&[Some("physical"), Some("0/500123"), Some("2")])
-        .await;
     assert!(server.expect_query().await.contains("PHYSICAL 0/500000 "));
     server.send(b'W', &[0, 0, 0]).await;
     let end = server.stream(Lsn(5 * SEG), &pattern(4096, 0)).await;
@@ -1161,6 +1182,7 @@ async fn an_invalidated_slot_on_a_later_timeline_is_wal_gone() {
     let sink = Arc::new(MemSink::default());
     let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
     server.open_on(2).await;
+    server.slot(Lsn(SEG)).await;
     assert!(server.expect_query().await.contains("PHYSICAL 0/300000 "));
     server
         .error("55000", "can no longer access replication slot")

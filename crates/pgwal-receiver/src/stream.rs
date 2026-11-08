@@ -41,8 +41,7 @@ pub enum Confirm {
     /// the WAL of one upload interval.
     Flushed,
     /// Once the WAL is in the sink. A receiver on another host with an empty
-    /// store loses nothing: it starts at the slot, or after a failover at the
-    /// end of the parent timeline in the sink.
+    /// store loses nothing: it starts after what the sink holds.
     Uploaded,
 }
 
@@ -149,8 +148,7 @@ where
     Ok(uploaded)
 }
 
-/// The restart position of the slot, or the server position for a slot
-/// that holds no WAL yet.
+/// The restart position of the slot. WalGone for a slot with none.
 async fn slot_position<S>(conn: &mut Conn<S>, slot: &str, xlogpos: Lsn) -> Result<Lsn, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -216,9 +214,10 @@ where
 #[derive(Clone, Copy)]
 enum Start {
     /// Where the store or the watermark says, on the timeline of the server:
-    /// a restart. The server must hold that WAL.
+    /// a restart.
     Local,
-    /// After WAL that the server must hold.
+    /// A restart once resolved: after the WAL that the store or the
+    /// watermark holds. It has no fallback.
     Resume(Lsn),
     /// Where the timeline of the server begins, or after what the sink holds
     /// of it. The slot when that WAL is gone.
@@ -249,8 +248,7 @@ async fn stored_start(
     let Some(at) = switches.iter().position(|(tl, _)| *tl == old) else {
         // Another branch of the history: its WAL goes up, and the stream
         // follows the server.
-        salvage(dir, sink.clone()).await?;
-        remove_other_timelines(dir, system.timeline, seg_size).await?;
+        keep_only(dir, sink, system.timeline, seg_size).await?;
         return Ok((system.timeline, server_floor(switches, None)));
     };
     // The new server can have recycled this WAL since its promotion: the
@@ -259,14 +257,9 @@ async fn stored_start(
     if flushed < end {
         return Ok((old, Start::ParentTail(flushed)));
     }
-    let next = switches.get(at + 1).map_or(system.timeline, |(tl, _)| *tl);
-    salvage(dir, sink.clone()).await?;
-    remove_other_timelines(dir, next, seg_size).await?;
-    if next == system.timeline {
-        Ok((next, Start::Begin(end)))
-    } else {
-        Ok((next, Start::ParentTail(end)))
-    }
+    let (next, start) = after_switch(system, switches, at);
+    keep_only(dir, sink, next, seg_size).await?;
+    Ok((next, start))
 }
 
 /// The start of an empty store, as on a new host: after the newest WAL that
@@ -286,14 +279,33 @@ async fn empty_store_start(
         let Some(parent_held) = sink_end(sink, system.system_id, parent).await? else {
             continue;
         };
-        let next = switches.get(at + 1).map_or(system.timeline, |(tl, _)| *tl);
-        return Ok(match (parent_held < end, next == system.timeline) {
-            (true, _) => (parent, Start::ParentTail(parent_held)),
-            (false, true) => (next, Start::Begin(end)),
-            (false, false) => (next, Start::ParentTail(end)),
-        });
+        if parent_held < end {
+            return Ok((parent, Start::ParentTail(parent_held)));
+        }
+        return Ok(after_switch(system, switches, at));
     }
     Ok((system.timeline, server_floor(switches, None)))
+}
+
+/// The timeline after the parent at `switches[at]`, which starts at the
+/// end of that parent.
+fn after_switch(system: &SystemInfo, switches: &[(u32, Lsn)], at: usize) -> (u32, Start) {
+    let end = switches[at].1;
+    match switches.get(at + 1) {
+        Some(&(next, _)) => (next, Start::ParentTail(end)),
+        None => (system.timeline, Start::Begin(end)),
+    }
+}
+
+/// Uploads the local WAL of other timelines, then removes their files.
+async fn keep_only(
+    dir: &Path,
+    sink: &Arc<dyn WalSink>,
+    timeline: u32,
+    seg_size: u64,
+) -> Result<(), Error> {
+    salvage(dir, sink.clone()).await?;
+    remove_other_timelines(dir, timeline, seg_size).await
 }
 
 /// Where the timeline of the server starts with nothing local: after `held`,
@@ -327,8 +339,15 @@ async fn begin_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut slot_at = None;
     loop {
         let store = WalStore::open(cfg.dir.clone(), system.system_id, timeline, seg_size).await?;
+        // Every start reads the slot, once the store is ours: Postgres 16 and
+        // 17 stream from an invalidated slot too.
+        let slot_at = match slot_at {
+            Some(lsn) => lsn,
+            None => *slot_at.insert(slot_position(conn, &cfg.slot, system.xlogpos).await?),
+        };
         // What the store or the watermark holds moves the start forward,
         // and a start keeps its fallback.
         let local = match store.resume_point().await? {
@@ -346,7 +365,7 @@ where
         };
         let from = match resolved {
             Start::Resume(lsn) | Start::Begin(lsn) | Start::ParentTail(lsn) => lsn,
-            Start::Local | Start::Slot => slot_position(conn, &cfg.slot, system.xlogpos).await?,
+            Start::Local | Start::Slot => slot_at,
         }
         .segment_start(seg_size);
         conn.start_replication(&cfg.slot, from, timeline).await?;
@@ -365,11 +384,8 @@ where
             // A timeline that began long ago can have lost its first WAL. The
             // slot position is then the earliest WAL left.
             Start::Begin(begin) => {
-                let fallback = slot_position(conn, &cfg.slot, system.xlogpos)
-                    .await?
-                    .max(begin)
-                    .segment_start(seg_size);
-                warn!(%from, %fallback, "the first WAL of the timeline is gone; its archive starts later");
+                let fallback = slot_at.max(begin).segment_start(seg_size);
+                warn!(%from, %fallback, "the WAL at the start is gone; the archive has a gap up to the slot");
                 conn.start_replication(&cfg.slot, fallback, timeline)
                     .await?;
                 return Ok((store, timeline, fallback, None));
@@ -384,8 +400,7 @@ where
                     .await?
                     .is_some_and(|(tl, _)| tl != system.timeline)
                 {
-                    salvage(&cfg.dir, sink.clone()).await?;
-                    remove_other_timelines(&cfg.dir, system.timeline, seg_size).await?;
+                    keep_only(&cfg.dir, sink, system.timeline, seg_size).await?;
                 }
                 timeline = system.timeline;
                 let held = sink_end(sink.as_ref(), system.system_id, timeline).await?;
