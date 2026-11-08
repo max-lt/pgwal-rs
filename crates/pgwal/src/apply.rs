@@ -97,6 +97,9 @@ pub fn request_recovery(data_dir: &Path, after: AfterReplay) -> io::Result<()> {
     if text.lines().any(|line| line.trim() == RESTORE_COMMAND) {
         return Ok(());
     }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
     text.push_str(RESTORE_COMMAND);
     text.push('\n');
     std::fs::write(path, text)
@@ -145,5 +148,14 @@ mod tests {
         assert!(!dir.path().join("recovery.signal").exists());
         request_recovery(dir.path(), AfterReplay::Promote).unwrap();
         assert!(!dir.path().join("standby.signal").exists());
+
+        // A file edited by hand can lack its last newline.
+        let conf = dir.path().join("postgresql.auto.conf");
+        std::fs::write(&conf, "work_mem = '4MB'").unwrap();
+        request_recovery(dir.path(), AfterReplay::Promote).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            "work_mem = '4MB'\nrestore_command = 'false'\n"
+        );
     }
 }
