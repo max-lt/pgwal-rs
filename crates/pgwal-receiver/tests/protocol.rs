@@ -273,6 +273,11 @@ impl Walsender {
     }
 
     async fn open_on(&mut self, timeline: u32) {
+        self.open_with(timeline, HISTORY).await;
+    }
+
+    /// Answers the handshake on `timeline`, whose history file is `history`.
+    async fn open_with(&mut self, timeline: u32, history: &str) {
         let params = self.read_startup().await;
         assert_eq!(params["replication"], "true");
         assert_eq!(params["application_name"], "pgwal");
@@ -300,9 +305,19 @@ impl Walsender {
                 self.expect_query().await,
                 format!("TIMELINE_HISTORY {timeline}")
             );
-            self.row(&[Some(&format!("{timeline:08X}.history")), Some(HISTORY)])
-                .await;
+            self.history(timeline, history).await;
         }
+    }
+
+    /// Answers a TIMELINE_HISTORY query.
+    async fn history(&mut self, timeline: u32, history: &str) {
+        self.row(&[Some(&format!("{timeline:08X}.history")), Some(history)])
+            .await;
+    }
+
+    /// Ends the stream of an old timeline at its switch point.
+    async fn copy_done(&mut self) {
+        self.send(b'c', &[]).await;
     }
 
     /// Answers the rest of the handshake and returns the START_REPLICATION
@@ -683,7 +698,7 @@ async fn a_failover_archives_the_old_timeline_up_to_its_end() {
     let old_end = server.stream(Lsn(SEG), &old_wal).await;
     assert_eq!(old_end, switch);
     server.await_flush(old_end).await;
-    server.end().await;
+    server.copy_done().await;
     assert_eq!(finish(task).await.unwrap(), switch);
 
     let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
@@ -716,6 +731,158 @@ async fn a_failover_archives_the_old_timeline_up_to_its_end() {
         .filter(|name| name.starts_with("00000001"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// Two failovers, 1 to 2 to 3, while the receiver is down. The runs stream
+/// each timeline to its end, and every history file reaches the sink.
+#[tokio::test]
+async fn a_chain_of_failovers_archives_every_timeline_and_history() {
+    const HISTORY_2: &str = "1\t0/300A00\tno recovery target specified\n";
+    const HISTORY_3: &str = "1\t0/300A00\tno recovery target specified\n\
+                             2\t0/500A00\tno recovery target specified\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let lagged = server.stream(Lsn(SEG), &pattern(4096, 1)).await;
+    server.await_flush(lagged).await;
+    server.end().await;
+    finish(task).await.unwrap();
+
+    // Each run: the timeline it streams, where, the end, and the history
+    // queries it makes before START_REPLICATION.
+    let runs: [(u32, Lsn, Lsn, &[u32]); 3] = [
+        (1, Lsn(SEG), Lsn(0x300A00), &[2]),
+        (2, Lsn(3 * SEG), Lsn(0x500A00), &[2]),
+        (3, Lsn(5 * SEG), Lsn(5 * SEG + 4096), &[]),
+    ];
+    for (timeline, from, to, queries) in runs {
+        let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+        server.open_with(3, HISTORY_3).await;
+        for queried in queries {
+            assert_eq!(
+                server.expect_query().await,
+                format!("TIMELINE_HISTORY {queried}")
+            );
+            server.history(*queried, HISTORY_2).await;
+        }
+        let query = server.start(None).await;
+        assert!(
+            query.ends_with(&format!("PHYSICAL {from} TIMELINE {timeline}")),
+            "{query}"
+        );
+        let end = server
+            .stream(from, &pattern((to.0 - from.0) as usize, timeline as u8))
+            .await;
+        server.await_flush(end).await;
+        if timeline < 3 {
+            server.copy_done().await;
+        } else {
+            server.end().await;
+        }
+        assert_eq!(finish(task).await.unwrap(), to);
+    }
+
+    let objects = sink.0.lock().unwrap().clone();
+    assert_eq!(&objects["7401/00000002.history"][..], HISTORY_2.as_bytes());
+    assert_eq!(&objects["7401/00000003.history"][..], HISTORY_3.as_bytes());
+    let ranges: Vec<RangeKey> = objects
+        .keys()
+        .filter_map(|key| RangeKey::parse(key))
+        .collect();
+    for (timeline, from, to) in [
+        (1, Lsn(SEG), Lsn(0x300A00)),
+        (2, Lsn(3 * SEG), Lsn(0x500A00)),
+        (3, Lsn(5 * SEG), Lsn(5 * SEG + 4096)),
+    ] {
+        let mut at = from;
+        for range in ranges.iter().filter(|r| r.timeline == timeline) {
+            assert!(range.start <= at, "a gap on timeline {timeline} at {at}");
+            at = at.max(range.end);
+        }
+        assert_eq!(at, to, "timeline {timeline}");
+    }
+}
+
+/// The sink is down on a later timeline. The history file waits for the
+/// uploader, and the stream goes on: the server sees the flush.
+#[tokio::test]
+async fn a_sink_outage_on_a_later_timeline_does_not_stop_the_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(GateSink::default());
+    let (client, server) = tokio::io::duplex(4 << 20);
+    let mut server = Walsender {
+        io: server,
+        buf: BytesMut::new(),
+    };
+    let cfg = config(tmp.path());
+    let dyn_sink: Arc<dyn WalSink> = sink.clone();
+    let task =
+        tokio::spawn(async move { receive(client, &cfg, dyn_sink, std::future::pending()).await });
+    server.open_on(2).await;
+    server.start(None).await;
+    let end = server.stream(Lsn(3 * SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+    sink.open.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.end().await;
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    let objects = sink.inner.0.lock().unwrap().clone();
+    assert_eq!(&objects["7401/00000002.history"][..], HISTORY.as_bytes());
+}
+
+/// The first segment of a later timeline was removed. The server says so
+/// inside the copy, then waits for a command: the stream starts again at
+/// the slot on the same connection.
+#[tokio::test]
+async fn a_removed_first_segment_inside_the_copy_falls_back_to_the_slot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    assert!(server.start(None).await.contains("PHYSICAL 0/300000 "));
+    server
+        .error("58P01", "requested WAL segment has already been removed")
+        .await;
+    server.ready().await;
+    assert_eq!(
+        server.expect_query().await,
+        format!("READ_REPLICATION_SLOT {SLOT}")
+    );
+    server
+        .row(&[Some("physical"), Some("0/500123"), Some("2")])
+        .await;
+    assert!(server.expect_query().await.contains("PHYSICAL 0/500000 "));
+    server.send(b'W', &[0, 0, 0]).await;
+    let end = server.stream(Lsn(5 * SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+    server.end().await;
+
+    assert_eq!(finish(task).await.unwrap(), end);
+    sink.assert_tiles(Lsn(5 * SEG), end);
+}
+
+/// A segment removed later in the stream is WalGone, not a retry without
+/// end.
+#[tokio::test]
+async fn a_removed_segment_inside_the_copy_is_wal_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let end = server.stream(Lsn(SEG), &pattern(4096, 0)).await;
+    server.await_flush(end).await;
+    server
+        .error("58P01", "requested WAL segment has already been removed")
+        .await;
+
+    let err = finish(task).await.unwrap_err();
+    assert!(
+        matches!(err, Error::WalGone { requested, .. } if requested == end),
+        "{err}"
+    );
 }
 
 #[tokio::test]

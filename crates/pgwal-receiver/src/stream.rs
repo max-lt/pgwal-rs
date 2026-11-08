@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use pgwal::{ArchiveKey, Lsn, timeline_start, timeline_switches};
+use pgwal::{ArchiveKey, Lsn, timeline_switches};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use crate::error::Error;
 use crate::store::{WalStore, first_segment, read_flushed, remove_other_timelines};
 use crate::upload::{Uploader, WalSink, read_watermark, salvage};
-use crate::wire::{Conn, ConnConfig, CopyMessage, check_slot};
+use crate::wire::{Conn, ConnConfig, CopyMessage, check_slot, wal_gone};
 
 /// Longest delay before a flush while WAL keeps arriving.
 const MAX_FLUSH_DELAY: Duration = Duration::from_millis(100);
@@ -47,10 +47,12 @@ pub enum Confirm {
 /// Streams WAL from the server behind `stream` into `cfg.dir`, uploads it to
 /// `sink`, and returns the LSN up to which the sink holds the WAL.
 ///
-/// The stream ends in one of two ways:
+/// The stream ends in one of three ways:
 /// - The server ends it. A clean server shutdown waits for this receiver to
 ///   confirm the flush of the final WAL, so the result covers the shutdown
 ///   checkpoint.
+/// - After a failover, the stream of a parent timeline reaches its end. Call
+///   `receive` again: it goes on with the next timeline.
 /// - `stop` resolves. The receiver asks the server for its position, reads
 ///   and flushes up to it, and ends the stream. Use it before the server is
 ///   paused or killed. WAL that the server writes after it answers is not in
@@ -73,89 +75,110 @@ where
     let seg_size = conn.wal_segment_size().await?;
     conn.ensure_physical_slot(&cfg.slot).await?;
 
-    // A timeline above 1 starts at its switch point. Its history file goes to
-    // the sink, so a restore can follow it and pick an unused timeline.
+    // The history of the server's timeline lists its parents, and where each
+    // one ends.
     let history = match system.timeline {
         1 => None,
         timeline => Some(conn.timeline_history(timeline).await?),
     };
-    let switch_point = history
+    let switches = history
         .as_deref()
-        .and_then(timeline_start)
+        .map(timeline_switches)
         .unwrap_or_default();
-    if let Some(content) = &history {
-        sink.put(
-            &ArchiveKey::History {
-                system_id: system.system_id,
-                timeline: system.timeline,
-            }
-            .to_string(),
-            Bytes::from(content.clone()),
-        )
-        .await?;
-    }
+    let server_start = match switches.last() {
+        Some((_, begin)) => Start::Begin(*begin),
+        None => Start::Slot,
+    };
 
-    // After a failover, the old timeline goes on up to its end, which the
-    // new server still holds when this receiver lagged behind it. Then its
-    // WAL goes up before its files go, and the next timeline starts there.
-    let (timeline, begins_at) = match read_flushed(&cfg.dir).await? {
+    // After a failover, a store on a parent timeline streams that timeline
+    // to its end, which the new server holds when this receiver lagged behind
+    // it. The next run uploads it, removes its files, and starts the next
+    // timeline there.
+    let (timeline, start) = match read_flushed(&cfg.dir).await? {
         Some((old, flushed)) if old != system.timeline => {
-            let switches = history
-                .as_deref()
-                .map(timeline_switches)
-                .unwrap_or_default();
             match switches.iter().position(|(tl, _)| *tl == old) {
-                Some(at) if flushed < switches[at].1 => (old, Some(flushed)),
+                Some(at) if flushed < switches[at].1 => (old, Start::Resume(flushed)),
                 Some(at) => {
                     let next = switches.get(at + 1).map_or(system.timeline, |(tl, _)| *tl);
                     salvage(&cfg.dir, sink.clone()).await?;
                     remove_other_timelines(&cfg.dir, next, seg_size).await?;
-                    (next, Some(switches[at].1))
+                    (next, Start::Resume(switches[at].1))
                 }
                 // Another branch of the history: its WAL goes up, and the
                 // stream follows the server.
                 None => {
                     salvage(&cfg.dir, sink.clone()).await?;
                     remove_other_timelines(&cfg.dir, system.timeline, seg_size).await?;
-                    (system.timeline, None)
+                    (system.timeline, server_start)
                 }
             }
         }
-        _ => (system.timeline, None),
+        _ => (system.timeline, server_start),
     };
-    // A later timeline with nothing local starts where it begins, not at the
-    // slot. A slot created after a promotion would leave the first WAL of
-    // the timeline out of the archive.
-    let begin =
-        begins_at.or((timeline == system.timeline && history.is_some()).then_some(switch_point));
+
+    // A restore follows the timelines through their history files.
+    let mut histories = Vec::new();
+    for later in switches.iter().map(|(tl, _)| *tl).chain([system.timeline]) {
+        if later <= 1 || later < timeline {
+            continue;
+        }
+        let content = match &history {
+            Some(content) if later == system.timeline => content.clone(),
+            _ => conn.timeline_history(later).await?,
+        };
+        let key = ArchiveKey::History {
+            system_id: system.system_id,
+            timeline: later,
+        };
+        histories.push((key.to_string(), Bytes::from(content)));
+    }
 
     let mut store = WalStore::open(cfg.dir.clone(), system.system_id, timeline, seg_size).await?;
-    let resumed = match store.resume_point().await? {
-        Some(lsn) => Some(lsn),
-        None => read_watermark(&cfg.dir, timeline)
-            .await?
-            .map(|uploaded| uploaded.max(begin.unwrap_or_default())),
+    let start = match store.resume_point().await? {
+        Some(lsn) => Start::Resume(lsn),
+        None => match read_watermark(&cfg.dir, timeline).await? {
+            Some(uploaded) => Start::Resume(uploaded.max(start.lsn().unwrap_or_default())),
+            None => start,
+        },
     };
-    let first_wal_can_be_gone = resumed.is_none() && begin.is_some() && timeline == system.timeline;
-    let mut start = match resumed.or(begin) {
-        Some(lsn) => lsn,
-        None => slot_position(&mut conn, &cfg.slot, system.xlogpos).await?,
+    let mut from = match start {
+        Start::Resume(lsn) | Start::Begin(lsn) => lsn,
+        Start::Slot => slot_position(&mut conn, &cfg.slot, system.xlogpos).await?,
     }
     .segment_start(seg_size);
-    match conn.start_replication(&cfg.slot, start, timeline).await {
-        // A timeline that began long ago can have lost its first WAL. The
-        // slot position is then the earliest WAL left.
-        Err(Error::WalGone { .. }) if first_wal_can_be_gone => {
+    // A timeline that began long ago can have lost its first WAL. The error
+    // comes inside the copy for a removed segment, so the first message
+    // tells. The slot position is then the earliest WAL left.
+    let begun = conn.start_replication(&cfg.slot, from, timeline).await;
+    let first_message = match (begun, start) {
+        (Ok(()), Start::Begin(_)) => match conn.next_message().await {
+            Ok(Some(message)) => Ok(Some(message)),
+            Ok(None) => return Ok(from),
+            // ReadyForQuery follows the error.
+            Err(e) => match wal_gone(e, from) {
+                gone @ Error::WalGone { .. } => {
+                    conn.ready().await?;
+                    Err(gone)
+                }
+                e => Err(e),
+            },
+        },
+        (begun, _) => begun.map(|()| None),
+    };
+    let first_message = match (first_message, start) {
+        (Err(Error::WalGone { .. }), Start::Begin(begin)) => {
             let fallback = slot_position(&mut conn, &cfg.slot, system.xlogpos)
                 .await?
-                .max(begin.unwrap_or_default())
+                .max(begin)
                 .segment_start(seg_size);
-            warn!(%start, %fallback, "the first WAL of the timeline is gone; its archive starts later");
-            start = fallback;
-            conn.start_replication(&cfg.slot, start, timeline).await?;
+            warn!(%from, %fallback, "the first WAL of the timeline is gone; its archive starts later");
+            from = fallback;
+            conn.start_replication(&cfg.slot, from, timeline).await?;
+            None
         }
-        other => other?,
-    }
+        (first_message, _) => first_message?,
+    };
+    let start = from;
     store.start_at(start);
     info!(slot = %cfg.slot, system_id = system.system_id, timeline, %start, "streaming WAL");
 
@@ -164,7 +187,7 @@ where
     let first = first_segment(&cfg.dir, timeline)
         .await?
         .map_or(start, |(lsn, _)| lsn.min(start));
-    let uploader = Uploader::new(
+    let mut uploader = Uploader::new(
         cfg.dir.clone(),
         system.system_id,
         timeline,
@@ -173,6 +196,7 @@ where
         first,
     )
     .await?;
+    uploader.first = histories;
     let (flushed_tx, flushed_rx) = watch::channel(start);
     let (uploaded_tx, uploaded_rx) = watch::channel(uploader.uploaded);
     let mut upload = AbortOnDrop(tokio::spawn(uploader.run(
@@ -185,7 +209,15 @@ where
         confirm: cfg.confirm,
         uploaded: uploaded_rx,
     };
-    let streamed = stream_into(&mut conn, &mut store, &flushed_tx, confirmed, stop).await;
+    let streamed = stream_into(
+        &mut conn,
+        &mut store,
+        &flushed_tx,
+        confirmed,
+        first_message,
+        stop,
+    )
+    .await;
     // Closing the channel makes the uploader send the rest and stop, even when
     // the stream failed. The store lock stays held until it has stopped.
     drop(flushed_tx);
@@ -203,6 +235,26 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     Ok(conn.slot_restart_lsn(slot).await?.unwrap_or(xlogpos))
+}
+
+/// Where a run starts streaming.
+#[derive(Clone, Copy)]
+enum Start {
+    /// After the WAL that the store or the sink holds.
+    Resume(Lsn),
+    /// Where the timeline of the server begins. Its first WAL can be gone.
+    Begin(Lsn),
+    /// At the slot.
+    Slot,
+}
+
+impl Start {
+    fn lsn(self) -> Option<Lsn> {
+        match self {
+            Start::Resume(lsn) | Start::Begin(lsn) => Some(lsn),
+            Start::Slot => None,
+        }
+    }
 }
 
 /// A dropped `receive` stops its uploader, which reads the store that the
@@ -243,6 +295,7 @@ async fn stream_into<S>(
     store: &mut WalStore,
     flushed_tx: &watch::Sender<Lsn>,
     mut confirmed: Confirmed,
+    mut first_message: Option<CopyMessage>,
     stop: impl Future<Output = ()>,
 ) -> Result<Lsn, Error>
 where
@@ -255,24 +308,21 @@ where
     let mut flushed = store.flush().await?;
     let mut last_flush = Instant::now();
     loop {
-        let msg = tokio::select! {
-            () = &mut stop, if drain == Drain::Streaming => {
-                drain = Drain::Asked;
-                conn.ask_position(store.written(), confirmed.position(flushed), SystemTime::now())
-                    .await?;
-                continue;
-            }
-            () = confirmed.upload_ended(), if confirmed.confirm == Confirm::Uploaded => {
-                // As below, the read side decides how the stream ended.
-                if let Err(e) = conn
-                    .send_status(store.written(), confirmed.position(flushed), SystemTime::now())
-                    .await
-                {
-                    debug!(error = %e, "status update not delivered");
+        let msg = match first_message.take() {
+            Some(message) => Some(message),
+            None => tokio::select! {
+                () = &mut stop, if drain == Drain::Streaming => {
+                    drain = Drain::Asked;
+                    conn.ask_position(store.written(), confirmed.position(flushed), SystemTime::now())
+                        .await?;
+                    continue;
                 }
-                continue;
-            }
-            msg = conn.next_message() => msg?,
+                () = confirmed.upload_ended(), if confirmed.confirm == Confirm::Uploaded => {
+                    send_status(conn, store.written(), confirmed.position(flushed)).await;
+                    continue;
+                }
+                msg = conn.next_message() => msg.map_err(|e| wal_gone(e, store.written()))?,
+            },
         };
         let Some(msg) = msg else { break };
         let reply_requested = match msg {
@@ -309,18 +359,7 @@ where
             flushed = store.flush().await?;
             last_flush = Instant::now();
             flushed_tx.send_replace(flushed);
-            // The server may have closed after our last status. The read side
-            // decides how the stream ended.
-            if let Err(e) = conn
-                .send_status(
-                    store.written(),
-                    confirmed.position(flushed),
-                    SystemTime::now(),
-                )
-                .await
-            {
-                debug!(error = %e, "status update not delivered");
-            }
+            send_status(conn, store.written(), confirmed.position(flushed)).await;
         }
         if done {
             break;
@@ -331,6 +370,17 @@ where
     // A failed goodbye changes nothing: the server can be going away.
     conn.send_copy_done().await.ok();
     Ok(flushed)
+}
+
+/// Reports the positions. The server may have closed after the last status:
+/// the read side decides how the stream ended.
+async fn send_status<S>(conn: &mut Conn<S>, written: Lsn, flushed: Lsn)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Err(e) = conn.send_status(written, flushed, SystemTime::now()).await {
+        debug!(error = %e, "status update not delivered");
+    }
 }
 
 /// A stop: the receiver asks the server for its position, and ends the

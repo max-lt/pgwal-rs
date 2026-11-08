@@ -9,7 +9,7 @@ use futures_util::future::{Either, select};
 use js_sys::Promise;
 use pgwal::{ArchiveKey, Lsn, RangeKey, timeline_start};
 use pgwal_receiver::Error as WireError;
-use pgwal_receiver::wire::{Conn, ConnConfig, CopyMessage};
+use pgwal_receiver::wire::{Conn, ConnConfig, CopyMessage, wal_gone};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use wasm_bindgen::prelude::*;
@@ -640,7 +640,15 @@ impl Receiver {
                 let message = {
                     let next = pin!(conn.next_message());
                     match select(next, pin!(Delay::from(wait))).await {
-                        Either::Left((message, _)) => message?,
+                        // A removed segment shows inside the copy.
+                        Either::Left((message, _)) => {
+                            match message.map_err(|e| wal_gone(e, Lsn(written))) {
+                                Err(e @ WireError::WalGone { .. }) => {
+                                    return Err(Stop::fatal(format!("gap in the archive: {e}")));
+                                }
+                                message => message?,
+                            }
+                        }
                         Either::Right(_) => continue,
                     }
                 };

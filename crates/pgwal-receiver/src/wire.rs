@@ -265,16 +265,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             "START_REPLICATION SLOT {slot} PHYSICAL {start} TIMELINE {timeline}"
         ))
         .await?;
-        match self.result_sets("START_REPLICATION", b'W').await {
-            Ok(_) => Ok(()),
-            Err(Error::Db { code, message }) if WAL_GONE.contains(&code.as_str()) => {
-                Err(Error::WalGone {
-                    requested: start,
-                    message,
-                })
-            }
-            Err(e) => Err(e),
-        }
+        self.result_sets("START_REPLICATION", b'W')
+            .await
+            .map(drop)
+            .map_err(|e| wal_gone(e, start))
+    }
+
+    /// Reads up to ReadyForQuery, as after an error in the stream. The
+    /// connection then takes another command.
+    pub async fn ready(&mut self) -> Result<(), Error> {
+        self.result_sets("ready", b'Z').await.map(drop)
     }
 
     /// The next message of the replication stream, or `None` once the server
@@ -284,7 +284,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             let (tag, body) = self.read_frame().await?;
             match tag {
                 b'd' => return parse_copy_data(body).map(Some),
-                // A walsender that shuts down sends CommandComplete, not CopyDone.
+                // The end of an old timeline is CopyDone. A walsender that
+                // shuts down sends CommandComplete.
                 b'c' | b'C' => return Ok(None),
                 b'E' => return Err(db_error(body)),
                 b'N' => {}
@@ -514,6 +515,18 @@ fn parse_segment_size(value: &str) -> Result<u64, Error> {
         return Err(bad());
     }
     Ok(size)
+}
+
+/// `e`, or [`Error::WalGone`] from `requested` when the server says it no
+/// longer has that WAL. The error comes before the copy for an invalidated
+/// slot, and inside it for a removed segment.
+pub fn wal_gone(e: Error, requested: Lsn) -> Error {
+    match e {
+        Error::Db { code, message } if WAL_GONE.contains(&code.as_str()) => {
+            Error::WalGone { requested, message }
+        }
+        e => e,
+    }
 }
 
 /// Postgres' own rule for slot names. A name goes into a command as it is.
