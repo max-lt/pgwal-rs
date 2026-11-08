@@ -578,7 +578,14 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
     assert!(!backup.join("postmaster.pid").exists());
     assert_eq!(std::fs::read(backup.join("pg_hba.conf")).unwrap(), hba);
 
-    // Nothing new in the archive: the redo point stays.
+    // Nothing new in the archive: the redo point stays. The copy has no
+    // configuration files, as a copy of a Debian primary.
+    let conf = ["postgresql.conf", "pg_hba.conf", "pg_ident.conf"];
+    let aside = setup.path("conf");
+    std::fs::create_dir(&aside).unwrap();
+    for name in conf {
+        std::fs::rename(backup.join(name), aside.join(name)).unwrap();
+    }
     let again = setup.rebase();
     assert!(
         again.status.success(),
@@ -589,6 +596,10 @@ async fn rebase_moves_a_base_backup_to_the_last_checkpoint() {
         String::from_utf8(again.stdout).unwrap().trim(),
         redo.to_string()
     );
+    for name in conf {
+        assert!(!backup.join(name).exists(), "{name}");
+        std::fs::rename(aside.join(name), backup.join(name)).unwrap();
+    }
 
     let out = setup.restore(&[]);
     assert!(

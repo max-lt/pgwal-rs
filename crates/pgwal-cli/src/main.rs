@@ -91,7 +91,6 @@ impl ConnArgs {
         tls::connector(self.sslmode, self.sslrootcert.as_deref())
     }
 
-    /// The password comes from `PGPASSWORD`.
     fn config(&self, application_name: String, idle_timeout: u64) -> ConnConfig {
         ConnConfig {
             user: self.user.clone(),
@@ -127,11 +126,8 @@ struct ReceiveArgs {
     /// Local store of the received WAL. One receiver at a time can use it.
     #[arg(long)]
     dir: PathBuf,
-    /// Where the archived objects go: a directory, or `s3://bucket/prefix/`.
-    #[arg(long)]
-    archive: String,
     #[command(flatten)]
-    s3: archive::S3Args,
+    archive: archive::ArchiveArgs,
     /// Seconds between two uploads. A loss of this host loses at most that
     /// much WAL.
     #[arg(long, default_value_t = 2)]
@@ -169,7 +165,7 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
         upload_every: Duration::from_secs(args.upload_every),
         confirm: Confirm::Flushed,
     };
-    let sink = archive::open(&args.archive, &args.s3)?;
+    let sink = args.archive.open()?;
 
     let (stop_tx, mut stop) = watch::channel(false);
     let mut terminate = signal(SignalKind::terminate())?;

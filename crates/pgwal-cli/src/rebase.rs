@@ -1,3 +1,4 @@
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -7,7 +8,7 @@ use clap::Args;
 use pgwal::{AfterReplay, ClusterState, ControlFile, Lsn};
 use tracing::{info, warn};
 
-use crate::archive::{self, S3Args};
+use crate::archive::ArchiveArgs;
 use crate::restore::{self, OnGap};
 
 /// Port of the private socket. The server listens on no TCP port.
@@ -16,24 +17,14 @@ const POLL: Duration = Duration::from_millis(200);
 
 #[derive(Args, Debug)]
 pub struct RebaseArgs {
-    /// The archive, as `pgwal receive --archive` writes it: a directory, or
-    /// `s3://bucket/prefix/`.
-    #[arg(long)]
-    archive: String,
     #[command(flatten)]
-    s3: S3Args,
+    archive: ArchiveArgs,
     /// The copy to move forward, in place: a base backup, or the output of
     /// an earlier rebase. Postgres must not run on it.
     #[arg(long)]
     pgdata: PathBuf,
-    /// Directory of the Postgres binaries, of the major version of the copy.
-    /// Without it, they come from PATH.
-    #[arg(long, env = "PGWAL_PG_BIN")]
-    pg_bin: Option<PathBuf>,
-    /// A superuser of the copy, for the local connection that watches the
-    /// replay.
-    #[arg(long, env = "PGUSER", default_value = "postgres")]
-    user: String,
+    #[command(flatten)]
+    pg: PgArgs,
     /// How long the replay can stand still before its position counts as the
     /// end of the archive. The last object can end inside a WAL record.
     #[arg(long, default_value_t = 10)]
@@ -45,9 +36,9 @@ pub struct RebaseArgs {
 /// then a base backup at the last checkpoint of the primary in the archive.
 /// Prints its redo point.
 pub async fn run(args: RebaseArgs) -> Result<()> {
-    let pg = Bin(args.pg_bin.clone());
+    let pg = Bin(args.pg.pg_bin.clone());
     check_version(&pg, &args.pgdata)?;
-    let archive = archive::open(&args.archive, &args.s3)?;
+    let archive = args.archive.open()?;
     let t = Instant::now();
     let end = restore::apply(
         archive.as_ref(),
@@ -62,8 +53,7 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
     );
     let before = ControlFile::read(&args.pgdata)?.redo;
 
-    let socket = PathBuf::from(format!("/tmp/pgwal-rebase-{}", std::process::id()));
-    std::fs::create_dir_all(&socket)?;
+    let socket = private_dir("rebase")?;
     let result = replay(&pg, &args, &socket, end);
     let _ = std::fs::remove_dir_all(&socket);
     let reached = result?;
@@ -73,7 +63,7 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
     if control.state != ClusterState::ShutDownInRecovery {
         bail!("the copy is not shut down in recovery: {:?}", control.state);
     }
-    verify(&pg, &args.pgdata, &args.user)?;
+    verify(&pg, &args.pgdata, &args.pg.user)?;
     if control.redo == before {
         warn!(
             redo = %control.redo,
@@ -94,14 +84,13 @@ pub async fn run(args: RebaseArgs) -> Result<()> {
 /// Starts the server, waits for the replay to reach `end`, and stops it.
 /// Returns the replay position.
 fn replay(pg: &Bin, args: &RebaseArgs, socket: &Path, end: Lsn) -> Result<Lsn> {
-    let _hba = TrustLocal::install(&args.pgdata)?;
     let log = socket.join("postgres.log");
-    let server = start_server(pg, &args.pgdata, socket, &log)?;
+    let server = start_server(pg, &args.pgdata, socket)?;
 
     let stall = Duration::from_secs(args.stall_seconds);
     let mut last = (Lsn(0), Instant::now());
     let reached = loop {
-        let lsn = match server.replay_lsn(socket, &args.user) {
+        let lsn = match server.replay_lsn(socket, &args.pg.user) {
             Ok(lsn) => lsn,
             Err(e)
                 if pg
@@ -136,19 +125,26 @@ pub struct VerifyArgs {
     /// The copy to check. Postgres must not run on it.
     #[arg(long)]
     pgdata: PathBuf,
+    #[command(flatten)]
+    pg: PgArgs,
+}
+
+/// The Postgres that runs on a copy.
+#[derive(Args, Debug)]
+struct PgArgs {
     /// Directory of the Postgres binaries, of the major version of the copy.
     /// Without it, they come from PATH.
     #[arg(long, env = "PGWAL_PG_BIN")]
     pg_bin: Option<PathBuf>,
-    /// A superuser of the copy.
+    /// A superuser of the copy, for the local connections.
     #[arg(long, env = "PGUSER", default_value = "postgres")]
     user: String,
 }
 
 pub fn run_verify(args: VerifyArgs) -> Result<()> {
-    let pg = Bin(args.pg_bin);
+    let pg = Bin(args.pg.pg_bin);
     check_version(&pg, &args.pgdata)?;
-    verify(&pg, &args.pgdata, &args.user)
+    verify(&pg, &args.pgdata, &args.pg.user)
 }
 
 /// Checks a stopped copy: its page checksums when it has them, then
@@ -174,16 +170,13 @@ pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
         name.to_string_lossy(),
         std::process::id()
     ));
-    let socket = PathBuf::from(format!("/tmp/pgwal-verify-{}", std::process::id()));
+    let socket = private_dir("verify")?;
     let result = (|| {
         copy_dir(pgdata, &scratch)?;
         for signal in ["standby.signal", "recovery.signal"] {
             let _ = std::fs::remove_file(scratch.join(signal));
         }
-        std::fs::write(scratch.join("pg_hba.conf"), "local all all trust\n")?;
-        std::fs::create_dir_all(&socket)?;
-        let log = socket.join("postgres.log");
-        let server = start_server(pg, &scratch, &socket, &log)?;
+        let server = start_server(pg, &scratch, &socket)?;
         let amcheck = pg.run(
             "pg_amcheck",
             &[
@@ -212,24 +205,53 @@ pub fn verify(pg: &Bin, pgdata: &Path, user: &str) -> Result<()> {
     Ok(())
 }
 
-/// Starts Postgres on `pgdata`, on the private socket in `socket` only.
-fn start_server<'a>(
-    pg: &'a Bin,
-    pgdata: &'a Path,
-    socket: &Path,
-    log: &Path,
-) -> Result<Server<'a>> {
-    let opts = format!(
-        "-c listen_addresses= -k {} -p {PORT} -c hot_standby=on",
-        path(socket)
+/// A directory that only this user can enter, for the socket, the log and
+/// the trust rules of a private server. It must not exist yet.
+fn private_dir(purpose: &str) -> Result<PathBuf> {
+    // A short path: a Unix socket path holds about 100 bytes.
+    let dir = PathBuf::from(format!("/tmp/pgwal-{purpose}-{}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Starts Postgres on `pgdata`, on a socket in the private directory `dir`
+/// only, with local connections trusted. The copy keeps its own
+/// `pg_hba.conf`.
+fn start_server<'a>(pg: &'a Bin, pgdata: &'a Path, dir: &Path) -> Result<Server<'a>> {
+    let dir_name = path(dir);
+    std::fs::write(dir.join("pg_hba.conf"), "local all all trust\n")?;
+    let mut opts = format!(
+        "-c listen_addresses= -k {dir_name} -p {PORT} -c unix_socket_permissions=0700 \
+         -c hot_standby=on -c hba_file={dir_name}/pg_hba.conf"
     );
+    // A copy of a Debian primary has no postgresql.conf. The settings that a
+    // standby needs at least as high as on the primary come from pg_control.
+    if !pgdata.join("postgresql.conf").exists() {
+        std::fs::write(dir.join("postgresql.conf"), "")?;
+        std::fs::write(dir.join("pg_ident.conf"), "")?;
+        opts.push_str(&format!(
+            " -c config_file={dir_name}/postgresql.conf -c ident_file={dir_name}/pg_ident.conf"
+        ));
+        let data = pg.run("pg_controldata", &[path(pgdata)])?;
+        for (field, setting) in PRIMARY_SETTINGS {
+            let value = data
+                .lines()
+                .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+                .with_context(|| format!("pg_controldata has no {field}"))?;
+            opts.push_str(&format!(" -c {setting}={}", value.trim()));
+        }
+    }
+    let log = dir.join("postgres.log");
     let started = pg.run(
         "pg_ctl",
         &[
             "-D",
             path(pgdata),
             "-l",
-            path(log),
+            path(&log),
             "-o",
             &opts,
             "-w",
@@ -237,23 +259,32 @@ fn start_server<'a>(
         ],
     );
     let server = Server { pg, pgdata };
-    started.with_context(|| format!("starting Postgres:\n{}", tail(log)))?;
+    started.with_context(|| format!("starting Postgres:\n{}", tail(&log)))?;
     Ok(server)
 }
 
-/// Copies a directory tree. `fs::copy` clones each file where the file
-/// system can, as APFS, btrfs and XFS do.
+/// The `pg_controldata` field of each setting a standby needs at least as
+/// high as on the primary.
+const PRIMARY_SETTINGS: [(&str, &str); 5] = [
+    ("max_connections setting", "max_connections"),
+    ("max_worker_processes setting", "max_worker_processes"),
+    ("max_wal_senders setting", "max_wal_senders"),
+    ("max_prepared_xacts setting", "max_prepared_transactions"),
+    ("max_locks_per_xact setting", "max_locks_per_transaction"),
+];
+
+/// Copies a directory tree, with the targets of its links: a scratch
+/// server must not write into the tablespaces or the WAL directory of the
+/// copy. `fs::copy` clones each file where the file system can, as APFS,
+/// btrfs and XFS do.
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to)?;
     std::fs::set_permissions(to, std::fs::metadata(from)?.permissions())?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
+        if entry.path().is_dir() {
             copy_dir(&entry.path(), &target)?;
-        } else if kind.is_symlink() {
-            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
         } else {
             std::fs::copy(entry.path(), &target)?;
         }
@@ -362,30 +393,6 @@ impl Drop for Server<'_> {
             "pg_ctl",
             &["-D", path(self.pgdata), "-m", "immediate", "-w", "stop"],
         );
-    }
-}
-
-/// Lets local connections in without a password while the replay runs,
-/// and puts the `pg_hba.conf` of the copy back on drop.
-struct TrustLocal {
-    path: PathBuf,
-    original: Vec<u8>,
-}
-
-impl TrustLocal {
-    fn install(pgdata: &Path) -> Result<TrustLocal> {
-        let path = pgdata.join("pg_hba.conf");
-        let original = std::fs::read(&path)?;
-        std::fs::write(&path, "local all all trust\n")?;
-        Ok(TrustLocal { path, original })
-    }
-}
-
-impl Drop for TrustLocal {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::write(&self.path, &self.original) {
-            warn!(path = %self.path.display(), "putting pg_hba.conf back failed: {e}");
-        }
     }
 }
 

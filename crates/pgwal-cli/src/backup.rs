@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::ConnArgs;
-use crate::archive::{self, S3Args};
+use crate::archive::{self, ArchiveArgs};
 
 /// Parts read ahead of the unpacking: about 32 MiB.
 const PARTS_AHEAD: usize = 2;
@@ -26,11 +26,8 @@ pub struct BackupArgs {
     slot: String,
     #[arg(long, default_value = "pgwal_backup")]
     application_name: String,
-    /// The archive of `pgwal receive`: a directory, or `s3://bucket/prefix/`.
-    #[arg(long)]
-    archive: String,
     #[command(flatten)]
-    s3: S3Args,
+    archive: ArchiveArgs,
     /// Longest silence accepted from the server, in seconds. It covers the
     /// checkpoint at the start of the backup.
     #[arg(long, default_value_t = 300)]
@@ -40,7 +37,7 @@ pub struct BackupArgs {
 /// Takes a base backup into the archive and prints its start and end LSN.
 pub async fn run(args: BackupArgs) -> Result<()> {
     let tls = args.conn.tls()?;
-    let sink = archive::open(&args.archive, &args.s3)?;
+    let sink = args.archive.open()?;
     let conn = args.conn.config(args.application_name, args.idle_timeout);
     let stream = args.conn.connect(tls.as_ref()).await?;
     let backup = base_backup(stream, &conn, &args.slot, sink).await?;
@@ -50,10 +47,8 @@ pub async fn run(args: BackupArgs) -> Result<()> {
 
 #[derive(Args, Debug)]
 pub struct FetchArgs {
-    #[arg(long)]
-    archive: String,
     #[command(flatten)]
-    s3: S3Args,
+    archive: ArchiveArgs,
     /// A missing or empty directory.
     #[arg(long)]
     pgdata: PathBuf,
@@ -65,7 +60,7 @@ pub struct FetchArgs {
 /// Writes the latest backup whose WAL the archive holds up to its end, and
 /// prints its start LSN. Then `pgwal restore` writes the WAL.
 pub async fn run_fetch(args: FetchArgs) -> Result<()> {
-    let archive = archive::open(&args.archive, &args.s3)?;
+    let archive = args.archive.open()?;
     let keys = archive.list("").await?;
     let backup = latest(archive.as_ref(), &keys, args.system_id).await?;
     if !backup.tablespaces.is_empty() {

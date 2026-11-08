@@ -6,10 +6,29 @@ use bytes::Bytes;
 use clap::Args;
 use pgwal_receiver::{DirSink, WalSink};
 
-/// Where to reach an S3 archive, `--archive s3://bucket/prefix/`. The keys
-/// come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` only.
-#[derive(Args, Debug, Clone)]
-pub struct S3Args {
+/// The archive of `pgwal receive`.
+#[derive(Args, Debug)]
+pub struct ArchiveArgs {
+    /// The archive: a directory, or `s3://bucket/prefix/`.
+    #[arg(long)]
+    archive: String,
+    #[command(flatten)]
+    s3: S3Args,
+}
+
+impl ArchiveArgs {
+    pub fn open(&self) -> Result<Arc<dyn WalSink>> {
+        let Some(location) = self.archive.strip_prefix("s3://") else {
+            return Ok(Arc::new(DirSink::new(&self.archive)));
+        };
+        open_s3(location, &self.s3)
+    }
+}
+
+/// Where to reach an S3 archive. The keys come from `AWS_ACCESS_KEY_ID` and
+/// `AWS_SECRET_ACCESS_KEY` only.
+#[derive(Args, Debug)]
+struct S3Args {
     /// `https://host[:port]` of the S3 store. Without it, AWS in the region.
     #[arg(long, env = "AWS_ENDPOINT_URL")]
     s3_endpoint: Option<String>,
@@ -18,14 +37,6 @@ pub struct S3Args {
     /// PEM file of CAs to trust next to the public roots.
     #[arg(long, env = "AWS_CA_BUNDLE")]
     s3_ca_file: Option<PathBuf>,
-}
-
-/// `spec` is a directory, or `s3://bucket/prefix/`.
-pub fn open(spec: &str, s3: &S3Args) -> Result<Arc<dyn WalSink>> {
-    let Some(location) = spec.strip_prefix("s3://") else {
-        return Ok(Arc::new(DirSink::new(spec)));
-    };
-    open_s3(location, s3)
 }
 
 /// The object at `key`, which must be there.

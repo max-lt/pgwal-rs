@@ -12,8 +12,9 @@ point is the upload interval, not one 16 MiB segment.
   segment writer. It uses `std` only.
 - `pgwal-receiver`: the replication stream, the local store, the uploader,
   salvage, compaction and base backups. A sink implements the `WalSink`
-  trait: `DirSink` keeps a directory, `S3Sink` an S3 bucket. Without the default `runtime` feature, only the protocol module
-  `wire` builds, for hosts without tokio such as wasm32.
+  trait: `DirSink` keeps a directory, `S3Sink` an S3 bucket. Without the
+  default `runtime` feature, only the protocol module `wire` builds, for
+  hosts without tokio such as wasm32.
 - `pgwal-cli`: the `pgwal` command.
 - `pgwal-worker`: a receiver in a Cloudflare Durable Object, for one
   database. It is not published on crates.io. See its
@@ -41,7 +42,11 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
     Without it, the command trusts the Mozilla roots.
 - With `require` or `verify-full`, the command never falls back to clear
   text. A server that refuses TLS stops it.
-- The slot is `pgwal`. The command creates it on first use.
+- `--slot` (default `pgwal`) names the slot. The command creates it on first
+  use. `--application-name` (default `pgwal`) is the name that
+  `synchronous_standby_names` matches.
+- `--upload-every` (default 2 s) sets the upload interval. `--idle-timeout`
+  (default 60 s) is the longest silence accepted from the server.
 - The command reconnects after an error. It stops on Ctrl-C or SIGTERM,
   after it uploads the WAL it received.
 
@@ -169,6 +174,12 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   watches the replay. Its default is `postgres`.
 - Then the command runs `pgwal verify` on the copy, and fails if the check
   fails.
+- The server listens on a socket in a directory that only the user of the
+  command can enter, and trusts local connections there. The `pg_hba.conf`
+  of the copy stays as it is.
+- A copy without `postgresql.conf`, such as a copy of a Debian primary,
+  starts with the settings that `pg_control` holds and the defaults for the
+  rest.
 - The command runs as the owner of the data directory, not as root.
 
 `pgwal verify` checks a stopped copy:
@@ -196,8 +207,8 @@ aws s3 ls --recursive s3://bucket/wal/ | awk '{print $4}' \
 
 ## Tests
 
-Some tests start Postgres servers. Set `PGWAL_PG_BIN` to the directory of the
-Postgres binaries. Without them, these tests skip.
+Some tests start Postgres servers. They take the Postgres binaries from
+`PGWAL_PG_BIN`, else from `PATH`. Without them, these tests skip.
 
 The S3 tests run against a real store, under a prefix of their own that they
 delete:

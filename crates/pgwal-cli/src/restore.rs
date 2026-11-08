@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use pgwal_receiver::WalSink;
 
-use crate::archive::{self, S3Args};
+use crate::archive::{self, ArchiveArgs};
 
 /// Segments fetched at the same time, and objects of one segment. They bound
 /// a restore to 64 reads in flight and 4 segments in memory.
@@ -21,12 +21,8 @@ const OBJECTS_IN_FLIGHT: usize = 16;
 
 #[derive(Args, Debug)]
 pub struct RestoreArgs {
-    /// The archive, as `pgwal receive --archive` writes it: a directory, or
-    /// `s3://bucket/prefix/`.
-    #[arg(long)]
-    archive: String,
     #[command(flatten)]
-    s3: S3Args,
+    archive: ArchiveArgs,
     /// A copy of the data directory: a base backup or a snapshot. Postgres
     /// must not run on it.
     #[arg(long)]
@@ -46,15 +42,15 @@ pub struct RestoreArgs {
 pub enum OnGap {
     Refuse,
     /// Restore up to the gap.
-    Stop,
+    Accept,
 }
 
 /// Writes the archived WAL that follows the copy into its `pg_wal`. The
 /// next start of Postgres replays it. Prints the LSN where the replay ends.
 pub async fn run(args: RestoreArgs) -> Result<()> {
-    let archive = archive::open(&args.archive, &args.s3)?;
+    let archive = args.archive.open()?;
     let on_gap = if args.accept_gap {
-        OnGap::Stop
+        OnGap::Accept
     } else {
         OnGap::Refuse
     };
@@ -154,10 +150,7 @@ pub async fn apply(
                 let objects: Vec<_> = futures_util::stream::iter(&segment.keys)
                     .map(|key| async move {
                         let wal = archive::read(archive, &key.to_string()).await?;
-                        if wal.len() as u64 != key.end.0 - key.start.0 {
-                            bail!("archived object {key} holds {} bytes", wal.len());
-                        }
-                        Ok((key.start, key.end, wal))
+                        anyhow::Ok((key.start, key.end, wal))
                     })
                     .buffered(OBJECTS_IN_FLIGHT)
                     .try_collect()
@@ -176,10 +169,7 @@ pub async fn apply(
         )?;
     }
 
-    let end = match plan.recovery {
-        Recovery::Nothing => None,
-        Recovery::Crash { end } | Recovery::Archive { end } => Some(end),
-    };
+    let end = plan.recovery.end();
     let archive_recovery = matches!(plan.recovery, Recovery::Archive { .. });
     if after == AfterReplay::StayStandby || archive_recovery {
         request_recovery(pgdata, after)?;
@@ -187,7 +177,7 @@ pub async fn apply(
     info!(
         system_id = start.system_id,
         from = %start.from,
-        end = %end.map_or("-".to_owned(), |e| e.to_string()),
+        ?end,
         segments = plan.segments.len(),
         histories = plan.histories.len(),
         archive_recovery,
