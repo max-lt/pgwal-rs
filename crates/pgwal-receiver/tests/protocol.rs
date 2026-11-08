@@ -1087,10 +1087,10 @@ async fn an_invalidated_slot_is_reported_as_wal_gone() {
     );
 }
 
-/// The slot of a later timeline was invalidated: the server refuses the
-/// copy before it starts. The stream starts again at the slot.
+/// The slot was invalidated on a later timeline: the server refuses the
+/// copy before it starts, and a retry gets the same answer. It is WalGone.
 #[tokio::test]
-async fn an_invalidated_slot_on_a_later_timeline_starts_at_the_slot() {
+async fn an_invalidated_slot_on_a_later_timeline_is_wal_gone() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(MemSink::default());
     let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
@@ -1100,21 +1100,80 @@ async fn an_invalidated_slot_on_a_later_timeline_starts_at_the_slot() {
         .error("55000", "can no longer access replication slot")
         .await;
     server.ready().await;
-    assert_eq!(
-        server.expect_query().await,
-        format!("READ_REPLICATION_SLOT {SLOT}")
+
+    let err = finish(task).await.unwrap_err();
+    assert!(matches!(err, Error::WalGone { .. }), "{err}");
+}
+
+/// An empty store on timeline 1, as on a new host, and a slot ahead of the
+/// sink: the run starts at the end of the sink, not at the slot.
+#[tokio::test]
+async fn an_empty_store_on_timeline_1_starts_at_the_end_of_the_sink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let wal = pattern(4096, 1);
+    let held = RangeKey {
+        system_id: 7401,
+        timeline: 1,
+        start: Lsn(SEG),
+        end: Lsn(SEG + 4096),
+    };
+    sink.0
+        .lock()
+        .unwrap()
+        .insert(held.to_string(), Bytes::from(wal.clone()));
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    assert!(
+        server
+            .start(None)
+            .await
+            .ends_with("PHYSICAL 0/100000 TIMELINE 1")
     );
-    server
-        .row(&[Some("physical"), Some("0/500123"), Some("2")])
-        .await;
-    assert!(server.expect_query().await.contains("PHYSICAL 0/500000 "));
-    server.send(b'W', &[0, 0, 0]).await;
-    let end = server.stream(Lsn(5 * SEG), &pattern(4096, 0)).await;
+    let end = server.stream(Lsn(SEG), &pattern(8192, 1)).await;
     server.await_flush(end).await;
     server.end().await;
-
     assert_eq!(finish(task).await.unwrap(), end);
-    sink.assert_tiles(Lsn(5 * SEG), end);
+}
+
+/// An empty store after two failovers, 1 to 2 to 3, and a sink that ends
+/// early on timeline 1: the run starts with the rest of timeline 1, and
+/// every history file goes up.
+#[tokio::test]
+async fn an_empty_store_after_two_failovers_starts_on_the_oldest_held_timeline() {
+    const HISTORY_3: &str = "1\t0/300A00\tno recovery target specified\n\
+                             2\t0/500A00\tno recovery target specified\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+    let held = RangeKey {
+        system_id: 7401,
+        timeline: 1,
+        start: Lsn(SEG),
+        end: Lsn(SEG + 4096),
+    };
+    let old_wal = pattern((0x300A00 - SEG) as usize, 1);
+    sink.0
+        .lock()
+        .unwrap()
+        .insert(held.to_string(), Bytes::copy_from_slice(&old_wal[..4096]));
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_with(3, HISTORY_3).await;
+    assert_eq!(server.expect_query().await, "TIMELINE_HISTORY 2");
+    server.history(2, HISTORY).await;
+    assert!(
+        server
+            .start(None)
+            .await
+            .ends_with("PHYSICAL 0/100000 TIMELINE 1")
+    );
+    let end = server.stream(Lsn(SEG), &old_wal).await;
+    server.await_flush(end).await;
+    server.copy_done().await;
+    assert_eq!(finish(task).await.unwrap(), Lsn(0x300A00));
+
+    let objects = sink.0.lock().unwrap().clone();
+    assert_eq!(&objects["7401/00000002.history"][..], HISTORY.as_bytes());
+    assert_eq!(&objects["7401/00000003.history"][..], HISTORY_3.as_bytes());
 }
 
 #[tokio::test]
