@@ -372,3 +372,56 @@ async fn require_stops_on_a_server_without_tls() {
     assert!(!status.success());
     assert_eq!(slot_active(&cluster.client().await).await, None);
 }
+
+/// The archive refuses writes, and the server stops: its last WAL stays in
+/// the store. A stop of the command then fails, as its final upload does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_with_wal_the_archive_lacks_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let cluster = Cluster::start(bin, None);
+    let pgwal = cluster.receiver(&[]);
+    let client = cluster.client().await;
+    client
+        .batch_execute("CREATE TABLE t AS SELECT g FROM generate_series(1, 1000) g")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while objects_under(&cluster.path("archive")) == 0 {
+        assert!(Instant::now() < deadline, "no object reached the archive");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let set_mode = |mode: u32| {
+        let mut dirs = vec![cluster.path("archive")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                }
+            }
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    };
+    set_mode(0o500);
+    client
+        .batch_execute("INSERT INTO t SELECT generate_series(1, 100000)")
+        .await
+        .unwrap();
+    drop(client);
+    let _ = Command::new(cluster.bin.join("pg_ctl"))
+        .args(["-D", cluster.path("data").to_str().unwrap()])
+        .args(["-m", "fast", "-w", "stop"])
+        .output();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let status = pgwal.interrupt();
+    set_mode(0o700);
+    assert!(
+        !status.success(),
+        "the stop passed with WAL left in the store"
+    );
+}

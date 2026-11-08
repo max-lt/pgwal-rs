@@ -1,9 +1,10 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use pgwal_receiver::{Confirm, ConnConfig, Error, StreamConfig, receive};
+use pgwal_receiver::{Confirm, ConnConfig, Error, StreamConfig, WalSink, receive, salvage};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
@@ -205,7 +206,7 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
                     ))
                 })
             }
-            _ = stop.wait_for(|stopped| *stopped) => return Ok(()),
+            _ = stop.wait_for(|stopped| *stopped) => return final_upload(&cfg, &sink).await,
         };
         let received = match connected {
             Ok(stream) => receive(stream, &cfg, sink.clone(), stopped).await,
@@ -226,21 +227,31 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
             // A server that refuses TLS, or a certificate that fails the
             // check, fails every retry the same way.
             Err(Error::Io(e))
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
-                ) =>
+                if e.kind() == std::io::ErrorKind::Unsupported
+                    || e.get_ref()
+                        .is_some_and(|e| e.is::<tls::CertificateRefused>()) =>
             {
                 bail!(e)
             }
-            // The WAL that the last upload could not send stays in the store.
-            Err(e) if *stop.borrow() => bail!(e),
+            Err(e) if *stop.borrow() => {
+                warn!("receive failed: {e}");
+                return final_upload(&cfg, &sink).await;
+            }
             Err(e) => warn!(retry_in = ?backoff, "receive failed: {e}"),
         }
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
-            _ = stop.wait_for(|stopped| *stopped) => return Ok(()),
+            _ = stop.wait_for(|stopped| *stopped) => return final_upload(&cfg, &sink).await,
         }
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
+}
+
+/// Uploads what the store holds after a stop between two streams. A
+/// failure is the exit status: the WAL stays in the store.
+async fn final_upload(cfg: &StreamConfig, sink: &Arc<dyn WalSink>) -> Result<()> {
+    salvage(&cfg.dir, sink.clone())
+        .await
+        .context("the final upload failed: the WAL stays in the store")?;
+    Ok(())
 }

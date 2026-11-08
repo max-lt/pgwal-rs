@@ -29,7 +29,8 @@ impl ArchiveArgs {
 /// `AWS_SECRET_ACCESS_KEY` only.
 #[derive(Args, Debug)]
 struct S3Args {
-    /// `https://host[:port]` of the S3 store. Without it, AWS in the region.
+    /// `https://host[:port]`, or `http://host[:port]`, of the S3 store.
+    /// Without it, AWS in the region.
     #[arg(long, env = "AWS_ENDPOINT_URL")]
     s3_endpoint: Option<String>,
     #[arg(long, env = "AWS_REGION", default_value = "us-east-1")]

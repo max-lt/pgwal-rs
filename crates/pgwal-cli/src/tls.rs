@@ -3,11 +3,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -51,7 +54,11 @@ pub fn connector(mode: SslMode, root_cert: Option<&Path>) -> Result<Option<TlsCo
     let mut config = match mode {
         SslMode::Disable => return Ok(None),
         SslMode::Allow | SslMode::Prefer | SslMode::VerifyCa => {
-            bail!("sslmode {mode:?} is not supported: give disable, require or verify-full")
+            let name = mode
+                .to_possible_value()
+                .map(|value| value.get_name().to_owned())
+                .unwrap_or_default();
+            bail!("sslmode {name} is not supported: give disable, require or verify-full")
         }
         SslMode::Require => builder()?
             .dangerous()
@@ -59,7 +66,9 @@ pub fn connector(mode: SslMode, root_cert: Option<&Path>) -> Result<Option<TlsCo
             .with_no_client_auth(),
         SslMode::VerifyFull => {
             let mut roots = RootCertStore::empty();
-            match root_cert {
+            // libpq takes `system` for the trusted roots of the host. pgwal
+            // has the Mozilla roots for that.
+            match root_cert.filter(|path| *path != Path::new("system")) {
                 Some(path) => {
                     for cert in CertificateDer::pem_file_iter(path)
                         .with_context(|| format!("reading {}", path.display()))?
@@ -108,22 +117,46 @@ pub async fn connect(
     let name = ServerName::try_from(host.to_owned())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     connector.connect(name, stream).await.map_err(|e| {
-        let refused = e
+        let Some(rustls::Error::InvalidCertificate(cert)) = e
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<rustls::Error>())
-            .is_some_and(|tls| matches!(tls, rustls::Error::InvalidCertificate(_)));
-        if !refused {
+        else {
+            return e;
+        };
+        // A renewal or a clock fixes these: the next retry can pass.
+        if matches!(
+            cert,
+            CertificateError::Expired
+                | CertificateError::ExpiredContext { .. }
+                | CertificateError::NotValidYet
+                | CertificateError::NotValidYetContext { .. }
+        ) {
             return e;
         }
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "the certificate of {host} fails the check: {e}. It needs the host \
-                 name in its subjectAltName, and cannot be a CA certificate"
-            ),
-        )
+        let hint = match cert {
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+                " It needs the host name in its subjectAltName."
+            }
+            CertificateError::UnknownIssuer => " --sslrootcert gives the CA that signed it.",
+            _ => "",
+        };
+        io::Error::other(CertificateRefused(format!(
+            "the certificate of {host} fails the check: {e}.{hint}"
+        )))
     })
 }
+
+/// A server certificate that every retry refuses the same way.
+#[derive(Debug)]
+pub struct CertificateRefused(String);
+
+impl std::fmt::Display for CertificateRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CertificateRefused {}
 
 /// Accepts any server certificate, but checks the handshake signatures.
 #[derive(Debug)]

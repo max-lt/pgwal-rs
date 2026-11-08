@@ -39,15 +39,17 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
     `--sslrootcert`, the command refuses to start.
   - `verify-full`: TLS, with a check of the chain and of the host name.
     `--sslrootcert` (or `PGSSLROOTCERT`) gives a PEM file of the CAs to trust.
-    Without it, the command trusts the Mozilla roots. The server certificate
-    needs the host name in its subjectAltName, and cannot be a CA
-    certificate: a self-signed certificate made with `openssl req -x509`
-    fails.
+    Without it, or with `system` as in libpq, the command trusts the Mozilla
+    roots. The server certificate needs the host name in its subjectAltName,
+    and cannot be a CA certificate: a self-signed certificate made with
+    `openssl req -x509` fails.
   - The other values of libpq, `allow`, `prefer` and `verify-ca`, are an
     error.
 - With `require` or `verify-full`, the command never falls back to clear
-  text. A server that refuses TLS, or a certificate that fails the check,
-  stops it.
+  text. A server that refuses TLS stops it, and so does a certificate that
+  fails the check for good, such as a missing host name or an unknown CA.
+  An expired certificate, or one not valid yet, gives a retry: a renewal or
+  a clock fixes it.
 - `--slot` (default `pgwal`) names the slot. The command creates it on first
   use. `--application-name` (default `pgwal`) is the name that
   `synchronous_standby_names` matches.
@@ -59,8 +61,9 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
 - It stops on Ctrl-C or SIGTERM, after it uploads the WAL it received. When
   that upload fails, the exit status is not 0, and the WAL stays in the
   store.
-- Every command writes its files with mode 0600 and its directories with
-  mode 0700: the archive and the store hold every row of the server.
+- Every command runs with umask 077: the archive and the store hold every
+  row of the server, and only the user of the command reads them. `fetch`
+  keeps the modes that the backup gives its files.
 
 ### S3 archives
 
@@ -70,7 +73,8 @@ that reads or writes an archive.
 ```sh
 export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 pgwal receive --host db.example --user replicator --dir /var/lib/pgwal/store \
-  --archive s3://wal/db1/ --s3-endpoint https://<account>.r2.cloudflarestorage.com --s3-region auto
+  --archive s3://wal/db1/ --s3-region auto \
+  --s3-endpoint https://<account>.r2.cloudflarestorage.com
 ```
 
 - The keys come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` only.
@@ -133,8 +137,11 @@ pg_ctl -D /restore/data start
 - With `--standby`, Postgres replays the archive as a standby and does not
   promote. It connects to no primary: the command clears `primary_conninfo`
   and `primary_slot_name` of the copy. A copy of the data directory after a
-  clean stop is a new base backup, on the timeline of the archive. Its replay starts at the redo point of the
-  last checkpoint of the primary in the archive.
+  clean stop is a new base backup, on the timeline of the archive. Its
+  replay starts at the redo point of the last checkpoint of the primary in
+  the archive. Its `postgresql.auto.conf` keeps `primary_conninfo = ''` and
+  `primary_slot_name = ''`, which win over `postgresql.conf`: remove them to
+  make a streaming standby of it.
 
 ### Base backups in the archive
 
@@ -221,7 +228,9 @@ pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
   `pg_ctl stop`. During the download, a signal stops the command at once. A
   signal that the shell ignores, as `nohup` ignores SIGHUP, stays ignored.
 - After the rebase, the copy has no `backup_label.old` and no
-  `backup_manifest`: they describe the copy before the rebase.
+  `backup_manifest`: they describe the copy before the rebase. Its
+  `postgresql.auto.conf` keeps `restore_command = 'false'`,
+  `primary_conninfo = ''` and `primary_slot_name = ''`.
 - A copy without `postgresql.conf`, such as a copy of a Debian primary,
   starts with the defaults and the settings of `pg_control`.
 - The command runs as the owner of the data directory, not as root.
