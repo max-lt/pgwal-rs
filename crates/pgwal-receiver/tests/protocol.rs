@@ -1099,19 +1099,31 @@ async fn a_store_past_the_switch_falls_back_to_the_slot_of_the_new_server() {
 }
 
 /// A slot made with `pg_create_physical_replication_slot` and its defaults
-/// has no WAL reserved. With no WAL of the system anywhere, the stream
-/// starts at the server position.
+/// has no WAL reserved, as an invalidated slot. With no WAL of the system
+/// anywhere, the receiver makes the slot again with its WAL reserved.
 #[tokio::test]
-async fn a_new_slot_with_no_wal_reserved_starts_at_the_server_position() {
+async fn a_slot_with_no_wal_and_nothing_archived_is_made_again() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(MemSink::default());
     let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
     server.open().await;
     server.expect_query().await; // READ_REPLICATION_SLOT
     server.row(&[Some("physical"), None, None]).await;
-    let query = server.expect_query().await;
+    assert_eq!(
+        server.expect_query().await,
+        format!("DROP_REPLICATION_SLOT {SLOT}")
+    );
+    server.send(b'C', b"DROP_REPLICATION_SLOT\0").await;
+    server.ready().await;
+    assert_eq!(
+        server.expect_query().await,
+        format!("CREATE_REPLICATION_SLOT {SLOT} PHYSICAL RESERVE_WAL")
+    );
+    server
+        .row(&[Some(SLOT), Some("0/2000000"), None, None])
+        .await;
+    let query = server.start(Some(Lsn(0x200_0000))).await;
     assert!(query.contains(" 0/2000000 "), "{query}");
-    server.send(b'W', &[0, 0, 0]).await;
     let end = server.stream(Lsn(0x200_0000), &pattern(4096, 3)).await;
     server.await_flush(end).await;
     server.end().await;

@@ -27,6 +27,9 @@ use crate::store::{
 
 const WATERMARK_FILE: &str = "uploaded";
 
+/// Where the WAL goes. The receiver removes its local copy of an object once
+/// `put` returns: `put` returns only once the object is durable, and `list`
+/// then shows it.
 #[async_trait]
 pub trait WalSink: Send + Sync {
     /// Stores one object. After a crash, the same key can arrive again with the

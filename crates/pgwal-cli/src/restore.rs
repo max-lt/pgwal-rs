@@ -318,22 +318,26 @@ pub fn refuse_running(pgdata: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuses a user other than the owner of `dir`, as under sudo: the files
-/// the command writes would be theirs, and Postgres could not read them.
+/// Refuses root, and a user other than the owner of `dir` when it exists, as
+/// under sudo: the files the command writes would be theirs, and Postgres,
+/// which never runs as root, could not read them.
 pub fn refuse_other_owner(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let owner = std::fs::metadata(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .uid();
     // SAFETY: geteuid has no precondition and cannot fail.
     let user = unsafe { libc::geteuid() };
-    if owner != user {
-        bail!(
-            "{} belongs to uid {owner}: run the command as that user, not uid {user}",
-            dir.display()
-        );
+    if user == 0 {
+        bail!("Postgres never runs as root: run the command as the user of the server");
     }
-    Ok(())
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.uid() != user => bail!(
+            "{} belongs to uid {}: run the command as that user, not uid {user}",
+            dir.display(),
+            meta.uid()
+        ),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", dir.display())),
+    }
 }
 
 #[cfg(test)]

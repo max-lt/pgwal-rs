@@ -1,8 +1,8 @@
 //! Streams the WAL of a server over physical replication and uploads it to a sink,
 //! as objects keyed by LSN range.
 //!
-//! By default the receiver confirms a flush to Postgres once the WAL is
-//! fsynced on local disk, not once it is in the sink. A loss of the receiver's
+//! With [`Confirm::Flushed`], the receiver confirms a flush to Postgres once
+//! the WAL is fsynced on local disk, not once it is in the sink. A loss of the receiver's
 //! host then loses at most the WAL of one upload interval. With
 //! [`Confirm::Uploaded`], it confirms once the WAL is in the sink.
 //!

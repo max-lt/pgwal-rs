@@ -828,16 +828,41 @@ async fn a_lost_slot_is_reported_then_recreated() {
     client
         .batch_execute(&format!(
             "SELECT pg_create_physical_replication_slot('{SLOT}', true);
-             CREATE TABLE t (i bigint);
-             INSERT INTO t SELECT generate_series(1, 1500000);
-             SELECT pg_switch_wal(); CHECKPOINT;
-             INSERT INTO t SELECT generate_series(1, 100);
-             SELECT pg_switch_wal(); CHECKPOINT;"
+             CREATE TABLE t (i bigint);"
         ))
         .await
         .unwrap();
-
     let cfg = stream_config(&wal);
+
+    // The archive gets some WAL first: with none, a lost slot loses nothing.
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<Lsn>();
+    let first = {
+        let (cfg, sink) = (stream_config(&wal), sink.clone());
+        let stream = UnixStream::connect(&socket).await.unwrap();
+        tokio::spawn(async move { receive(stream, &cfg, sink, async { stop_rx.await.ok() }).await })
+    };
+    wait_for_slot(&client, true).await;
+    let flushed: Lsn = client
+        .query_one("SELECT pg_current_wal_flush_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get::<_, String>(0)
+        .parse()
+        .unwrap();
+    stop_tx.send(flushed).unwrap();
+    finish(first).await.unwrap();
+    wait_for_slot(&client, false).await;
+
+    client
+        .batch_execute(
+            "INSERT INTO t SELECT generate_series(1, 1500000);
+             SELECT pg_switch_wal(); CHECKPOINT;
+             INSERT INTO t SELECT generate_series(1, 100);
+             SELECT pg_switch_wal(); CHECKPOINT;",
+        )
+        .await
+        .unwrap();
+
     let stream = UnixStream::connect(&socket).await.unwrap();
     let err = receive(stream, &cfg, sink.clone(), std::future::pending())
         .await

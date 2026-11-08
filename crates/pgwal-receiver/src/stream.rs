@@ -155,7 +155,7 @@ where
 /// Postgres 16 and 17 still stream from it with no WAL kept: WalGone. Or it
 /// was made without reserved WAL, as `pg_create_physical_replication_slot`
 /// makes it by default. With no WAL of the system in the store or the sink,
-/// no WAL can be missing: the stream starts at the server position.
+/// no WAL can be missing: the slot is made again with its WAL reserved.
 async fn slot_position<S>(
     conn: &mut Conn<S>,
     cfg: &StreamConfig,
@@ -174,8 +174,14 @@ where
             .await?
             .is_empty();
     if new {
-        info!(slot = %cfg.slot, "the slot holds no WAL yet; the stream starts at the server position");
-        return Ok(system.xlogpos);
+        // An invalidated slot stays lost after a stream sets its position,
+        // and holds no WAL: only a new slot does.
+        info!(slot = %cfg.slot, "the slot holds no WAL; it is made again with its WAL reserved");
+        conn.drop_slot(&cfg.slot).await?;
+        conn.ensure_physical_slot(&cfg.slot).await?;
+        return conn.slot_restart_lsn(&cfg.slot).await?.ok_or_else(|| {
+            Error::Protocol(format!("slot {} holds no WAL after RESERVE_WAL", cfg.slot))
+        });
     }
     Err(Error::WalGone {
         requested: system.xlogpos,

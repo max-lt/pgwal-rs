@@ -521,6 +521,33 @@ async fn a_lost_slot_still_gets_the_store_into_the_archive() {
         objects_under(&cluster.path("archive")) > before,
         "the WAL of the store did not reach the archive"
     );
+
+    // A new archive with the lost slot: the receiver makes the slot again,
+    // and it holds WAL.
+    std::fs::remove_dir_all(cluster.path("store")).unwrap();
+    std::fs::remove_dir_all(cluster.path("archive")).unwrap();
+    let pgwal = cluster.receiver(&[]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status: Option<String> = client
+            .query_one(
+                "SELECT wal_status FROM pg_replication_slots WHERE slot_name = 'pgwal'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if status.as_deref() == Some("reserved") && objects_under(&cluster.path("archive")) > 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the slot stays {status:?}");
+        client
+            .batch_execute("SELECT pg_switch_wal()")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(pgwal.interrupt().success());
 }
 
 /// A slot made beforehand with `pg_create_physical_replication_slot` and its
