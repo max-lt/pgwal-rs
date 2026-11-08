@@ -151,10 +151,9 @@ pub async fn prepare(archive: &dyn WalSink, pgdata: &Path) -> Result<Prepared> {
     Ok(Prepared { start, plan })
 }
 
-/// Writes the WAL of `prepared` into the `pg_wal` of `pgdata`, asks for the
 /// The WAL objects of `segment`. Once a segment is whole, the receiver puts
 /// it as one object and deletes its parts, also after the plan listed them:
-/// a missing part then gives that object.
+/// a missing part then gives the planned range of that object.
 async fn segment_objects(
     archive: &dyn WalSink,
     segment: &Segment,
@@ -190,9 +189,13 @@ async fn segment_objects(
         })
         .with_context(|| format!("the archive lost WAL from {} to {}", first.start, last.end))?;
     let wal = archive::read(archive, &whole.to_string()).await?;
-    Ok(vec![(whole.start, whole.end, wal)])
+    // The replay ends where the plan says.
+    let at = |lsn: Lsn| (lsn.0 - whole.start.0) as usize;
+    let wal = wal.slice(at(first.start)..at(last.end));
+    Ok(vec![(first.start, last.end, wal)])
 }
 
+/// Writes the WAL of `prepared` into the `pg_wal` of `pgdata`, asks for the
 /// recovery that `after` says, and returns where the replay ends.
 pub async fn write(
     archive: &dyn WalSink,
@@ -317,15 +320,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let archive = DirSink::new(tmp.path());
         let whole = range(SEG, 2 * SEG);
-        let wal = Bytes::from(vec![5; SEG as usize]);
-        archive.put(&whole.to_string(), wal.clone()).await.unwrap();
+        let wal: Vec<u8> = (0..SEG).map(|i| i as u8).collect();
+        archive
+            .put(&whole.to_string(), Bytes::from(wal.clone()))
+            .await
+            .unwrap();
         let segment = Segment {
             timeline: 1,
             segno: 1,
             keys: vec![range(SEG, SEG + 100), range(SEG + 100, SEG + 300)],
         };
         let objects = segment_objects(&archive, &segment, SEG).await.unwrap();
-        assert_eq!(objects, [(whole.start, whole.end, wal)]);
+        assert_eq!(
+            objects,
+            [(Lsn(SEG), Lsn(SEG + 300), Bytes::from(wal[..300].to_vec()))]
+        );
 
         let gone = Segment {
             timeline: 1,
