@@ -45,6 +45,20 @@ const AUTH_SASL: i32 = 10;
 const AUTH_SASL_CONTINUE: i32 = 11;
 const AUTH_SASL_FINAL: i32 = 12;
 
+/// How to reach a server, as a role with `REPLICATION`.
+#[derive(Clone, Debug)]
+pub struct ConnConfig {
+    pub user: String,
+    /// For SCRAM-SHA-256. `None` when the server trusts `user`.
+    pub password: Option<String>,
+    /// The name `synchronous_standby_names` matches.
+    pub application_name: String,
+    /// Longest silence accepted from the server. An idle walsender sends a
+    /// keepalive after half of its `wal_sender_timeout` (60 s by default), so
+    /// this must be longer than that half.
+    pub idle_timeout: Duration,
+}
+
 pub struct SystemInfo {
     pub system_id: u64,
     pub timeline: u32,
@@ -94,24 +108,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// Opens a physical replication connection. Without `password`, the
     /// backend must trust `user`. With it, the backend can ask for
     /// SCRAM-SHA-256.
-    pub async fn connect(
-        stream: S,
-        user: &str,
-        password: Option<&str>,
-        application_name: &str,
-        idle_timeout: Duration,
-    ) -> Result<Self, Error> {
+    pub async fn connect(stream: S, cfg: &ConnConfig) -> Result<Self, Error> {
         let mut conn = Conn {
             stream,
             buf: BytesMut::with_capacity(256 * 1024),
-            idle_timeout,
+            idle_timeout: cfg.idle_timeout,
         };
         let mut out = BytesMut::new();
         frontend::startup_message(
             [
-                ("user", user),
+                ("user", cfg.user.as_str()),
                 ("replication", "true"),
-                ("application_name", application_name),
+                ("application_name", cfg.application_name.as_str()),
             ],
             &mut out,
         )?;
@@ -124,7 +132,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 b'R' => match take_i32(&mut body)? {
                     AUTH_OK => {}
                     AUTH_SASL => {
-                        let Some(password) = password else {
+                        let Some(password) = &cfg.password else {
                             return Err(protocol("backend asked for a password; none given"));
                         };
                         if !body[..]
@@ -200,6 +208,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     /// Creates the slot with its WAL reserved, unless it already exists.
     pub async fn ensure_physical_slot(&mut self, slot: &str) -> Result<(), Error> {
+        check_slot(slot)?;
         let sql = format!("CREATE_REPLICATION_SLOT {slot} PHYSICAL RESERVE_WAL");
         match self.simple_query(&sql).await {
             Err(Error::Db { code, .. }) if code == DUPLICATE_OBJECT => Ok(()),
@@ -209,6 +218,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     /// Drops the slot, if it exists.
     pub async fn drop_slot(&mut self, slot: &str) -> Result<(), Error> {
+        check_slot(slot)?;
         match self
             .simple_query(&format!("DROP_REPLICATION_SLOT {slot}"))
             .await
@@ -220,6 +230,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     /// `None` if the slot is missing or holds no WAL.
     pub async fn slot_restart_lsn(&mut self, slot: &str) -> Result<Option<Lsn>, Error> {
+        check_slot(slot)?;
         let row = self
             .single_row(&format!("READ_REPLICATION_SLOT {slot}"))
             .await?;
@@ -230,7 +241,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .transpose()
     }
 
-    /// The history file of `timeline`: `(file name, content)`.
     /// The content of the history file of `timeline`.
     pub async fn timeline_history(&mut self, timeline: u32) -> Result<String, Error> {
         let row = self
@@ -249,6 +259,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         start: Lsn,
         timeline: u32,
     ) -> Result<(), Error> {
+        check_slot(slot)?;
         self.send_query(&format!(
             "START_REPLICATION SLOT {slot} PHYSICAL {start} TIMELINE {timeline}"
         ))
@@ -542,6 +553,20 @@ fn parse_segment_size(value: &str) -> Result<u64, Error> {
 }
 
 /// The frame length field (which counts itself, not the tag), once buffered.
+/// Postgres' own rule for slot names. A name goes into a command as it is.
+pub(crate) fn check_slot(name: &str) -> Result<(), Error> {
+    let valid = (1..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if !valid {
+        return Err(Error::Config(format!(
+            "invalid replication slot name {name:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn frame_len(buf: &[u8]) -> Result<Option<usize>, Error> {
     let Some(len) = buf.get(1..5) else {
         return Ok(None);
@@ -700,6 +725,14 @@ fn unexpected(tag: u8, during: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_names() {
+        assert!(check_slot("pgwal_receiver").is_ok());
+        assert!(check_slot("").is_err());
+        assert!(check_slot("PgWal").is_err());
+        assert!(check_slot("x; DROP").is_err());
+    }
 
     #[test]
     fn segment_sizes() {

@@ -10,7 +10,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pgwal::assemble_segment;
-use pgwal_receiver::{Confirm, Error, Lsn, RangeKey, StreamConfig, WalSink, receive, salvage};
+use pgwal_receiver::{
+    Confirm, ConnConfig, Error, Lsn, RangeKey, StreamConfig, WalSink, receive, salvage,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -122,13 +124,15 @@ impl WalSink for DownSink {
 
 fn config(dir: &Path) -> StreamConfig {
     StreamConfig {
+        conn: ConnConfig {
+            user: "postgres".into(),
+            password: None,
+            application_name: "pgwal".into(),
+            idle_timeout: Duration::from_secs(5),
+        },
         slot: SLOT.into(),
-        user: "postgres".into(),
-        password: None,
-        application_name: "pgwal".into(),
         dir: dir.to_path_buf(),
         upload_every: Duration::from_millis(20),
-        idle_timeout: Duration::from_secs(5),
         confirm: Confirm::Flushed,
     }
 }
@@ -751,11 +755,8 @@ async fn a_hang_up_mid_stream_is_an_error_and_what_was_flushed_is_uploaded() {
 async fn a_silent_server_times_out() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(MemSink::default());
-    let cfg = StreamConfig {
-        idle_timeout: Duration::from_millis(300),
-        confirm: Confirm::Flushed,
-        ..config(tmp.path())
-    };
+    let mut cfg = config(tmp.path());
+    cfg.conn.idle_timeout = Duration::from_millis(300);
     let (task, mut server) = spawn_receiver(cfg, &sink);
     server.open().await;
     server.start(Some(Lsn(SEG))).await;

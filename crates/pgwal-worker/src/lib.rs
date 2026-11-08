@@ -9,7 +9,7 @@ use futures_util::future::{Either, select};
 use js_sys::Promise;
 use pgwal::{Lsn, RangeKey, history_key, timeline_start};
 use pgwal_receiver::Error as WireError;
-use pgwal_receiver::wire::{Conn, CopyMessage};
+use pgwal_receiver::wire::{Conn, ConnConfig, CopyMessage};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use wasm_bindgen::prelude::*;
@@ -471,14 +471,13 @@ impl Receiver {
             .secure_transport(SecureTransport::On)
             .allow_half_open(false)
             .connect(cfg.host.clone(), cfg.port)?;
-        let mut conn = Conn::connect(
-            socket,
-            &cfg.user,
-            Some(&cfg.password),
-            "pgwal-worker",
-            Duration::from_millis(IDLE_MS),
-        )
-        .await?;
+        let conn_cfg = ConnConfig {
+            user: cfg.user.clone(),
+            password: Some(cfg.password.clone()),
+            application_name: "pgwal-worker".into(),
+            idle_timeout: Duration::from_millis(IDLE_MS),
+        };
+        let mut conn = Conn::connect(socket, &conn_cfg).await?;
         let result = self.stream(&cfg, &mut conn, t0).await;
         let mut socket: Socket = conn.into_inner();
         let _ = socket.close().await;

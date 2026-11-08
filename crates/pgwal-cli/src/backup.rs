@@ -2,13 +2,12 @@ use std::collections::BTreeSet;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, Bytes};
 use clap::Args;
 use pgwal::{ArchivedBackup, RangeKey, backup_done_key, backup_part_key, parse_backup_done_key};
-use pgwal_receiver::{BackupConfig, base_backup};
+use pgwal_receiver::base_backup;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -42,15 +41,9 @@ pub struct BackupArgs {
 pub async fn run(args: BackupArgs) -> Result<()> {
     let tls = args.conn.tls()?;
     let sink = Archive::open(&args.archive, &args.s3)?.sink();
-    let cfg = BackupConfig {
-        user: args.conn.user.clone(),
-        password: std::env::var("PGPASSWORD").ok(),
-        application_name: args.application_name,
-        idle_timeout: Duration::from_secs(args.idle_timeout),
-        slot: args.slot,
-    };
+    let conn = args.conn.config(args.application_name, args.idle_timeout);
     let stream = args.conn.connect(tls.as_ref()).await?;
-    let backup = base_backup(stream, &cfg, sink).await?;
+    let backup = base_backup(stream, &conn, &args.slot, sink).await?;
     println!("{} {}", backup.start, backup.end);
     Ok(())
 }

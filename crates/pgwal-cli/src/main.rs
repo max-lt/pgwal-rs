@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
-use pgwal_receiver::{Confirm, Error, Lsn, StreamConfig, WalSink, receive};
+use pgwal_receiver::{Confirm, ConnConfig, Error, Lsn, StreamConfig, WalSink, receive};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::watch;
@@ -68,7 +68,7 @@ pub struct ConnArgs {
     #[arg(long, env = "PGPORT", default_value_t = 5432)]
     port: u16,
     #[arg(long, env = "PGUSER", default_value = "postgres")]
-    pub user: String,
+    user: String,
     /// TLS to the server. It applies to TCP only.
     #[arg(long, env = "PGSSLMODE", value_enum, default_value_t = SslMode::Disable)]
     sslmode: SslMode,
@@ -90,6 +90,16 @@ impl ConnArgs {
             );
         }
         tls::connector(self.sslmode, self.sslrootcert.as_deref())
+    }
+
+    /// The password comes from `PGPASSWORD`.
+    fn config(&self, application_name: String, idle_timeout: u64) -> ConnConfig {
+        ConnConfig {
+            user: self.user.clone(),
+            password: std::env::var("PGPASSWORD").ok(),
+            application_name,
+            idle_timeout: Duration::from_secs(idle_timeout),
+        }
     }
 
     pub async fn connect(&self, tls: Option<&TlsConnector>) -> std::io::Result<Box<dyn Io>> {
@@ -154,13 +164,10 @@ async fn main() -> Result<()> {
 async fn run_receive(args: ReceiveArgs) -> Result<()> {
     let tls = args.conn.tls()?;
     let cfg = StreamConfig {
+        conn: args.conn.config(args.application_name, args.idle_timeout),
         slot: args.slot,
-        user: args.conn.user.clone(),
-        password: std::env::var("PGPASSWORD").ok(),
-        application_name: args.application_name,
         dir: args.dir,
         upload_every: Duration::from_secs(args.upload_every),
-        idle_timeout: Duration::from_secs(args.idle_timeout),
         confirm: Confirm::Flushed,
     };
     let sink: Arc<dyn WalSink> = archive::Archive::open(&args.archive, &args.s3)?.sink();

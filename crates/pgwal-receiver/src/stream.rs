@@ -13,30 +13,20 @@ use tracing::{debug, info, warn};
 use crate::error::Error;
 use crate::store::{WalStore, read_flushed, remove_other_timelines};
 use crate::upload::{Uploader, WalSink, read_watermark, salvage};
-use crate::wire::{Conn, CopyMessage};
+use crate::wire::{Conn, ConnConfig, CopyMessage, check_slot};
 
 /// Longest delay before a flush while WAL keeps arriving.
 const MAX_FLUSH_DELAY: Duration = Duration::from_millis(100);
 
 pub struct StreamConfig {
+    pub conn: ConnConfig,
     /// Physical replication slot, created on first use.
     pub slot: String,
-    /// A role with `REPLICATION`.
-    pub user: String,
-    /// For SCRAM-SHA-256. `None` when the server trusts `user`.
-    pub password: Option<String>,
-    /// The name `synchronous_standby_names` matches.
-    pub application_name: String,
     /// One directory per cluster. One receiver at a time can use it.
     pub dir: PathBuf,
     /// Interval between two uploads to the sink. It bounds the WAL a host loss
     /// can take with it.
     pub upload_every: Duration,
-    /// Longest silence accepted from the server. An idle walsender sends a
-    /// keepalive after half of its `wal_sender_timeout` (60 s by default), so
-    /// this must be longer than that half, and the server must not set
-    /// `wal_sender_timeout` to 0.
-    pub idle_timeout: Duration,
     /// When the server may drop the WAL it sent.
     pub confirm: Confirm,
 }
@@ -77,14 +67,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     validate(cfg)?;
-    let mut conn = Conn::connect(
-        stream,
-        &cfg.user,
-        cfg.password.as_deref(),
-        &cfg.application_name,
-        cfg.idle_timeout,
-    )
-    .await?;
+    let mut conn = Conn::connect(stream, &cfg.conn).await?;
     let system = conn.identify_system().await?;
     let seg_size = conn.wal_segment_size().await?;
     conn.ensure_physical_slot(&cfg.slot).await?;
@@ -323,57 +306,22 @@ enum Drain {
     Answered,
 }
 
-/// Drops the slot of `cfg` on the server behind `stream`. After a
+/// Drops `slot` on the server behind `stream`, if it exists. After an
 /// [`Error::WalGone`], call it and clear the store directory: the next
 /// [`receive`] creates the slot again and starts at the server's position.
-pub async fn forget_slot<S>(stream: S, cfg: &StreamConfig) -> Result<(), Error>
+pub async fn forget_slot<S>(stream: S, conn: &ConnConfig, slot: &str) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    validate(cfg)?;
-    let mut conn = Conn::connect(
-        stream,
-        &cfg.user,
-        cfg.password.as_deref(),
-        &cfg.application_name,
-        cfg.idle_timeout,
-    )
-    .await?;
-    conn.drop_slot(&cfg.slot).await
+    Conn::connect(stream, conn).await?.drop_slot(slot).await
 }
 
 fn validate(cfg: &StreamConfig) -> Result<(), Error> {
-    if !valid_slot_name(&cfg.slot) {
-        return Err(Error::Config(format!(
-            "invalid replication slot name {:?}",
-            cfg.slot
-        )));
-    }
-    if cfg.upload_every.is_zero() || cfg.idle_timeout.is_zero() {
+    check_slot(&cfg.slot)?;
+    if cfg.upload_every.is_zero() || cfg.conn.idle_timeout.is_zero() {
         return Err(Error::Config(
             "upload_every and idle_timeout must be positive".into(),
         ));
     }
     Ok(())
-}
-
-/// Postgres' own rule for slot names.
-fn valid_slot_name(name: &str) -> bool {
-    (1..=63).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn slot_names() {
-        assert!(valid_slot_name("pgwal_receiver"));
-        assert!(!valid_slot_name(""));
-        assert!(!valid_slot_name("PgWal"));
-        assert!(!valid_slot_name("x; DROP"));
-    }
 }

@@ -14,16 +14,18 @@
 //! # async fn run(sink: std::sync::Arc<dyn pgwal_receiver::WalSink>) -> Result<(), Box<dyn std::error::Error>> {
 //! use std::time::Duration;
 //!
-//! use pgwal_receiver::{Confirm, Error, StreamConfig, receive};
+//! use pgwal_receiver::{Confirm, ConnConfig, Error, StreamConfig, receive};
 //!
 //! let cfg = StreamConfig {
+//!     conn: ConnConfig {
+//!         user: "replicator".into(),
+//!         password: None,
+//!         application_name: "pgwal".into(),
+//!         idle_timeout: Duration::from_secs(60),
+//!     },
 //!     slot: "pgwal".into(),
-//!     user: "replicator".into(),
-//!     password: None,
-//!     application_name: "pgwal".into(),
 //!     dir: "/var/lib/pgwal/db1".into(),
 //!     upload_every: Duration::from_secs(2),
-//!     idle_timeout: Duration::from_secs(60),
 //!     confirm: Confirm::Flushed,
 //! };
 //! loop {
@@ -54,11 +56,12 @@ mod upload;
 pub mod wire;
 
 #[cfg(feature = "runtime")]
-pub use backup::{BackupConfig, base_backup};
+pub use backup::base_backup;
 pub use error::Error;
 #[cfg(feature = "runtime")]
 pub use stream::{Confirm, StreamConfig, forget_slot, receive};
 #[cfg(feature = "runtime")]
 pub use upload::{WalSink, salvage};
+pub use wire::ConnConfig;
 
 pub use pgwal::{ArchivedBackup, Lsn, RangeKey};

@@ -2,7 +2,6 @@
 //! parts of at most 16 MiB.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use pgwal::{ArchivedBackup, Lsn, backup_done_key, backup_part_key};
@@ -11,58 +10,41 @@ use tracing::info;
 
 use crate::error::Error;
 use crate::upload::WalSink;
-use crate::wire::{BackupMessage, Conn};
+use crate::wire::{BackupMessage, Conn, ConnConfig};
 
 /// Largest part, so that memory stays bounded to one part.
 const PART_SIZE: usize = 16 << 20;
 
 const MANIFEST: &str = "backup_manifest";
 
-pub struct BackupConfig {
-    /// A role with `REPLICATION`.
-    pub user: String,
-    /// For SCRAM-SHA-256. `None` when the server trusts `user`.
-    pub password: Option<String>,
-    pub application_name: String,
-    /// Longest silence accepted from the server. It must cover the
-    /// checkpoint at the start of the backup.
-    pub idle_timeout: Duration,
-    /// The slot of [`receive`](crate::receive). It keeps the WAL of the
-    /// backup on the server until the archive has it.
-    pub slot: String,
-}
-
 /// Takes a base backup of the server behind `stream`, without its WAL, and
 /// writes it to `sink`.
 ///
 /// A restore needs the WAL from `start` to `end` of the result. Take the
-/// backup while [`receive`](crate::receive) streams `cfg.slot`. Without the
-/// slot, or with a slot that holds no WAL, the backup does not start: the
-/// error is [`Error::Config`].
+/// backup while [`receive`](crate::receive) streams `slot`, which keeps that
+/// WAL on the server until the archive has it. Without the slot, or with a
+/// slot that holds no WAL, the backup does not start: the error is
+/// [`Error::Config`].
+///
+/// The server sends nothing during the checkpoint at the start: give `conn`
+/// an idle timeout that covers it.
 ///
 /// The `done` object goes last. On an error, the parts written so far stay
 /// in the sink without it.
 pub async fn base_backup<S>(
     stream: S,
-    cfg: &BackupConfig,
+    conn: &ConnConfig,
+    slot: &str,
     sink: Arc<dyn WalSink>,
 ) -> Result<ArchivedBackup, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut conn = Conn::connect(
-        stream,
-        &cfg.user,
-        cfg.password.as_deref(),
-        &cfg.application_name,
-        cfg.idle_timeout,
-    )
-    .await?;
+    let mut conn = Conn::connect(stream, conn).await?;
     let system = conn.identify_system().await?;
-    if conn.slot_restart_lsn(&cfg.slot).await?.is_none() {
+    if conn.slot_restart_lsn(slot).await?.is_none() {
         return Err(Error::Config(format!(
-            "slot {} does not exist or holds no WAL: the WAL of a backup could leave the server",
-            cfg.slot
+            "slot {slot} does not exist or holds no WAL: the WAL of a backup could leave the server"
         )));
     }
     let begun = conn.start_base_backup().await?;
