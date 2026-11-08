@@ -55,7 +55,7 @@ pub(crate) async fn read_watermark(dir: &Path, timeline: u32) -> Result<Option<L
 
 /// Uploads the WAL that a receiver flushed in `dir` but did not upload, and
 /// returns where the sink holds the WAL of that store. `None` if `dir` holds
-/// no flushed WAL.
+/// no segment of the timeline it flushed.
 ///
 /// Call it on a stopped store before its server restarts from an image: the
 /// restarted server can write other WAL at the same LSNs.
@@ -95,6 +95,9 @@ pub(crate) struct Uploader {
     /// Objects that go up before the WAL, such as history files.
     pub(crate) pending: Vec<(String, Bytes)>,
     max_object: u64,
+    /// No WAL went up yet in this run: an earlier run can have left parts of
+    /// the first segment in the sink.
+    first_put: bool,
     /// At most one compaction runs next to the uploads: it bounds the memory
     /// to one segment.
     compaction: Option<tokio::task::JoinHandle<Result<(), Error>>>,
@@ -136,9 +139,16 @@ impl Uploader {
             .await?;
         // A mark from the start: on a full disk, the write in place of a
         // later one still passes, and frees the uploaded segments.
-        if watermark.metadata().await?.len() < MARK_LEN {
+        if watermark.metadata().await?.len() < MARK_LEN as u64 {
             write_mark(&mut watermark, timeline, uploaded).await?;
             sync_dir(&dir).await?;
+        }
+        // A crash between a mark and the removal of its segment leaves it.
+        for file in segment_files(&dir, seg_size).await? {
+            let up = (file.segno + 1) * seg_size <= uploaded.0;
+            if file.timeline == timeline && !file.partial && up {
+                fs::remove_file(file.path).await?;
+            }
         }
         Ok(Self {
             dir,
@@ -150,6 +160,7 @@ impl Uploader {
             watermark,
             pending: Vec::new(),
             max_object: crate::MAX_OBJECT as u64,
+            first_put: true,
             compaction: None,
         })
     }
@@ -203,7 +214,6 @@ impl Uploader {
             self.sink.put(key, data.clone()).await?;
             self.pending.remove(0);
         }
-        let before = self.uploaded;
         while self.uploaded < upto {
             let segno = self.uploaded.segment_no(self.seg_size);
             let end = upto
@@ -217,11 +227,16 @@ impl Uploader {
                 end,
             };
             self.sink.put(&key.to_string(), wal).await?;
+            let first_put = std::mem::replace(&mut self.first_put, false);
             self.uploaded = end;
             // Durable before any segment it covers is removed.
             write_mark(&mut self.watermark, self.timeline, self.uploaded).await?;
             if end.0 == (segno + 1) * self.seg_size {
-                self.start_compaction(segno).await;
+                // A segment that went up as one object has no parts to
+                // replace.
+                if key.start.0 != segno * self.seg_size || first_put {
+                    self.start_compaction(segno).await;
+                }
                 // At once, so a long backlog frees the disk as it goes up.
                 let path = self
                     .dir
@@ -231,9 +246,6 @@ impl Uploader {
                     _ => {}
                 }
             }
-        }
-        if self.uploaded > before {
-            self.remove_uploaded_segments().await?;
         }
         Ok(())
     }
@@ -289,16 +301,6 @@ impl Uploader {
             return Ok(wal.into());
         }
         Err(Error::Store(format!("segment {name} is not in the store")))
-    }
-
-    async fn remove_uploaded_segments(&self) -> Result<(), Error> {
-        for file in segment_files(&self.dir, self.seg_size).await? {
-            let uploaded = (file.segno + 1) * self.seg_size <= self.uploaded.0;
-            if file.timeline == self.timeline && !file.partial && uploaded {
-                fs::remove_file(file.path).await?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -364,6 +366,7 @@ mod tests {
         objects: Mutex<BTreeMap<String, Bytes>>,
         fail_first: AtomicUsize,
         fail_key: Mutex<Option<String>>,
+        lists: AtomicUsize,
     }
 
     #[async_trait]
@@ -386,6 +389,7 @@ mod tests {
         }
 
         async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
             let objects = self.objects.lock().unwrap();
             Ok(objects
                 .keys()
@@ -535,6 +539,28 @@ mod tests {
         uploader.upload_to(flushed).await.unwrap();
         assert_eq!(sink.keys()[0], key(SEG, 2 * SEG));
         assert_eq!(read_watermark(tmp.path(), 1).await.unwrap(), Some(flushed));
+    }
+
+    /// A segment that goes up as one object has no part to compact, except
+    /// the first one of a run: an earlier run can have left parts of it.
+    #[tokio::test]
+    async fn only_a_segment_with_parts_is_compacted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = WalStore::open(tmp.path().to_path_buf(), SYSTEM_ID, 1, SEG)
+            .await
+            .unwrap();
+        store.start_at(Lsn(SEG));
+        store
+            .write(Lsn(SEG), &vec![3; 3 * SEG as usize])
+            .await
+            .unwrap();
+        let flushed = store.flush().await.unwrap();
+        let sink = Arc::new(MemSink::default());
+        let mut uploader = uploader(tmp.path(), &sink).await;
+        uploader.upload_to(flushed).await.unwrap();
+        uploader.finish_compaction().await;
+        assert_eq!(sink.keys().len(), 3);
+        assert_eq!(sink.lists.load(Ordering::SeqCst), 1);
     }
 
     /// A long backlog frees each segment once it is up: the disk need not

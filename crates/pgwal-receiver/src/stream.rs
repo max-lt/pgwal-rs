@@ -342,14 +342,14 @@ async fn begin_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut slot_at = None;
+    let mut slot_cache = None;
     loop {
         let store = WalStore::open(cfg.dir.clone(), system.system_id, timeline, seg_size).await?;
         // Every start reads the slot, once the store is ours: Postgres 16 and
         // 17 stream from an invalidated slot too.
-        let slot_at = match slot_at {
+        let slot_at = match slot_cache {
             Some(lsn) => lsn,
-            None => *slot_at.insert(slot_position(conn, &cfg.slot, system.xlogpos).await?),
+            None => *slot_cache.insert(slot_position(conn, &cfg.slot, system.xlogpos).await?),
         };
         // What the store or the watermark holds moves the start forward,
         // and a start keeps its fallback.
