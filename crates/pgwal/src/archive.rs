@@ -21,6 +21,15 @@ impl std::fmt::Display for RangeKey {
 }
 
 impl RangeKey {
+    /// A key prefix of every range of `timeline` that starts in
+    /// `[start, start + len)`. `len` is a power of two, and `start` a
+    /// multiple of it. The prefix can match a few more ranges around.
+    pub fn prefix(system_id: u64, timeline: u32, start: Lsn, len: u64) -> String {
+        let varying = ((len - 1).ilog2() / 4 + 1) as usize;
+        let start = format!("{:016X}", start.0);
+        format!("{system_id}/{timeline:08X}/{}", &start[..16 - varying])
+    }
+
     /// Accepts only the exact form `Display` writes.
     pub fn parse(key: &str) -> Option<Self> {
         let (system_id, rest) = key.split_once('/')?;
@@ -218,6 +227,15 @@ mod tests {
         ] {
             assert_eq!(RangeKey::parse(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_prefix_matches_the_ranges_that_start_in_its_span() {
+        let prefix = RangeKey::prefix(SYSTEM_ID, 1, Lsn(0x100_0000), 0x100_0000);
+        assert_eq!(prefix, "7401/00000001/0000000001");
+        assert!(key(0x100_0000, 0x100_0148).starts_with(&prefix));
+        assert!(key(0x1FF_FF00, 0x200_0000).starts_with(&prefix));
+        assert!(!key(0x200_0000, 0x200_0100).starts_with(&prefix));
     }
 
     #[test]

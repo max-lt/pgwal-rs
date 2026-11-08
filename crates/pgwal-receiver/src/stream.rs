@@ -124,8 +124,8 @@ where
         .start_replication(&cfg.slot, start, system.timeline)
         .await
     {
-        // The first WAL of an old later timeline can be gone. Then the slot
-        // position is the earliest WAL left.
+        // A timeline that began long ago can have lost its first WAL. The
+        // slot position is then the earliest WAL left.
         Err(Error::WalGone { .. }) if first_wal_can_be_gone => {
             let fallback = slot_position(&mut conn, &cfg.slot, system.xlogpos)
                 .await?
@@ -213,7 +213,7 @@ impl Confirmed {
 
     /// Resolves when an upload ends. Never resolves once the uploader has
     /// stopped.
-    async fn uploaded(&mut self) {
+    async fn upload_ended(&mut self) {
         if self.uploaded.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
@@ -244,7 +244,7 @@ where
                     .await?;
                 continue;
             }
-            () = confirmed.uploaded(), if confirmed.confirm == Confirm::Uploaded => {
+            () = confirmed.upload_ended(), if confirmed.confirm == Confirm::Uploaded => {
                 conn.send_status(store.written(), confirmed.position(flushed), SystemTime::now())
                     .await?;
                 continue;
@@ -300,13 +300,12 @@ where
             }
         }
         if done {
-            conn.send_copy_done().await.ok();
-            return Ok(flushed);
+            break;
         }
     }
     let flushed = store.flush().await?;
     flushed_tx.send_replace(flushed);
-    // The server is going away; a failed goodbye changes nothing.
+    // A failed goodbye changes nothing: the server can be going away.
     conn.send_copy_done().await.ok();
     Ok(flushed)
 }

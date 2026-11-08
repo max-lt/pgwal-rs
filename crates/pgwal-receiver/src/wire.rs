@@ -46,7 +46,7 @@ const AUTH_SASL_CONTINUE: i32 = 11;
 const AUTH_SASL_FINAL: i32 = 12;
 
 /// How to reach a server, as a role with `REPLICATION`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ConnConfig {
     pub user: String,
     /// For SCRAM-SHA-256. `None` when the server trusts `user`.
@@ -57,6 +57,17 @@ pub struct ConnConfig {
     /// keepalive after half of its `wal_sender_timeout` (60 s by default), so
     /// this must be longer than that half.
     pub idle_timeout: Duration,
+}
+
+impl std::fmt::Debug for ConnConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnConfig")
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("application_name", &self.application_name)
+            .field("idle_timeout", &self.idle_timeout)
+            .finish()
+    }
 }
 
 /// One row of a result set, with `None` for NULL.
@@ -180,34 +191,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     }
 
     pub async fn identify_system(&mut self) -> Result<SystemInfo, Error> {
-        let row = self.single_row("IDENTIFY_SYSTEM").await?;
-        let col = |i: usize| {
-            row.get(i)
-                .cloned()
-                .flatten()
-                .ok_or_else(|| protocol("IDENTIFY_SYSTEM: missing column"))
-        };
+        const DURING: &str = "IDENTIFY_SYSTEM";
+        let row = self.single_row(DURING).await?;
         Ok(SystemInfo {
-            system_id: col(0)?
+            system_id: col(&row, 0, DURING)?
                 .parse()
                 .map_err(|_| protocol("IDENTIFY_SYSTEM: bad system id"))?,
-            timeline: col(1)?
+            timeline: col(&row, 1, DURING)?
                 .parse()
                 .map_err(|_| protocol("IDENTIFY_SYSTEM: bad timeline"))?,
-            xlogpos: col(2)?.parse().map_err(|e| protocol(format!("{e}")))?,
+            xlogpos: col(&row, 2, DURING)?
+                .parse()
+                .map_err(|e| protocol(format!("{e}")))?,
         })
     }
 
     pub async fn wal_segment_size(&mut self) -> Result<u64, Error> {
-        parse_segment_size(&self.show("wal_segment_size").await?)
-    }
-
-    async fn show(&mut self, setting: &str) -> Result<String, Error> {
-        let row = self.single_row(&format!("SHOW {setting}")).await?;
-        row.into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| protocol(format!("SHOW {setting}: no value")))
+        const DURING: &str = "SHOW wal_segment_size";
+        let row = self.single_row(DURING).await?;
+        parse_segment_size(col(&row, 0, DURING)?)
     }
 
     /// Creates the slot with its WAL reserved, unless it already exists.
@@ -239,21 +241,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .single_row(&format!("READ_REPLICATION_SLOT {slot}"))
             .await?;
         row.get(1)
-            .cloned()
-            .flatten()
+            .and_then(Option::as_deref)
             .map(|s| s.parse().map_err(|e| protocol(format!("{e}"))))
             .transpose()
     }
 
     /// The content of the history file of `timeline`.
     pub async fn timeline_history(&mut self, timeline: u32) -> Result<String, Error> {
-        let row = self
-            .single_row(&format!("TIMELINE_HISTORY {timeline}"))
-            .await?;
-        row.get(1)
-            .cloned()
-            .flatten()
-            .ok_or_else(|| protocol("TIMELINE_HISTORY: missing column"))
+        let sql = format!("TIMELINE_HISTORY {timeline}");
+        let row = self.single_row(&sql).await?;
+        Ok(col(&row, 1, &sql)?.to_owned())
     }
 
     /// The errors of missing WAL come back as [`Error::WalGone`].
@@ -268,27 +265,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             "START_REPLICATION SLOT {slot} PHYSICAL {start} TIMELINE {timeline}"
         ))
         .await?;
-        // After an error the server sends ReadyForQuery, and the connection
-        // takes another command.
-        let mut err = None;
-        loop {
-            let (tag, body) = self.read_frame().await?;
-            match tag {
-                b'W' => return Ok(()),
-                b'E' => err = Some(db_error(body)),
-                b'Z' => match err {
-                    Some(Error::Db { code, message }) if WAL_GONE.contains(&code.as_str()) => {
-                        return Err(Error::WalGone {
-                            requested: start,
-                            message,
-                        });
-                    }
-                    Some(e) => return Err(e),
-                    None => return Err(unexpected(tag, "START_REPLICATION")),
-                },
-                b'N' => {}
-                other => return Err(unexpected(other, "START_REPLICATION")),
+        match self.result_sets("START_REPLICATION", b'W').await {
+            Ok(_) => Ok(()),
+            Err(Error::Db { code, message }) if WAL_GONE.contains(&code.as_str()) => {
+                Err(Error::WalGone {
+                    requested: start,
+                    message,
+                })
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -531,7 +516,6 @@ fn parse_segment_size(value: &str) -> Result<u64, Error> {
     Ok(size)
 }
 
-/// The frame length field (which counts itself, not the tag), once buffered.
 /// Postgres' own rule for slot names. A name goes into a command as it is.
 pub(crate) fn check_slot(name: &str) -> Result<(), Error> {
     let valid = (1..=63).contains(&name.len())
@@ -546,6 +530,14 @@ pub(crate) fn check_slot(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Column `i` of `row`, which must not be NULL.
+fn col<'a>(row: &'a Row, i: usize, during: &str) -> Result<&'a str, Error> {
+    row.get(i)
+        .and_then(Option::as_deref)
+        .ok_or_else(|| protocol(format!("{during}: no column {i}")))
+}
+
+/// The frame length field (which counts itself, not the tag), once buffered.
 fn frame_len(buf: &[u8]) -> Result<Option<usize>, Error> {
     let Some(len) = buf.get(1..5) else {
         return Ok(None);

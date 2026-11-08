@@ -424,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_flush_records_its_position_and_a_torn_record_reads_as_none() {
+    async fn the_store_files_read_back_and_a_torn_flush_record_reads_as_none() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = open_store(tmp.path()).await;
         store.start_at(Lsn(SEG));

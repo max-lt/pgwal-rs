@@ -55,14 +55,9 @@ pub(crate) async fn read_watermark(dir: &Path, timeline: u32) -> Result<Option<L
     let (mark_timeline, lsn) = text.split_once(' ').ok_or_else(corrupt)?;
     let mark_timeline: u32 = mark_timeline.parse().map_err(|_| corrupt())?;
     let lsn: Lsn = lsn.parse().map_err(|_| corrupt())?;
-    if mark_timeline != timeline {
-        warn!(
-            mark_timeline,
-            timeline, "upload watermark belongs to another timeline"
-        );
-        return Ok(None);
-    }
-    Ok(Some(lsn))
+    // After a failover, the watermark holds the old timeline until the first
+    // upload on the new one.
+    Ok((mark_timeline == timeline).then_some(lsn))
 }
 
 /// Uploads the WAL that a receiver flushed in `dir` but did not upload, and
@@ -72,9 +67,6 @@ pub(crate) async fn read_watermark(dir: &Path, timeline: u32) -> Result<Option<L
 /// Call it on a stopped store before its server restarts from an image: the
 /// restarted server can write other WAL at the same LSNs.
 pub async fn salvage(dir: &Path, sink: Arc<dyn WalSink>) -> Result<Option<Lsn>, Error> {
-    if !fs::try_exists(dir).await? {
-        return Ok(None);
-    }
     let (Some(system_id), Some((timeline, flushed))) =
         (read_system_id(dir).await?, read_flushed(dir).await?)
     else {
@@ -293,28 +285,19 @@ impl Uploader {
 /// whole object goes up before the parts go: a crash between the two leaves
 /// overlapping objects with the same bytes.
 async fn compact(sink: Arc<dyn WalSink>, whole: RangeKey, wal: Bytes) -> Result<(), Error> {
-    // The parts start inside `whole`, so their keys share the hex digits of
-    // the start above its size. The listing stays a few segments long.
-    let varying = ((whole.end.0 - whole.start.0 - 1).ilog2() / 4 + 1) as usize;
-    let start = format!("{:016X}", whole.start.0);
-    let prefix = format!(
-        "{}/{:08X}/{}",
+    let prefix = RangeKey::prefix(
         whole.system_id,
         whole.timeline,
-        &start[..16 - varying]
+        whole.start,
+        whole.end.0 - whole.start.0,
     );
     let parts: Vec<String> = sink
         .list(&prefix)
         .await?
         .into_iter()
         .filter(|key| {
-            RangeKey::parse(key).is_some_and(|r| {
-                r.system_id == whole.system_id
-                    && r.timeline == whole.timeline
-                    && r.start >= whole.start
-                    && r.end <= whole.end
-                    && r != whole
-            })
+            RangeKey::parse(key)
+                .is_some_and(|r| r.start >= whole.start && r.end <= whole.end && r != whole)
         })
         .collect();
     if parts.is_empty() {

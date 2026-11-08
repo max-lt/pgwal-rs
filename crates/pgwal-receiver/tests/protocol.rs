@@ -111,28 +111,6 @@ impl WalSink for GateSink {
     }
 }
 
-/// An object store that is down.
-struct DownSink;
-
-#[async_trait]
-impl WalSink for DownSink {
-    async fn put(&self, _key: &str, _wal: Bytes) -> io::Result<()> {
-        Err(io::Error::other("object store down"))
-    }
-
-    async fn get(&self, _key: &str) -> io::Result<Option<Bytes>> {
-        Err(io::Error::other("object store down"))
-    }
-
-    async fn list(&self, _prefix: &str) -> io::Result<Vec<String>> {
-        Err(io::Error::other("object store down"))
-    }
-
-    async fn delete(&self, _keys: &[String]) -> io::Result<()> {
-        Err(io::Error::other("object store down"))
-    }
-}
-
 fn config(dir: &Path) -> StreamConfig {
     StreamConfig {
         conn: ConnConfig {
@@ -637,7 +615,13 @@ async fn a_restart_uploads_the_finished_segments_that_a_dead_run_kept() {
     };
     let cfg = config(tmp.path());
     let task = tokio::spawn(async move {
-        receive(client, &cfg, Arc::new(DownSink), std::future::pending()).await
+        receive(
+            client,
+            &cfg,
+            Arc::new(GateSink::default()),
+            std::future::pending(),
+        )
+        .await
     });
     server.open().await;
     server.start(Some(Lsn(SEG))).await;
@@ -672,7 +656,13 @@ async fn a_failover_uploads_then_removes_the_old_timeline() {
     };
     let cfg = config(tmp.path());
     let task = tokio::spawn(async move {
-        receive(client, &cfg, Arc::new(DownSink), std::future::pending()).await
+        receive(
+            client,
+            &cfg,
+            Arc::new(GateSink::default()),
+            std::future::pending(),
+        )
+        .await
     });
     server.open().await;
     server.start(Some(Lsn(SEG))).await;
@@ -931,7 +921,13 @@ async fn salvage_uploads_what_a_dead_run_flushed_but_never_uploaded() {
     };
     let cfg = config(tmp.path());
     let task = tokio::spawn(async move {
-        receive(client, &cfg, Arc::new(DownSink), std::future::pending()).await
+        receive(
+            client,
+            &cfg,
+            Arc::new(GateSink::default()),
+            std::future::pending(),
+        )
+        .await
     });
     server.open().await;
     server.start(Some(Lsn(SEG))).await;

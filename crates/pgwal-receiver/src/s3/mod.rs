@@ -3,9 +3,9 @@
 //! - Every request signs the SHA-256 of its body, so the server refuses a
 //!   body that changed on the way.
 //! - Every PUT carries `If-None-Match: *`, so a store that honors it, such
-//!   as AWS, R2 or MinIO, never overwrites an object. A key names one LSN range of one timeline of one system, so the same
-//!   key must hold the same bytes. On a 412, the client reads the object
-//!   back and fails unless the bytes are equal.
+//!   as AWS, R2 or MinIO, never overwrites an object. A key names its
+//!   content, so the same key holds the same bytes. On a 412, the client
+//!   reads the object back and fails unless the bytes are equal.
 //! - Paths are in the path style: `/bucket/key`.
 
 mod retry;
@@ -34,8 +34,6 @@ use crate::WalSink;
 const MAX_IN_FLIGHT: usize = 64;
 /// Deletes at one time, within `MAX_IN_FLIGHT`.
 const DELETES_IN_FLIGHT: usize = 16;
-/// Largest object read: the receiver writes none larger.
-const MAX_OBJECT: usize = crate::MAX_OBJECT;
 /// Largest list page or error body read. The store is not trusted.
 const MAX_SMALL: usize = 16 << 20;
 
@@ -344,23 +342,22 @@ impl S3Sink {
 
 #[async_trait]
 impl WalSink for S3Sink {
-    /// Stores `wal` at `key`, unless an object is there. An object with the
-    /// same bytes counts as stored: it is an earlier attempt of the same
-    /// upload.
-    async fn put(&self, key: &str, wal: Bytes) -> io::Result<()> {
+    /// An object with the same bytes at `key` counts as stored: it is an
+    /// earlier attempt of the same put.
+    async fn put(&self, key: &str, data: Bytes) -> io::Result<()> {
         let mut call = Call::new(Method::PUT, Some(key));
         call.headers.push(("if-none-match", "*"));
-        call.body = wal.clone();
+        call.body = data.clone();
         let reply = self.send(call).await?;
         match reply.status {
             status if status.is_success() => Ok(()),
             StatusCode::PRECONDITION_FAILED => match self.get(key).await? {
-                Some(stored) if stored == wal => Ok(()),
+                Some(stored) if stored == data => Ok(()),
                 Some(stored) => Err(io::Error::other(format!(
                     "{key} is in the store with other bytes ({} stored, {} new): \
-                     two writers disagree on this WAL",
+                     two writers disagree on this object",
                     stored.len(),
-                    wal.len()
+                    data.len()
                 ))),
                 None => Err(io::Error::other(format!(
                     "{key}: the store refused the write, then has no object there"
@@ -370,10 +367,9 @@ impl WalSink for S3Sink {
         }
     }
 
-    /// The object at `key`, or `None` if there is none.
     async fn get(&self, key: &str) -> io::Result<Option<Bytes>> {
         let mut call = Call::new(Method::GET, Some(key));
-        call.max_reply = MAX_OBJECT;
+        call.max_reply = crate::MAX_OBJECT;
         let reply = self.send(call).await?;
         match reply.status {
             status if status.is_success() => Ok(Some(reply.body)),
