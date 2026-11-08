@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::archive::ArchiveArgs;
 use crate::pg::{Bin, check_interrupted, path, watch_signals};
-use crate::restore::{self, OnGap};
+use crate::restore;
 use crate::server::{
     POLL, PgArgs, Role, canonical, check_version, controldata_field, private_dir, start_server,
     tail,
@@ -43,7 +43,12 @@ pub async fn run(mut args: RebaseArgs) -> Result<()> {
     check_version(&pg, &args.pgdata)?;
     let archive = args.archive.open()?;
     let t = Instant::now();
-    let prepared = restore::prepare(archive.as_ref(), &args.pgdata, OnGap::Refuse).await?;
+    let prepared = restore::prepare(archive.as_ref(), &args.pgdata).await?;
+    if let Some(gap) = prepared.plan.gap {
+        bail!(
+            "the archive has a gap at {gap}: a rebase needs the WAL up to the end of the archive"
+        );
+    }
     let end = prepared.plan.recovery.end().unwrap_or(prepared.start.from);
     // A standby accepts no connection before it is consistent. The check
     // comes before the download.

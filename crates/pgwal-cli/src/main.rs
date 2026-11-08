@@ -7,7 +7,6 @@ use clap::{Args, Parser, Subcommand};
 use pgwal_receiver::{Confirm, ConnConfig, Error, StreamConfig, WalSink, receive, salvage};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
@@ -73,11 +72,12 @@ pub struct ConnArgs {
     port: u16,
     #[arg(long, env = "PGUSER", default_value = "postgres")]
     user: String,
-    /// TLS to the server. It applies to TCP only.
-    #[arg(long, env = "PGSSLMODE", value_enum, default_value_t = SslMode::Disable)]
-    sslmode: SslMode,
-    /// PEM file of the CAs that `verify-full` trusts. Without it, it trusts
-    /// the Mozilla roots.
+    /// TLS to the server. It applies to TCP only. The default is `disable`,
+    /// or `verify-full` with `--sslrootcert`.
+    #[arg(long, env = "PGSSLMODE", value_enum)]
+    sslmode: Option<SslMode>,
+    /// PEM file of the CAs that `verify-full` trusts. Without it, or with
+    /// `system`, it trusts the Mozilla roots.
     #[arg(long, env = "PGSSLROOTCERT")]
     sslrootcert: Option<PathBuf>,
 }
@@ -104,11 +104,19 @@ impl ConnArgs {
     }
 
     pub async fn connect(&self, tls: Option<&TlsConnector>) -> std::io::Result<Box<dyn Io>> {
+        let at = |address: String| {
+            move |e: std::io::Error| std::io::Error::new(e.kind(), format!("{address}: {e}"))
+        };
         if self.host.starts_with('/') {
             let socket = PathBuf::from(&self.host).join(format!(".s.PGSQL.{}", self.port));
-            return Ok(Box::new(UnixStream::connect(socket).await?));
+            let stream = UnixStream::connect(&socket)
+                .await
+                .map_err(at(socket.display().to_string()))?;
+            return Ok(Box::new(stream));
         }
-        let stream = TcpStream::connect((self.host.as_str(), self.port)).await?;
+        let stream = TcpStream::connect((self.host.as_str(), self.port))
+            .await
+            .map_err(at(format!("{}:{}", self.host, self.port)))?;
         stream.set_nodelay(true)?;
         Ok(match tls {
             Some(tls) => Box::new(tls::connect(stream, tls, &self.host).await?),
@@ -177,14 +185,10 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
     let sink = args.archive.open()?;
 
     let (stop_tx, mut stop) = watch::channel(false);
-    let mut terminate = signal(SignalKind::terminate())?;
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
+    let stop_tx = Arc::new(stop_tx);
+    pg::on_stop_signal(move || {
         info!("stopping");
-        let _ = stop_tx.send(true);
+        stop_tx.send_replace(true);
     });
 
     let mut backoff = MIN_BACKOFF;
@@ -221,7 +225,18 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
                 info!(%lsn, "the server ended the stream");
                 backoff = MIN_BACKOFF;
             }
-            Err(e @ (Error::Config(_) | Error::SystemMismatch { .. } | Error::WalGone { .. })) => {
+            Err(e @ Error::WalGone { .. }) => {
+                final_upload(&cfg, &sink).await.context(e.to_string())?;
+                bail!(
+                    "{e}. The archive has the WAL of the store, up to a gap. To go on, drop \
+                     the slot {} with pg_drop_replication_slot, empty {}, start receive \
+                     again, and take a new base backup",
+                    cfg.slot,
+                    cfg.dir.display()
+                )
+            }
+            Err(e @ (Error::Config(_) | Error::SystemMismatch { .. })) => {
+                final_upload(&cfg, &sink).await.context(e.to_string())?;
                 bail!(e)
             }
             // A server that refuses TLS, or a certificate that fails the
@@ -247,8 +262,8 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
     }
 }
 
-/// Uploads what the store holds after a stop between two streams. A
-/// failure is the exit status: the WAL stays in the store.
+/// Uploads what the store holds when no stream runs. A failure is the exit
+/// status: the WAL stays in the store.
 async fn final_upload(cfg: &StreamConfig, sink: &Arc<dyn WalSink>) -> Result<()> {
     salvage(&cfg.dir, sink.clone())
         .await

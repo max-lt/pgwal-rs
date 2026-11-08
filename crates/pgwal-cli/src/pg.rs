@@ -14,9 +14,14 @@ use tokio::signal::unix::{SignalKind, signal};
 /// Set on a watched signal.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-/// Watches SIGINT, SIGTERM and SIGHUP, as of a closed ssh session. A signal
-/// that the process ignores, as nohup makes SIGHUP, stays ignored.
+/// Sets the flag of [`check_interrupted`] on a stop signal.
 pub fn watch_signals() {
+    on_stop_signal(|| INTERRUPTED.store(true, Ordering::SeqCst));
+}
+
+/// Calls `on` at SIGINT, SIGTERM or SIGHUP, as of a closed ssh session. A
+/// signal that the process ignores, as nohup makes SIGHUP, stays ignored.
+pub fn on_stop_signal(on: impl Fn() + Clone + Send + 'static) {
     for (kind, number) in [
         (SignalKind::interrupt(), libc::SIGINT),
         (SignalKind::terminate(), libc::SIGTERM),
@@ -26,9 +31,10 @@ pub fn watch_signals() {
             continue;
         }
         if let Ok(mut stream) = signal(kind) {
+            let on = on.clone();
             tokio::spawn(async move {
                 stream.recv().await;
-                INTERRUPTED.store(true, Ordering::SeqCst);
+                on();
             });
         }
     }

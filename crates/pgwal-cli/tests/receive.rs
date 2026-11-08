@@ -212,12 +212,39 @@ impl Receiver {
         );
         self.0.wait().unwrap()
     }
+
+    /// Waits for the command to end by itself.
+    fn wait(mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return status;
+            }
+            assert!(std::time::Instant::now() < deadline, "pgwal did not stop");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 impl Drop for Receiver {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// Sets the mode of `dir` and of the directories under it.
+fn set_mode(dir: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 }
 
@@ -377,7 +404,6 @@ async fn require_stops_on_a_server_without_tls() {
 /// the store. A stop of the command then fails, as its final upload does.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_with_wal_the_archive_lacks_fails() {
-    use std::os::unix::fs::PermissionsExt;
     let Some(bin) = pg_bin() else {
         eprintln!("skipping: postgres binaries not found");
         return;
@@ -394,19 +420,7 @@ async fn a_stop_with_wal_the_archive_lacks_fails() {
         assert!(Instant::now() < deadline, "no object reached the archive");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let set_mode = |mode: u32| {
-        let mut dirs = vec![cluster.path("archive")];
-        while let Some(dir) = dirs.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    dirs.push(path);
-                }
-            }
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
-        }
-    };
-    set_mode(0o500);
+    set_mode(&cluster.path("archive"), 0o500);
     client
         .batch_execute("INSERT INTO t SELECT generate_series(1, 100000)")
         .await
@@ -419,9 +433,92 @@ async fn a_stop_with_wal_the_archive_lacks_fails() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let status = pgwal.interrupt();
-    set_mode(0o700);
+    set_mode(&cluster.path("archive"), 0o700);
     assert!(
         !status.success(),
         "the stop passed with WAL left in the store"
+    );
+}
+
+/// The slot loses its WAL while the store holds WAL that the archive lacks.
+/// The next receive fails, but it uploads that WAL first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_slot_still_gets_the_store_into_the_archive() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let cluster = Cluster::start(bin, None);
+    let client = cluster.client().await;
+    let pgwal = cluster.receiver(&[]);
+    client
+        .batch_execute("CREATE TABLE t AS SELECT g FROM generate_series(1, 1000) g")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while objects_under(&cluster.path("archive")) == 0 {
+        assert!(Instant::now() < deadline, "no object reached the archive");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    set_mode(&cluster.path("archive"), 0o500);
+    client
+        .batch_execute("INSERT INTO t SELECT generate_series(1, 100000)")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let flushed: bool = client
+            .query_one(
+                "SELECT coalesce(bool_and(flush_lsn >= pg_current_wal_flush_lsn()), false) \
+                 FROM pg_stat_replication WHERE application_name = 'pgwal'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if flushed {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the store did not get the WAL");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!pgwal.interrupt().success());
+    set_mode(&cluster.path("archive"), 0o700);
+    let before = objects_under(&cluster.path("archive"));
+
+    for sql in [
+        "ALTER SYSTEM SET max_slot_wal_keep_size = '1MB'",
+        "SELECT pg_reload_conf()",
+    ] {
+        client.batch_execute(sql).await.unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        client
+            .batch_execute(
+                "INSERT INTO t SELECT generate_series(1, 10000); \
+                 SELECT pg_switch_wal(); CHECKPOINT",
+            )
+            .await
+            .unwrap();
+        let status: Option<String> = client
+            .query_one(
+                "SELECT wal_status FROM pg_replication_slots WHERE slot_name = 'pgwal'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if status.as_deref() == Some("lost") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the slot kept its WAL");
+    }
+
+    let status = cluster.receiver(&[]).wait(Duration::from_secs(30));
+    assert!(!status.success(), "receive passed on a lost slot");
+    assert!(
+        objects_under(&cluster.path("archive")) > before,
+        "the WAL of the store did not reach the archive"
     );
 }

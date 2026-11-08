@@ -32,12 +32,14 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
 - The password comes from `PGPASSWORD` only. The server can use trust, peer
   or SCRAM-SHA-256.
 - `--sslmode` (or `PGSSLMODE`) sets TLS on TCP:
-  - `disable` (default): no TLS. Use it on a Unix socket, `localhost` or an
-    encrypted private network only. Without TLS, the WAL, and so every row
-    the server writes, crosses the network in clear text.
-  - `require`: TLS, with no check of the server certificate. With
-    `--sslrootcert`, the command refuses to start.
-  - `verify-full`: TLS, with a check of the chain and of the host name.
+  - `disable` (default without `--sslrootcert`): no TLS. Use it on a Unix
+    socket, `localhost` or an encrypted private network only. Without TLS,
+    the WAL, and so every row the server writes, crosses the network in
+    clear text.
+  - `require`: TLS, with no check of the server certificate.
+  - `verify-full` (default with `--sslrootcert`): TLS, with a check of the
+    chain and of the host name. With `disable` or `require`, `--sslrootcert`
+    is an error.
     `--sslrootcert` (or `PGSSLROOTCERT`) gives a PEM file of the CAs to trust.
     Without it, or with `system` as in libpq, the command trusts the Mozilla
     roots. The server certificate needs the host name in its subjectAltName,
@@ -58,9 +60,13 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
 - The command reconnects after an error of the network or of the server.
   It stops on a wrong setting, on a store of another cluster, on WAL that
   the server no longer has, and on a server that refuses TLS.
-- It stops on Ctrl-C or SIGTERM, after it uploads the WAL it received. When
-  that upload fails, the exit status is not 0, and the WAL stays in the
-  store.
+- It stops on Ctrl-C, SIGTERM or SIGHUP. Before it stops, for a signal or
+  an error, it uploads the WAL that the store holds. When that upload
+  fails, the exit status is not 0, and the WAL stays in the store.
+- When the server no longer has the WAL, the archive has a gap. To go on,
+  drop the slot (`SELECT pg_drop_replication_slot('pgwal')`), empty
+  `--dir`, start `receive` again, and take a new base backup: a restore
+  cannot cross the gap.
 - Every command runs with umask 077: the archive and the store hold every
   row of the server, and only the user of the command reads them. `fetch`
   keeps the modes that the backup gives its files.

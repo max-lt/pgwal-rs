@@ -120,23 +120,23 @@ pub async fn apply(
     on_gap: OnGap,
     after: AfterReplay,
 ) -> Result<Lsn> {
-    let prepared = prepare(archive, pgdata, on_gap).await?;
-    write(archive, pgdata, prepared, after).await
-}
-
-/// Reads the copy and plans its replay from the archive.
-pub async fn prepare(archive: &dyn WalSink, pgdata: &Path, on_gap: OnGap) -> Result<Prepared> {
-    refuse_running(pgdata)?;
-    let start = replay_start(pgdata)?;
-    let keys = archive.list("").await?;
-    let switches = switches(archive, &keys, start.system_id).await?;
-    let plan = plan(keys.iter().map(String::as_str), &start, &switches);
-    if let Some(gap) = plan.gap {
+    let prepared = prepare(archive, pgdata).await?;
+    if let Some(gap) = prepared.plan.gap {
         if on_gap == OnGap::Refuse {
             bail!("the archive has a gap at {gap}; --accept-gap restores up to it");
         }
         warn!(%gap, "the archive has a gap: the replay stops there");
     }
+    write(archive, pgdata, prepared, after).await
+}
+
+/// Reads the copy and plans its replay from the archive.
+pub async fn prepare(archive: &dyn WalSink, pgdata: &Path) -> Result<Prepared> {
+    refuse_running(pgdata)?;
+    let start = replay_start(pgdata)?;
+    let keys = archive.list("").await?;
+    let switches = switches(archive, &keys, start.system_id).await?;
+    let plan = plan(keys.iter().map(String::as_str), &start, &switches);
     // The archive holds the segment of the start of any copy that it serves.
     // An empty plan is the archive of another cluster, or a wrong location.
     if plan.segments.is_empty() {

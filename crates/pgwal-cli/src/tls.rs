@@ -40,13 +40,19 @@ pub enum SslMode {
 
 /// The TLS connector for `mode`, or `None` for `disable`. `root_cert` is
 /// a PEM file of trusted CAs; without it, `verify-full` trusts the Mozilla
-/// roots.
-pub fn connector(mode: SslMode, root_cert: Option<&Path>) -> Result<Option<TlsConnector>> {
-    // libpq checks the certificate with require and a root file. Here
-    // require checks nothing, so the pair is refused.
-    if mode == SslMode::Require && root_cert.is_some() {
-        bail!("--sslrootcert needs --sslmode verify-full: require checks no certificate");
-    }
+/// roots. Without a mode, a root file gives `verify-full`, as
+/// `sslrootcert=system` does in libpq.
+pub fn connector(mode: Option<SslMode>, root_cert: Option<&Path>) -> Result<Option<TlsConnector>> {
+    let mode = match (mode, root_cert) {
+        (None, None) => SslMode::Disable,
+        (None, Some(_)) => SslMode::VerifyFull,
+        // A root file asks for a check of the certificate, which disable
+        // and require do not make.
+        (Some(SslMode::Disable | SslMode::Require), Some(_)) => {
+            bail!("--sslrootcert needs --sslmode verify-full")
+        }
+        (Some(mode), _) => mode,
+    };
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = || {
         ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions()
@@ -212,11 +218,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn require_with_a_root_file_is_refused() {
-        let root = Path::new("/etc/ssl/root.crt");
-        assert!(connector(SslMode::Require, Some(root)).is_err());
-        assert!(connector(SslMode::Require, None).unwrap().is_some());
-        assert!(connector(SslMode::Disable, Some(root)).unwrap().is_none());
-        assert!(connector(SslMode::Prefer, None).is_err());
+    fn a_root_file_asks_for_verify_full() {
+        let root = Path::new("system");
+        assert!(connector(None, None).unwrap().is_none());
+        assert!(connector(None, Some(root)).unwrap().is_some());
+        assert!(connector(Some(SslMode::Require), Some(root)).is_err());
+        assert!(connector(Some(SslMode::Disable), Some(root)).is_err());
+        assert!(connector(Some(SslMode::Require), None).unwrap().is_some());
+        assert!(connector(Some(SslMode::Prefer), None).is_err());
     }
 }
