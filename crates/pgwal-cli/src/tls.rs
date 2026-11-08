@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::pem::PemObject;
@@ -30,14 +30,20 @@ pub enum SslMode {
 /// a PEM file of trusted CAs; without it, `verify-full` trusts the Mozilla
 /// roots.
 pub fn connector(mode: SslMode, root_cert: Option<&Path>) -> Result<Option<TlsConnector>> {
+    // libpq checks the certificate with require and a root file. Here
+    // require checks nothing, so the pair is refused.
+    if mode == SslMode::Require && root_cert.is_some() {
+        bail!("--sslrootcert needs --sslmode verify-full: require checks no certificate");
+    }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()?;
+    let builder = || {
+        ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions()
+    };
     let mut config = match mode {
         SslMode::Disable => return Ok(None),
-        SslMode::Require => builder
+        SslMode::Require => builder()?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+            .with_custom_certificate_verifier(Arc::new(AnyCert(provider.clone())))
             .with_no_client_auth(),
         SslMode::VerifyFull => {
             let mut roots = RootCertStore::empty();
@@ -51,7 +57,9 @@ pub fn connector(mode: SslMode, root_cert: Option<&Path>) -> Result<Option<TlsCo
                 }
                 None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
             }
-            builder.with_root_certificates(roots).with_no_client_auth()
+            builder()?
+                .with_root_certificates(roots)
+                .with_no_client_auth()
         }
     };
     config.alpn_protocols = vec![b"postgresql".to_vec()];
@@ -136,5 +144,18 @@ impl ServerCertVerifier for AnyCert {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_with_a_root_file_is_refused() {
+        let root = Path::new("/etc/ssl/root.crt");
+        assert!(connector(SslMode::Require, Some(root)).is_err());
+        assert!(connector(SslMode::Require, None).unwrap().is_some());
+        assert!(connector(SslMode::Disable, Some(root)).unwrap().is_none());
     }
 }

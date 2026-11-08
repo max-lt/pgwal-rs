@@ -205,7 +205,7 @@ impl Setup {
     fn stop_with(&self, mut receiver: Child) {
         self.stop("data");
         Command::new("kill")
-            .args(["-INT", &receiver.id().to_string()])
+            .args(["-TERM", &receiver.id().to_string()])
             .status()
             .unwrap();
         assert!(receiver.wait().unwrap().success(), "pgwal receive failed");

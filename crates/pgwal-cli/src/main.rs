@@ -1,12 +1,12 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
-use pgwal_receiver::{Confirm, ConnConfig, Error, Lsn, StreamConfig, WalSink, receive};
+use pgwal_receiver::{Confirm, ConnConfig, Error, StreamConfig, receive};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
@@ -172,11 +172,14 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
     let sink = archive::open(&args.archive, &args.s3)?;
 
     let (stop_tx, mut stop) = watch::channel(false);
+    let mut terminate = signal(SignalKind::terminate())?;
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("stopping");
-            let _ = stop_tx.send(true);
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
         }
+        info!("stopping");
+        let _ = stop_tx.send(true);
     });
 
     let mut backoff = MIN_BACKOFF;
@@ -187,7 +190,11 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
                 let _ = stop.wait_for(|stopped| *stopped).await;
             }
         };
-        match receive_once(&args.conn, tls.as_ref(), &cfg, sink.clone(), stopped).await {
+        let received = match args.conn.connect(tls.as_ref()).await {
+            Ok(stream) => receive(stream, &cfg, sink.clone(), stopped).await,
+            Err(e) => Err(e.into()),
+        };
+        match received {
             Ok(lsn) if *stop.borrow() => {
                 info!(%lsn, "archived");
                 return Ok(());
@@ -208,15 +215,4 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
         }
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
-}
-
-async fn receive_once(
-    conn: &ConnArgs,
-    tls: Option<&TlsConnector>,
-    cfg: &StreamConfig,
-    sink: Arc<dyn WalSink>,
-    stop: impl Future<Output = ()>,
-) -> Result<Lsn, Error> {
-    let stream = conn.connect(tls).await?;
-    receive(stream, cfg, sink, stop).await
 }
