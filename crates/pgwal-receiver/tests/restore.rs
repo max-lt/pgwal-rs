@@ -16,7 +16,7 @@ use pgwal::{
     ArchiveKey, ClusterState, ControlFile, ReplayStart, assemble_segment, segment_file_name,
 };
 use pgwal_receiver::{
-    ArchivedBackup, Confirm, ConnConfig, DirSink, Error, Lsn, RangeKey, StreamConfig, WalSink,
+    ArchivedBackup, Confirm, ConnConfig, DirSink, Error, Lsn, OnGap, RangeKey, StreamConfig, WalSink,
     base_backup, forget_slot, receive,
 };
 use tokio::net::UnixStream;
@@ -784,11 +784,13 @@ fn stream_config(wal: &Path) -> StreamConfig {
         dir: wal.to_path_buf(),
         upload_every: Duration::from_millis(100),
         confirm: Confirm::Flushed,
+        on_gap: OnGap::Refuse,
     }
 }
 
 /// A slot past `max_slot_wal_keep_size` loses its WAL. The receiver reports
-/// the gap, `forget_slot` drops the slot, and the next stream starts again.
+/// the gap, `forget_slot` drops the slot, and the next stream, which accepts
+/// the gap, starts again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lost_slot_is_reported_then_recreated() {
     let Some(bin) = pg_bin() else {
@@ -876,7 +878,11 @@ async fn a_lost_slot_is_reported_then_recreated() {
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<Lsn>();
     let receiver = {
-        let (cfg, sink) = (stream_config(&wal), sink.clone());
+        let cfg = StreamConfig {
+            on_gap: OnGap::Accept,
+            ..stream_config(&wal)
+        };
+        let sink = sink.clone();
         let stream = UnixStream::connect(&socket).await.unwrap();
         tokio::spawn(async move { receive(stream, &cfg, sink, async { stop_rx.await.ok() }).await })
     };

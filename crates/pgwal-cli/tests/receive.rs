@@ -204,11 +204,13 @@ impl Drop for Cluster {
 struct Receiver(Child);
 
 impl Receiver {
-    fn interrupt(mut self) -> std::process::ExitStatus {
+    /// A shell ignores SIGINT for a command run in the background: SIGTERM
+    /// reaches it in every case.
+    fn terminate(mut self) -> std::process::ExitStatus {
         run(
             Path::new("/bin"),
             "kill",
-            &["-INT", &self.0.id().to_string()],
+            &["-TERM", &self.0.id().to_string()],
         );
         self.0.wait().unwrap()
     }
@@ -286,7 +288,7 @@ async fn archive_and_stop(cluster: &Cluster, mut pgwal: Receiver) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert_eq!(slot_active(&client).await, Some(true));
-    let status = pgwal.interrupt();
+    let status = pgwal.terminate();
     assert!(status.success(), "pgwal exited with {status}");
     // The archive holds every row: no other user reads it.
     assert_private(&cluster.path("archive"));
@@ -400,8 +402,10 @@ async fn require_stops_on_a_server_without_tls() {
     assert_eq!(slot_active(&cluster.client().await).await, None);
 }
 
-/// The archive refuses writes, and the server stops: its last WAL stays in
-/// the store. A stop of the command then fails, as its final upload does.
+/// The archive refuses writes. A clean stop of the server waits for the
+/// confirmation of its last WAL, which comes once the archive has it: the
+/// server stops after the command. The stop of the command fails, as its
+/// final upload does, and the WAL stays in the store.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_with_wal_the_archive_lacks_fails() {
     let Some(bin) = pg_bin() else {
@@ -426,17 +430,27 @@ async fn a_stop_with_wal_the_archive_lacks_fails() {
         .await
         .unwrap();
     drop(client);
-    let _ = Command::new(cluster.bin.join("pg_ctl"))
-        .args(["-D", cluster.path("data").to_str().unwrap()])
-        .args(["-m", "fast", "-w", "stop"])
-        .output();
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let pg_ctl = |args: &[&str]| {
+        Command::new(cluster.bin.join("pg_ctl"))
+            .args(["-D", cluster.path("data").to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+    };
+    let stopped = pg_ctl(&["-m", "fast", "-t", "3", "-w", "stop"]);
+    assert!(!stopped.success(), "the server stopped before the archive had its WAL");
 
-    let status = pgwal.interrupt();
+    let status = pgwal.terminate();
     set_mode(&cluster.path("archive"), 0o700);
     assert!(
         !status.success(),
         "the stop passed with WAL left in the store"
+    );
+    assert!(
+        pg_ctl(&["-t", "10", "-w", "stop"]).success()
+            || !cluster.path("data/postmaster.pid").exists(),
+        "the server still runs"
     );
 }
 
@@ -450,7 +464,7 @@ async fn a_lost_slot_still_gets_the_store_into_the_archive() {
     };
     let cluster = Cluster::start(bin, None);
     let client = cluster.client().await;
-    let pgwal = cluster.receiver(&[]);
+    let pgwal = cluster.receiver(&["--confirm", "flushed"]);
     client
         .batch_execute("CREATE TABLE t AS SELECT g FROM generate_series(1, 1000) g")
         .await
@@ -482,7 +496,7 @@ async fn a_lost_slot_still_gets_the_store_into_the_archive() {
         assert!(Instant::now() < deadline, "the store did not get the WAL");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(!pgwal.interrupt().success());
+    assert!(!pgwal.terminate().success());
     set_mode(&cluster.path("archive"), 0o700);
     let before = objects_under(&cluster.path("archive"));
 
@@ -547,7 +561,7 @@ async fn a_lost_slot_still_gets_the_store_into_the_archive() {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(pgwal.interrupt().success());
+    assert!(pgwal.terminate().success());
 }
 
 /// A slot made beforehand with `pg_create_physical_replication_slot` and its
@@ -583,5 +597,5 @@ async fn a_slot_made_with_sql_streams() {
         .unwrap()
         .get(0);
     assert!(restart.is_some(), "the slot reserves no WAL");
-    assert!(pgwal.interrupt().success());
+    assert!(pgwal.terminate().success());
 }

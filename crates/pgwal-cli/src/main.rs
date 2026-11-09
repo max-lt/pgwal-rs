@@ -1,10 +1,13 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
-use pgwal_receiver::{Confirm, ConnConfig, Error, StreamConfig, WalSink, receive, salvage};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use pgwal_receiver::{
+    Confirm, ConnConfig, Error, OnGap, StreamConfig, WalSink, receive, salvage,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::watch;
@@ -139,13 +142,29 @@ struct ReceiveArgs {
     dir: PathBuf,
     #[command(flatten)]
     archive: archive::ArchiveArgs,
-    /// Seconds between two uploads. A loss of this host loses at most that
-    /// much WAL.
+    /// Seconds between two uploads. With `--confirm flushed`, a loss of this
+    /// host loses at most that much WAL.
     #[arg(long, default_value_t = 2)]
     upload_every: u64,
+    /// When the server may drop the WAL it sent: once the archive has it, or
+    /// once the local store has it. `flushed` gives a synchronous standby
+    /// the latency of a local fsync.
+    #[arg(long, value_enum, default_value_t = ConfirmArg::Uploaded)]
+    confirm: ConfirmArg,
+    /// Start where the server can when it lacks the WAL that follows the
+    /// archive, and leave a gap in the archive. A slot that holds no WAL is
+    /// made again. Give it for one run, after a WAL gone error.
+    #[arg(long)]
+    accept_gap: bool,
     /// Longest silence accepted from the server, in seconds.
     #[arg(long, default_value_t = 60)]
     idle_timeout: u64,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum ConfirmArg {
+    Uploaded,
+    Flushed,
 }
 
 #[tokio::main]
@@ -161,6 +180,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
     match Cli::parse().cmd {
         Cmd::Receive(args) => run_receive(args).await,
@@ -180,7 +200,15 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
         slot: args.slot,
         dir: args.dir,
         upload_every: Duration::from_secs(args.upload_every),
-        confirm: Confirm::Flushed,
+        confirm: match args.confirm {
+            ConfirmArg::Uploaded => Confirm::Uploaded,
+            ConfirmArg::Flushed => Confirm::Flushed,
+        },
+        on_gap: if args.accept_gap {
+            OnGap::Accept
+        } else {
+            OnGap::Refuse
+        },
     };
     let sink = args.archive.open()?;
 
@@ -230,9 +258,8 @@ async fn run_receive(args: ReceiveArgs) -> Result<()> {
                 if matches!(e, Error::WalGone { .. }) {
                     bail!(
                         "{e}. The archive has the WAL of the store, up to a gap. To go on, \
-                         drop the slot {} with pg_drop_replication_slot, empty {}, start \
-                         receive again, and take a new base backup",
-                        cfg.slot,
+                         empty {}, start receive again with --accept-gap, and take a new \
+                         base backup",
                         cfg.dir.display()
                     )
                 }

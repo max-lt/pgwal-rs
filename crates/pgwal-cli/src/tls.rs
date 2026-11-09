@@ -143,6 +143,11 @@ pub async fn connect(
                 " It needs the host name in its subjectAltName."
             }
             CertificateError::UnknownIssuer => " --sslrootcert gives the CA that signed it.",
+            // rustls passes this webpki error on as text only.
+            CertificateError::Other(other) if other.to_string() == "CaUsedAsEndEntity" => {
+                " It is a CA certificate, as a self-signed certificate is: the server needs a \
+                 certificate that a CA signed, and --sslrootcert gives that CA."
+            }
             _ => "",
         };
         io::Error::other(TlsRefused(format!(
@@ -226,5 +231,47 @@ mod tests {
         assert!(connector(Some(SslMode::Disable), Some(root)).is_err());
         assert!(connector(Some(SslMode::Require), None).unwrap().is_some());
         assert!(connector(Some(SslMode::Prefer), None).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_self_signed_server_certificate_gets_a_hint() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rustls::pki_types::PrivateKeyDer;
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ca = tmp.path().join("ca.pem");
+        std::fs::write(&ca, cert.pem()).unwrap();
+
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.read_exact(&mut [0; 8]).await.unwrap();
+            stream.write_all(b"S").await.unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+            let _ = acceptor.accept(stream).await;
+        });
+
+        let connector = connector(Some(SslMode::VerifyFull), Some(&ca))
+            .unwrap()
+            .unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let err = connect(stream, &connector, "127.0.0.1").await.unwrap_err();
+        assert!(err.to_string().contains("a self-signed certificate"), "{err}");
     }
 }

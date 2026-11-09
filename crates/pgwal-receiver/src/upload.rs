@@ -16,7 +16,7 @@ use pgwal::{Lsn, RangeKey, segment_file_name};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::error::Error;
@@ -26,6 +26,8 @@ use crate::store::{
 };
 
 const WATERMARK_FILE: &str = "uploaded";
+/// Interval between two warnings while the uploads fail.
+const FAILURE_WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// Where the WAL goes. The receiver removes its local copy of an object once
 /// `put` returns: `put` returns only once the object is durable, and `list`
@@ -179,7 +181,7 @@ impl Uploader {
     ) -> Result<Lsn, Error> {
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut failing = false;
+        let mut warned: Option<Instant> = None;
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
@@ -194,14 +196,15 @@ impl Uploader {
                 moved
             });
             match result {
-                Ok(()) if failing => {
-                    failing = false;
-                    info!(uploaded = %self.uploaded, "WAL upload recovered");
+                Ok(()) => {
+                    if warned.take().is_some() {
+                        info!(uploaded = %self.uploaded, "WAL upload recovered");
+                    }
                 }
-                Ok(()) => {}
-                Err(e) if !failing => {
-                    failing = true;
-                    warn!(error = %e, "WAL upload failed; retrying");
+                Err(e) if warned.is_none_or(|at| at.elapsed() >= FAILURE_WARN_EVERY) => {
+                    warned = Some(Instant::now());
+                    let lag_bytes = upto.0.saturating_sub(self.uploaded.0);
+                    warn!(error = %e, lag_bytes, "WAL upload failed; retrying");
                 }
                 Err(e) => debug!(error = %e, "WAL upload still failing"),
             }

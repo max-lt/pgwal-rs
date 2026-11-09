@@ -1,7 +1,7 @@
 //! A [`WalSink`] in a local directory.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -28,17 +28,7 @@ impl WalSink for DirSink {
     /// leaves a partial object under its key.
     async fn put(&self, key: &str, data: Bytes) -> io::Result<()> {
         let path = self.root.join(key);
-        let dir = path.parent().expect("a key has a parent directory");
-        let name = path.file_name().expect("a key has a file name");
-        fs::create_dir_all(dir).await?;
-        let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
-        let mut file = fs::File::create(&tmp).await?;
-        file.write_all(&data).await?;
-        // The write ends on a blocking thread: only a flush gives its error.
-        file.flush().await?;
-        file.sync_all().await?;
-        fs::rename(&tmp, &path).await?;
-        fs::File::open(dir).await?.sync_all().await
+        write_durably(&path, &data).await.map_err(at(&path))
     }
 
     async fn get(&self, key: &str) -> io::Result<Option<Bytes>> {
@@ -55,10 +45,11 @@ impl WalSink for DirSink {
         let mut keys = Vec::new();
         let mut dirs = vec![start.to_string()];
         while let Some(dir) = dirs.pop() {
-            let mut entries = match fs::read_dir(self.root.join(&dir)).await {
+            let path = self.root.join(&dir);
+            let mut entries = match fs::read_dir(&path).await {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
+                Err(e) => return Err(at(&path)(e)),
             };
             while let Some(entry) = entries.next_entry().await? {
                 let name = entry.file_name();
@@ -90,6 +81,24 @@ impl WalSink for DirSink {
         }
         Ok(())
     }
+}
+
+async fn write_durably(path: &Path, data: &[u8]) -> io::Result<()> {
+    let dir = path.parent().expect("a key has a parent directory");
+    let name = path.file_name().expect("a key has a file name");
+    fs::create_dir_all(dir).await?;
+    let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
+    let mut file = fs::File::create(&tmp).await?;
+    file.write_all(data).await?;
+    // The write ends on a blocking thread: only a flush gives its error.
+    file.flush().await?;
+    file.sync_all().await?;
+    fs::rename(&tmp, path).await?;
+    fs::File::open(dir).await?.sync_all().await
+}
+
+fn at(path: &Path) -> impl FnOnce(io::Error) -> io::Error + '_ {
+    move |e| io::Error::new(e.kind(), format!("{}: {e}", path.display()))
 }
 
 #[cfg(test)]

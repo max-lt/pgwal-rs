@@ -14,7 +14,7 @@
 //! # async fn run(sink: std::sync::Arc<dyn pgwal_receiver::WalSink>) -> Result<(), Box<dyn std::error::Error>> {
 //! use std::time::Duration;
 //!
-//! use pgwal_receiver::{Confirm, ConnConfig, Error, StreamConfig, receive};
+//! use pgwal_receiver::{Confirm, ConnConfig, Error, OnGap, StreamConfig, receive};
 //!
 //! let cfg = StreamConfig {
 //!     conn: ConnConfig {
@@ -26,7 +26,8 @@
 //!     slot: "pgwal".into(),
 //!     dir: "/var/lib/pgwal/db1".into(),
 //!     upload_every: Duration::from_secs(2),
-//!     confirm: Confirm::Flushed,
+//!     confirm: Confirm::Uploaded,
+//!     on_gap: OnGap::Refuse,
 //! };
 //! loop {
 //!     let stream = tokio::net::TcpStream::connect("db1.example:5432").await?;
@@ -63,7 +64,7 @@ pub use backup::base_backup;
 pub use dir::DirSink;
 pub use error::Error;
 #[cfg(feature = "runtime")]
-pub use stream::{Confirm, StreamConfig, forget_slot, receive};
+pub use stream::{Confirm, OnGap, StreamConfig, forget_slot, receive};
 #[cfg(feature = "runtime")]
 pub use upload::{WalSink, salvage};
 pub use wire::ConnConfig;

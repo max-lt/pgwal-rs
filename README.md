@@ -57,16 +57,31 @@ PGPASSWORD=... pgwal receive --host db.example --user replicator \
   `synchronous_standby_names` matches.
 - `--upload-every` (default 2 s) sets the upload interval. `--idle-timeout`
   (default 60 s) is the longest silence accepted from the server.
+- `--confirm` sets when the server can drop the WAL it sent:
+  - `uploaded` (default): once the archive has it. The slot keeps the WAL
+    until then, so a loss of this host loses no WAL. A synchronous standby
+    waits for the next upload. A clean stop of the server waits for the
+    upload of its last WAL: while the archive refuses writes, the server
+    stops once the command stops.
+  - `flushed`: once the store has it on disk. A loss of this host loses the
+    WAL of one upload interval at most. Use it when
+    `synchronous_standby_names` names the command.
 - The command reconnects after an error of the network or of the server.
   It stops on a wrong setting, on a store of another cluster, on WAL that
   the server no longer has, and on a server that refuses TLS.
 - It stops on Ctrl-C, SIGTERM or SIGHUP. Before it stops, for a signal or
   an error, it uploads the WAL that the store holds. When that upload
   fails, the exit status is not 0, and the WAL stays in the store.
-- When the server no longer has the WAL, the archive has a gap. To go on,
-  drop the slot (`SELECT pg_drop_replication_slot('pgwal')`), empty
-  `--dir`, start `receive` again, and take a new base backup: a restore
-  cannot cross the gap.
+- When the server no longer has the WAL that follows the archive, the
+  command stops: the archive would have a gap, and a restore cannot cross
+  it. To go on, empty `--dir`, run `receive` once with `--accept-gap`, and
+  take a new base backup. With `--accept-gap`, a slot that holds no WAL is
+  made again. An archive with no WAL of the cluster has no gap: the command
+  starts where the server can.
+- After a failover, point `--host` at the new primary. The command makes the
+  slot there at its first connection, and goes on with the new timeline.
+  The new primary keeps no WAL for the command before that connection: a
+  late start can find the WAL gone, which is a gap.
 - Every command runs with umask 077: the archive and the store hold every
   row of the server, and only the user of the command reads them. `fetch`
   keeps the modes that the backup gives its files.
@@ -139,7 +154,7 @@ pg_ctl -D /restore/data start
   promotion at the end of the replay: wait for `pg_is_in_recovery()` to be
   false. A crash recovery accepts no connection until its end.
 - The replay goes to the end of the archive. There is no target time.
-- The command prints the LSN where the replay ends.
+- The command prints the end of the archived WAL that the replay reads.
 - With `--standby`, Postgres replays the archive as a standby and does not
   promote. It connects to no primary: the command clears `primary_conninfo`
   and `primary_slot_name` of the copy. A copy of the data directory after a
@@ -194,7 +209,7 @@ without a new `pg_basebackup` of the primary.
 
 ```sh
 pgwal rebase --archive /var/lib/pgwal/archive --pgdata /backups/2026-11-06 \
-  --pg-bin /usr/lib/postgresql/18/bin
+  --pg-bin /usr/lib/postgresql/18/bin --user postgres
 ```
 
 - The command writes the WAL into the copy, starts a Postgres on it as a

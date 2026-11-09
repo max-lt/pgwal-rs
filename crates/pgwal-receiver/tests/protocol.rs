@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pgwal::assemble_segment;
 use pgwal_receiver::{
-    Confirm, ConnConfig, Error, Lsn, RangeKey, StreamConfig, WalSink, receive, salvage,
+    Confirm, ConnConfig, Error, Lsn, OnGap, RangeKey, StreamConfig, WalSink, receive, salvage,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::oneshot;
@@ -143,6 +143,7 @@ fn config(dir: &Path) -> StreamConfig {
         dir: dir.to_path_buf(),
         upload_every: Duration::from_millis(20),
         confirm: Confirm::Flushed,
+        on_gap: OnGap::Refuse,
     }
 }
 
@@ -465,6 +466,7 @@ async fn confirm_uploaded_holds_the_flush_until_the_sink_has_the_wal() {
     let sink = Arc::new(GateSink::default());
     let cfg = StreamConfig {
         confirm: Confirm::Uploaded,
+        on_gap: OnGap::Refuse,
         ..config(tmp.path())
     };
     let (client, server) = tokio::io::duplex(4 << 20);
@@ -986,12 +988,9 @@ async fn an_empty_store_streams_the_tail_of_the_parent_timeline() {
     assert_eq!(reached, Some(Lsn(0x300A00)));
 }
 
-/// An empty store, and the server no longer has the rest of the parent
-/// timeline after the end of the sink. The archive has a gap there, and the
-/// stream follows the timeline of the server on the same connection.
-#[tokio::test]
-async fn a_gone_parent_tail_falls_back_to_the_timeline_of_the_server() {
-    let tmp = tempfile::tempdir().unwrap();
+/// A sink with WAL of timeline 1, and a server on timeline 2 that no longer
+/// has the rest of timeline 1.
+async fn a_gone_parent_tail(cfg: StreamConfig) -> (JoinHandle<Result<Lsn, Error>>, Walsender) {
     let sink = Arc::new(MemSink::default());
     let held = RangeKey {
         system_id: 7401,
@@ -1003,7 +1002,7 @@ async fn a_gone_parent_tail_falls_back_to_the_timeline_of_the_server() {
         .lock()
         .unwrap()
         .insert(held.to_string(), Bytes::from(pattern(4096, 1)));
-    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    let (task, mut server) = spawn_receiver(cfg, &sink);
     server.open_on(2).await;
     assert!(
         server
@@ -1015,6 +1014,27 @@ async fn a_gone_parent_tail_falls_back_to_the_timeline_of_the_server() {
         .error("58P01", "requested WAL segment has already been removed")
         .await;
     server.ready().await;
+    (task, server)
+}
+
+#[tokio::test]
+async fn a_gone_parent_tail_is_wal_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (task, _server) = a_gone_parent_tail(config(tmp.path())).await;
+    let err = finish(task).await.unwrap_err();
+    assert!(matches!(err, Error::WalGone { .. }), "{err}");
+}
+
+/// With the gap accepted, the stream follows the timeline of the server on
+/// the same connection.
+#[tokio::test]
+async fn an_accepted_gone_parent_tail_falls_back_to_the_timeline_of_the_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = StreamConfig {
+        on_gap: OnGap::Accept,
+        ..config(tmp.path())
+    };
+    let (task, mut server) = a_gone_parent_tail(cfg).await;
     let query = server.expect_query().await;
     assert!(query.ends_with("PHYSICAL 0/300000 TIMELINE 2"), "{query}");
     server.send(b'W', &[0, 0, 0]).await;
@@ -1057,13 +1077,17 @@ async fn an_empty_store_starts_after_what_the_sink_holds() {
 }
 
 /// A store on timeline 1 past the switch point, after a failover. The new
-/// server recycled the first segment of timeline 2 since its promotion: the
-/// stream starts at the slot, not with WalGone.
+/// server recycled the first segment of timeline 2 since its promotion: with
+/// the gap accepted, the stream starts at the slot.
 #[tokio::test]
 async fn a_store_past_the_switch_falls_back_to_the_slot_of_the_new_server() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(MemSink::default());
-    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    let cfg = || StreamConfig {
+        on_gap: OnGap::Accept,
+        ..config(tmp.path())
+    };
+    let (task, mut server) = spawn_receiver(cfg(), &sink);
     server.open().await;
     server.start(Some(Lsn(SEG))).await;
     let end = server
@@ -1073,7 +1097,7 @@ async fn a_store_past_the_switch_falls_back_to_the_slot_of_the_new_server() {
     server.end().await;
     finish(task).await.unwrap();
 
-    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    let (task, mut server) = spawn_receiver(cfg(), &sink);
     server.open_on(2).await;
     assert!(
         server

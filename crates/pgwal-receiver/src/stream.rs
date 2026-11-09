@@ -20,6 +20,7 @@ use crate::wire::{
 /// Longest delay before a flush while WAL keeps arriving.
 const MAX_FLUSH_DELAY: Duration = Duration::from_millis(100);
 
+#[derive(Clone)]
 pub struct StreamConfig {
     pub conn: ConnConfig,
     /// Physical replication slot, created on first use.
@@ -31,6 +32,20 @@ pub struct StreamConfig {
     pub upload_every: Duration,
     /// When the server may drop the WAL it sent.
     pub confirm: Confirm,
+    /// What a start does when the server lacks the WAL that follows the
+    /// sink.
+    pub on_gap: OnGap,
+}
+
+/// What a start does when the WAL between the sink and the server is gone,
+/// as after an invalidated slot. A sink with no WAL of the system has no gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnGap {
+    /// The start fails with [`Error::WalGone`].
+    Refuse,
+    /// The stream starts where the server can, and the sink keeps a gap. A
+    /// slot that holds no WAL is made again.
+    Accept,
 }
 
 /// The position the receiver reports to the server as flushed. The slot keeps
@@ -155,7 +170,7 @@ where
 /// Postgres 16 and 17 still stream from it with no WAL kept: WalGone. Or it
 /// was made without reserved WAL, as `pg_create_physical_replication_slot`
 /// makes it by default. With no WAL of the system in the store or the sink,
-/// no WAL can be missing: the slot is made again with its WAL reserved.
+/// or with [`OnGap::Accept`], the slot is made again with its WAL reserved.
 async fn slot_position<S>(
     conn: &mut Conn<S>,
     cfg: &StreamConfig,
@@ -168,12 +183,8 @@ where
     if let Some(lsn) = conn.slot_restart_lsn(&cfg.slot).await? {
         return Ok(lsn);
     }
-    let new = read_flushed(&cfg.dir).await?.is_none()
-        && sink
-            .list(&ArchiveKey::wal_prefix(system.system_id))
-            .await?
-            .is_empty();
-    if new {
+    let new = read_flushed(&cfg.dir).await?.is_none() && !archived(sink, system).await?;
+    if new || cfg.on_gap == OnGap::Accept {
         // An invalidated slot stays lost after a stream sets its position,
         // and holds no WAL: only a new slot does.
         info!(slot = %cfg.slot, "the slot holds no WAL; it is made again with its WAL reserved");
@@ -190,6 +201,11 @@ where
             cfg.slot
         ),
     })
+}
+
+async fn archived(sink: &dyn WalSink, system: &SystemInfo) -> Result<bool, Error> {
+    let keys = sink.list(&ArchiveKey::wal_prefix(system.system_id)).await?;
+    Ok(!keys.is_empty())
 }
 
 /// The end of the WAL of `timeline` in the sink.
@@ -408,12 +424,20 @@ where
             },
         };
         conn.ready().await?;
+        let gap = archived(sink.as_ref(), system).await?;
+        if gap && cfg.on_gap == OnGap::Refuse {
+            return Err(gone);
+        }
         match resolved {
             // A timeline that began long ago can have lost its first WAL. The
             // slot position is then the earliest WAL left.
             Start::Begin(begin) => {
                 let fallback = slot_at.max(begin).segment_start(seg_size);
-                warn!(%from, %fallback, "the WAL at the start is gone; the archive has a gap up to the slot");
+                if gap {
+                    warn!(%from, %fallback, "the WAL at the start is gone; the archive has a gap up to the slot");
+                } else {
+                    info!(%from, %fallback, "the WAL at the start is gone; the archive starts at the slot");
+                }
                 conn.start_replication(&cfg.slot, fallback, timeline)
                     .await?;
                 return Ok((store, timeline, fallback, None));
