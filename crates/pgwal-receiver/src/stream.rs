@@ -291,9 +291,9 @@ async fn stored_start(
     }
     let Some(at) = switches.iter().position(|(tl, _)| *tl == old) else {
         // Another branch of the history: its WAL goes up, and the stream
-        // follows the server.
+        // goes on after what the sink holds of the history of the server.
         keep_only(dir, sink, system.timeline, seg_size).await?;
-        return Ok((system.timeline, server_floor(switches, None)));
+        return empty_store_start(system, switches, sink.as_ref()).await;
     };
     // The new server can have recycled this WAL since its promotion: the
     // starts keep their fallbacks.

@@ -1588,3 +1588,95 @@ async fn salvage_uploads_what_a_dead_run_flushed_but_never_uploaded() {
         None
     );
 }
+
+/// A run that dies after it began to rewrite the unfinished segment, and
+/// before its first flush. The flushed position of the run before it must
+/// not make the salvage upload the bytes of the new file.
+#[tokio::test]
+async fn salvage_after_a_rewrite_that_died_uploads_only_real_wal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal = pattern((SEG + SEG / 2) as usize, 7);
+    for rewrite in [false, true] {
+        let (client, server) = tokio::io::duplex(4 << 20);
+        let mut server = Walsender {
+            io: server,
+            buf: BytesMut::new(),
+        };
+        let cfg = config(tmp.path());
+        let task = tokio::spawn(async move {
+            receive(
+                client,
+                &cfg,
+                Arc::new(GateSink::default()),
+                std::future::pending(),
+            )
+            .await
+        });
+        server.open().await;
+        let query = server.start(Some(Lsn(SEG))).await;
+        if rewrite {
+            assert!(query.ends_with("PHYSICAL 0/200000 TIMELINE 1"), "{query}");
+            // The announced end is far: the flush waits.
+            server
+                .stream_announcing(Lsn(2 * SEG), &wal[SEG as usize..][..100], Lsn(9 * SEG))
+                .await;
+        } else {
+            let end = server.stream(Lsn(SEG), &wal).await;
+            server.await_flush(end).await;
+        }
+        drop(server);
+        assert!(finish(task).await.is_err(), "the run dies");
+    }
+
+    let sink = Arc::new(MemSink::default());
+    salvage(tmp.path(), sink.clone()).await.unwrap();
+    for (start, end, bytes) in sink.ranges() {
+        let at = |lsn: Lsn| (lsn.0 - SEG) as usize;
+        assert_eq!(
+            &bytes[..],
+            &wal[at(start)..at(end)],
+            "the object {start}-{end} holds other bytes than the WAL"
+        );
+    }
+}
+
+/// The store is on timeline 2, a branch that the server on timeline 3 never
+/// had. Timeline 3 began on timeline 1 after the WAL that the sink holds of
+/// it: the stream goes on with the rest of timeline 1.
+#[tokio::test]
+async fn a_store_on_another_branch_streams_the_tail_of_the_common_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = Arc::new(MemSink::default());
+
+    // Timeline 1 up to 0/300A00, then timeline 2 from there.
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open().await;
+    server.start(Some(Lsn(SEG))).await;
+    let old = pattern((0x300A00 - SEG) as usize, 1);
+    let end = server.stream(Lsn(SEG), &old).await;
+    server.await_flush(end).await;
+    server.end().await;
+    finish(task).await.unwrap();
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server.open_on(2).await;
+    server.start(Some(Lsn(3 * SEG))).await;
+    let end = server
+        .stream(Lsn(3 * SEG), &pattern(SEG as usize / 2, 2))
+        .await;
+    server.await_flush(end).await;
+    server.end().await;
+    finish(task).await.unwrap();
+
+    // Timeline 3 began on timeline 1 at 0/600000.
+    let (task, mut server) = spawn_receiver(config(tmp.path()), &sink);
+    server
+        .open_with(3, "1\t0/600000\tno recovery target specified\n")
+        .await;
+    let query = server.start(Some(Lsn(6 * SEG))).await;
+    assert!(
+        query.ends_with("PHYSICAL 0/300000 TIMELINE 1"),
+        "the WAL of timeline 1 from 0/300A00 to 0/600000 is in no object: {query}"
+    );
+    drop(server);
+    finish(task).await.ok();
+}

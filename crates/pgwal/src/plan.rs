@@ -104,7 +104,8 @@ pub struct ReplayPlan {
 /// describes: its timeline from the segment of `start.from`, then each
 /// later timeline. `switches` are the lines of the newest history file,
 /// from [`timeline_switches`](crate::timeline_switches): a timeline needs
-/// its WAL up to its switch point only. The replay stops at the first gap
+/// its WAL up to its switch point only, and a later timeline that the file
+/// does not list is left out. The replay stops at the first gap
 /// and promotes, as a server that went on from the gap writes other WAL at
 /// the LSNs after it.
 pub fn plan<'a>(
@@ -129,6 +130,18 @@ pub fn plan<'a>(
             }) if system_id == start.system_id => histories.push(timeline),
             _ => {}
         }
+    }
+    // The replay follows the newest history file. A later timeline that it
+    // does not list is another branch: its WAL is not on the way.
+    let newest = (histories.iter().copied())
+        .chain(ranges.iter().map(|r| r.timeline))
+        .max();
+    if !switches.is_empty() {
+        ranges.retain(|r| {
+            r.timeline == start.timeline
+                || Some(r.timeline) == newest
+                || switches.iter().any(|(tl, _)| *tl == r.timeline)
+        });
     }
     let chain_from = if start.has_start_segment {
         start.from
@@ -438,5 +451,23 @@ mod tests {
                 end: Lsn(SEG + 0x200)
             }
         );
+    }
+
+    #[test]
+    fn a_timeline_off_the_history_does_not_hide_a_gap() {
+        // Timeline 2 is a branch that timeline 3 never had: timeline 3 began
+        // on timeline 1 at 3 * SEG + 0x80. The WAL of timeline 1 after
+        // SEG + 0x200 is missing.
+        let keys = [
+            key(1, SEG, SEG + 0x200),
+            key(2, SEG, 5 * SEG),
+            key(3, 3 * SEG, 3 * SEG + 0x100),
+            "7/00000002.history".to_owned(),
+            "7/00000003.history".to_owned(),
+        ];
+        let switches = [(1, Lsn(3 * SEG + 0x80))];
+        let plan = plan(keys.iter().map(String::as_str), &start(), &switches);
+        assert_eq!(plan.gap, Some(Lsn(SEG + 0x200)));
+        assert!(plan.segments.iter().all(|s| s.timeline == 1));
     }
 }
