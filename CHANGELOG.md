@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.1
+
+No change of the public API.
+
+- `pgwal`: `plan` leaves out a later timeline that the newest history file
+  does not list. The WAL of such a branch hid a gap of its parent, and the
+  plan gave an end that the replay did not reach.
+- `pgwal-receiver`: a store on a timeline that the server never had starts
+  after the WAL that the sink holds on the history of the server. It
+  started the timeline of the server at its begin, and left a gap on the
+  parent without a `WalGone` error.
+
 ## 0.5.0
 
 ### Breaking

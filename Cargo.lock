@@ -725,14 +725,14 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pgwal"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "pgwal-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "pgwal-receiver"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "bytes",
