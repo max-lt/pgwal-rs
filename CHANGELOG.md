@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.2
+
+The public API grows. No item changes.
+
+- `pgwal`: `RecoveryTarget` and `request_recovery_to`: the replay stops at
+  an LSN or at a time, then Postgres promotes.
+- `pgwal`: `request_recovery` clears a recovery target that the copy holds.
+- `pgwal-cli`: `restore --target-lsn` and `restore --target-time`.
+- `pgwal-cli`: `fetch --target-lsn` and `fetch --target-time` take the
+  latest backup that a restore to the target can use.
+
 ## 0.5.1
 
 No change of the public API.
