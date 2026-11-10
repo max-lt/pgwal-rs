@@ -439,7 +439,10 @@ async fn a_stop_with_wal_the_archive_lacks_fails() {
             .status
     };
     let stopped = pg_ctl(&["-m", "fast", "-t", "3", "-w", "stop"]);
-    assert!(!stopped.success(), "the server stopped before the archive had its WAL");
+    assert!(
+        !stopped.success(),
+        "the server stopped before the archive had its WAL"
+    );
 
     let status = pgwal.terminate();
     set_mode(&cluster.path("archive"), 0o700);

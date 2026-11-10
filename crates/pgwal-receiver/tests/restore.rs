@@ -16,8 +16,8 @@ use pgwal::{
     ArchiveKey, ClusterState, ControlFile, ReplayStart, assemble_segment, segment_file_name,
 };
 use pgwal_receiver::{
-    ArchivedBackup, Confirm, ConnConfig, DirSink, Error, Lsn, OnGap, RangeKey, StreamConfig, WalSink,
-    base_backup, forget_slot, receive,
+    ArchivedBackup, Confirm, ConnConfig, DirSink, Error, Lsn, OnGap, RangeKey, StreamConfig,
+    WalSink, base_backup, forget_slot, receive,
 };
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;

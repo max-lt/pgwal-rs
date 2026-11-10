@@ -272,6 +272,9 @@ mod tests {
             .unwrap();
         let stream = TcpStream::connect(addr).await.unwrap();
         let err = connect(stream, &connector, "127.0.0.1").await.unwrap_err();
-        assert!(err.to_string().contains("a self-signed certificate"), "{err}");
+        assert!(
+            err.to_string().contains("a self-signed certificate"),
+            "{err}"
+        );
     }
 }

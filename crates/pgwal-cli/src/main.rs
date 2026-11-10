@@ -5,9 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use pgwal_receiver::{
-    Confirm, ConnConfig, Error, OnGap, StreamConfig, WalSink, receive, salvage,
-};
+use pgwal_receiver::{Confirm, ConnConfig, Error, OnGap, StreamConfig, WalSink, receive, salvage};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::watch;
