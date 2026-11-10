@@ -19,6 +19,7 @@ mod pg;
 mod rebase;
 mod restore;
 mod server;
+mod target;
 mod tls;
 mod verify;
 

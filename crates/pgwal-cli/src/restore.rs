@@ -7,13 +7,14 @@ use clap::Args;
 use futures_util::{StreamExt, TryStreamExt};
 use pgwal::{
     AfterReplay, ArchiveKey, Lsn, RangeKey, Recovery, ReplayPlan, ReplayStart, Segment, plan,
-    request_recovery, timeline_switches, write_history, write_segment,
+    request_recovery, request_recovery_to, timeline_switches, write_history, write_segment,
 };
 use tracing::{info, warn};
 
 use pgwal_receiver::WalSink;
 
 use crate::archive::{self, ArchiveArgs};
+use crate::target::{Target, TargetArgs};
 
 /// Segments fetched at the same time, and objects of one segment. They bound
 /// a restore to 64 reads in flight and 4 segments in memory.
@@ -34,8 +35,10 @@ pub struct RestoreArgs {
     /// Start as a standby that stays in recovery, on the timeline of the
     /// archive, instead of a server that promotes. A copy of it after a
     /// clean stop is a new base backup.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["target_lsn", "target_time"])]
     standby: bool,
+    #[command(flatten)]
+    target: TargetArgs,
 }
 
 /// What a restore does at a gap of the archive.
@@ -60,7 +63,15 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
     } else {
         AfterReplay::Promote
     };
-    let end = apply(archive.as_ref(), &args.pgdata, on_gap, after).await?;
+    let target = args.target.target()?;
+    let end = apply(
+        archive.as_ref(),
+        &args.pgdata,
+        on_gap,
+        after,
+        target.as_ref(),
+    )
+    .await?;
     println!("{end}");
     Ok(())
 }
@@ -123,15 +134,27 @@ pub async fn apply(
     pgdata: &Path,
     on_gap: OnGap,
     after: AfterReplay,
+    target: Option<&Target>,
 ) -> Result<Lsn> {
     let prepared = prepare(archive, pgdata).await?;
+    if let Some(Target::Lsn(lsn)) = target {
+        let (from, end) = (prepared.start.from, prepared.end);
+        if *lsn <= from {
+            bail!(
+                "the target {lsn} is not after {from}, the start of the copy: use an earlier copy"
+            );
+        }
+        if *lsn > end {
+            bail!("the target {lsn} is after {end}, the end of the archived WAL");
+        }
+    }
     if let Some(gap) = prepared.plan.gap {
         if on_gap == OnGap::Refuse {
             bail!("the archive has a gap at {gap}; --accept-gap restores up to it");
         }
         warn!(%gap, "the archive has a gap: the replay stops there");
     }
-    write(archive, pgdata, prepared, after).await
+    write(archive, pgdata, prepared, after, target).await
 }
 
 /// Reads the copy and plans its replay from the archive.
@@ -219,12 +242,14 @@ async fn segment_objects(
 }
 
 /// Writes the WAL of `prepared` into the `pg_wal` of `pgdata`, asks for the
-/// recovery that `after` says, and returns where the replay ends.
+/// recovery that `after` says, and returns the end of the WAL written. With
+/// `target`, the replay stops there and promotes.
 pub async fn write(
     archive: &dyn WalSink,
     pgdata: &Path,
     prepared: Prepared,
     after: AfterReplay,
+    target: Option<&Target>,
 ) -> Result<Lsn> {
     let Prepared { start, plan, end } = prepared;
     let pg_wal = pgdata.join("pg_wal");
@@ -260,9 +285,13 @@ pub async fn write(
 
     // A copy of a standby starts as a standby unless its standby.signal
     // goes, and promotes through an archive recovery.
-    let archive_recovery =
-        matches!(plan.recovery, Recovery::Archive { .. }) || pgdata.join("standby.signal").exists();
-    if after == AfterReplay::StayStandby || archive_recovery {
+    // Postgres takes a target in an archive recovery only.
+    let archive_recovery = target.is_some()
+        || matches!(plan.recovery, Recovery::Archive { .. })
+        || pgdata.join("standby.signal").exists();
+    if let Some(target) = target {
+        request_recovery_to(pgdata, &target.recovery())?;
+    } else if after == AfterReplay::StayStandby || archive_recovery {
         request_recovery(pgdata, after)?;
     }
     info!(
@@ -273,6 +302,7 @@ pub async fn write(
         histories = plan.histories.len(),
         archive_recovery,
         ?after,
+        ?target,
         "WAL written to pg_wal; start Postgres to replay it"
     );
     Ok(end)

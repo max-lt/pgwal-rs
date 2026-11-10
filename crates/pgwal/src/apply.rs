@@ -72,9 +72,77 @@ pub enum AfterReplay {
     StayStandby,
 }
 
+/// Where the replay of a restore stops, before the end of the archive.
+/// Postgres then promotes to an unused timeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryTarget {
+    /// After the record that ends at this LSN or first passes it.
+    Lsn(Lsn),
+    /// After the last transaction that committed up to this time, in a form
+    /// that Postgres reads as `timestamptz`, such as `2026-11-10 14:03:00+00`.
+    /// Postgres refuses the zone `Z` here.
+    Time(String),
+}
+
+/// A line of `postgresql.auto.conf` that a restore wants.
+enum Setting<'a> {
+    Is(&'a str, String),
+    /// Empty, when the file gives the setting a value.
+    Clear(&'a str),
+}
+
 /// Makes the next start of Postgres an archive recovery that reads the WAL
-/// already in `pg_wal`. Safe to call twice.
+/// already in `pg_wal`, up to its end. It clears a recovery target that the
+/// copy holds. Safe to call twice.
 pub fn request_recovery(data_dir: &Path, after: AfterReplay) -> io::Result<()> {
+    let mut settings = vec![
+        Setting::Clear("recovery_target_lsn"),
+        Setting::Clear("recovery_target_time"),
+    ];
+    // A standby of a copy made with pg_basebackup -R, or of a standby, would
+    // stream from the live primary.
+    if after == AfterReplay::StayStandby {
+        settings.push(Setting::Is("primary_conninfo", String::new()));
+        settings.push(Setting::Is("primary_slot_name", String::new()));
+    }
+    request(data_dir, after, settings)
+}
+
+/// As [`request_recovery`] with [`AfterReplay::Promote`], but the replay
+/// stops at `target`. Postgres does not start when the WAL in `pg_wal` ends
+/// before the target, or when the target is before the point where the copy
+/// is consistent.
+pub fn request_recovery_to(data_dir: &Path, target: &RecoveryTarget) -> io::Result<()> {
+    // Postgres refuses a second target, even an empty one, after the first:
+    // the other one is cleared before.
+    let (name, other, value) = match target {
+        RecoveryTarget::Lsn(lsn) => (
+            "recovery_target_lsn",
+            "recovery_target_time",
+            lsn.to_string(),
+        ),
+        RecoveryTarget::Time(time) => {
+            // The value goes between quotes into a configuration file.
+            let plain = |c: char| c.is_ascii_alphanumeric() || " :+-./".contains(c);
+            if time.is_empty() || !time.chars().all(plain) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("the target time {time:?} is not a plain timestamp"),
+                ));
+            }
+            ("recovery_target_time", "recovery_target_lsn", time.clone())
+        }
+    };
+    let settings = vec![
+        Setting::Clear(other),
+        Setting::Is(name, value),
+        // The default pauses the replay at the target.
+        Setting::Is("recovery_target_action", "promote".into()),
+    ];
+    request(data_dir, AfterReplay::Promote, settings)
+}
+
+fn request(data_dir: &Path, after: AfterReplay, mut settings: Vec<Setting>) -> io::Result<()> {
     // Postgres takes standby.signal over recovery.signal, and a copy of a
     // standby holds one.
     let (signal, other) = match after {
@@ -86,17 +154,8 @@ pub fn request_recovery(data_dir: &Path, after: AfterReplay) -> io::Result<()> {
         _ => {}
     }
     std::fs::write(data_dir.join(signal), b"")?;
-    // Postgres reads the WAL in pg_wal when the restore command fails. A
-    // standby of a copy made with pg_basebackup -R, or of a standby, would
-    // stream from the live primary: the later lines win.
-    let settings: &[&str] = match after {
-        AfterReplay::Promote => &["restore_command = 'false'"],
-        AfterReplay::StayStandby => &[
-            "restore_command = 'false'",
-            "primary_conninfo = ''",
-            "primary_slot_name = ''",
-        ],
-    };
+    // Postgres reads the WAL in pg_wal when the restore command fails.
+    settings.insert(0, Setting::Is("restore_command", "false".into()));
     let path = data_dir.join("postgresql.auto.conf");
     let mut text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -104,18 +163,25 @@ pub fn request_recovery(data_dir: &Path, after: AfterReplay) -> io::Result<()> {
         Err(e) => return Err(e),
     };
     let before = text.len();
-    for setting in settings {
-        let name = setting.split('=').next().unwrap_or_default().trim();
+    // The later lines win.
+    for setting in &settings {
+        let (name, value, wanted) = match setting {
+            Setting::Is(name, value) => (*name, value.as_str(), true),
+            Setting::Clear(name) => (*name, "", false),
+        };
+        let line = format!("{name} = '{value}'");
         let last = text
             .lines()
             .rfind(|line| line.split('=').next().is_some_and(|n| n.trim() == name));
-        if last.is_some_and(|line| line.trim() == *setting) {
-            continue;
+        match last {
+            Some(last) if last.trim() == line => continue,
+            None if !wanted => continue,
+            _ => {}
         }
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
-        text.push_str(setting);
+        text.push_str(&line);
         text.push('\n');
     }
     if text.len() == before {
@@ -187,5 +253,41 @@ mod tests {
             std::fs::read_to_string(&conf).unwrap(),
             "work_mem = '4MB'\nrestore_command = 'false'\n"
         );
+    }
+
+    #[test]
+    fn a_target_is_written_and_a_later_request_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("postgresql.auto.conf");
+        let read = || std::fs::read_to_string(&conf).unwrap();
+        std::fs::write(dir.path().join("standby.signal"), b"").unwrap();
+
+        request_recovery_to(dir.path(), &RecoveryTarget::Lsn(Lsn(0x300_0148))).unwrap();
+        assert!(dir.path().join("recovery.signal").exists());
+        assert!(!dir.path().join("standby.signal").exists());
+        assert_eq!(
+            read(),
+            "restore_command = 'false'\nrecovery_target_lsn = '0/3000148'\n\
+             recovery_target_action = 'promote'\n"
+        );
+
+        // One target at a time: Postgres refuses two.
+        let time = RecoveryTarget::Time("2026-11-10 14:03:00+00".into());
+        request_recovery_to(dir.path(), &time).unwrap();
+        request_recovery_to(dir.path(), &time).unwrap();
+        let text = read();
+        assert!(text.ends_with(
+            "recovery_target_lsn = ''\nrecovery_target_time = '2026-11-10 14:03:00+00'\n"
+        ));
+
+        request_recovery(dir.path(), AfterReplay::Promote).unwrap();
+        assert!(
+            read().ends_with("recovery_target_time = ''\n"),
+            "{}",
+            read()
+        );
+
+        let quote = RecoveryTarget::Time("2026' x".into());
+        assert!(request_recovery_to(dir.path(), &quote).is_err());
     }
 }

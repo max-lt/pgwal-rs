@@ -9,7 +9,10 @@ mod control;
 mod lsn;
 mod plan;
 
-pub use apply::{AfterReplay, request_recovery, segment_size, write_history, write_segment};
+pub use apply::{
+    AfterReplay, RecoveryTarget, request_recovery, request_recovery_to, segment_size,
+    write_history, write_segment,
+};
 pub use archive::{ArchiveKey, RangeKey, assemble_segment, timeline_start, timeline_switches};
 pub use backup::{ArchivedBackup, BackupLabel};
 pub use control::{ClusterState, ControlFile};

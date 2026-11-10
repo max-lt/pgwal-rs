@@ -66,6 +66,7 @@ pub async fn run(mut args: RebaseArgs) -> Result<()> {
         &args.pgdata,
         prepared,
         AfterReplay::StayStandby,
+        None,
     )
     .await?;
     info!(

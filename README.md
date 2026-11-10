@@ -153,7 +153,8 @@ pg_ctl -D /restore/data start
   consistent, which is when `pg_ctl start -w` returns. Writes wait for the
   promotion at the end of the replay: wait for `pg_is_in_recovery()` to be
   false. A crash recovery accepts no connection until its end.
-- The replay goes to the end of the archive. There is no target time.
+- The replay goes to the end of the archive, or to a target: see
+  [Restore to a point in time](#restore-to-a-point-in-time).
 - The command prints the end of the archived WAL that the replay reads.
 - With `--standby`, Postgres replays the archive as a standby and does not
   promote. It connects to no primary: the command clears `primary_conninfo`
@@ -201,6 +202,38 @@ pg_ctl -D /restore/data start
   `backup_manifest` in the directory. `pg_verifybackup -n` checks the files.
 - `pgwal fetch` refuses a backup with tablespaces.
 - The library function is `pgwal_receiver::base_backup`.
+
+### Restore to a point in time
+
+`pgwal restore` and `pgwal fetch` take a target: the replay stops there, and
+Postgres promotes to a new timeline.
+
+```sh
+pgwal fetch --archive s3://wal/db1/ --pgdata /restore/data \
+  --target-time 2026-11-10T14:03:00Z
+pgwal restore --archive s3://wal/db1/ --pgdata /restore/data \
+  --target-time 2026-11-10T14:03:00Z
+pg_ctl -D /restore/data start
+```
+
+- `--target-time` is in RFC 3339 with a zone: `2026-11-10T14:03:00Z` or
+  `2026-11-10T15:03:00+01:00`. The replay keeps the transactions that
+  committed up to that time.
+- `--target-lsn` is an LSN, such as `0/3000148`. The replay stops after the
+  record that ends there.
+- `pgwal fetch` takes the latest backup that the target can use: one that
+  ends at or before `--target-lsn`, or one that started before
+  `--target-time`. It reads the start time in the backup manifest.
+- A copy is consistent at the end of its backup. When the target time is
+  between the start and the end of the backup, Postgres does not start:
+  fetch the backup before it, with an earlier `--target-time`, then restore
+  with the target.
+- Postgres does not start when the archive ends before the target.
+  `pgwal restore` refuses a `--target-lsn` after the end of the archive, or
+  not after the start of the copy.
+- `--standby` does not take a target.
+- A receiver that then streams the restored server archives its new
+  timeline next to the old one. A later restore follows the new timeline.
 
 ### Rebase
 

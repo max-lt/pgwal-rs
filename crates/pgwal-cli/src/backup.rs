@@ -15,6 +15,8 @@ use tracing::{info, warn};
 
 use crate::ConnArgs;
 use crate::archive::{self, ArchiveArgs};
+use crate::target::Target;
+use crate::target::TargetArgs;
 
 /// Parts read ahead of the unpacking: about 32 MiB, and the reads in flight.
 const PARTS_AHEAD: usize = 2;
@@ -59,14 +61,18 @@ pub struct FetchArgs {
     /// The cluster to fetch, when the archive holds backups of several.
     #[arg(long)]
     system_id: Option<u64>,
+    #[command(flatten)]
+    target: TargetArgs,
 }
 
 /// Writes the latest backup whose WAL the archive holds up to its end, and
-/// prints its start LSN. Then `pgwal restore` writes the WAL.
+/// prints its start LSN. Then `pgwal restore` writes the WAL. With a target,
+/// it is the latest backup that a restore to that target can use.
 pub async fn run_fetch(args: FetchArgs) -> Result<()> {
     let archive = args.archive.open()?;
     let mut keys = archive.list("").await?;
-    let backup = latest(archive.as_ref(), &mut keys, args.system_id).await?;
+    let target = args.target.target()?;
+    let backup = latest(archive.as_ref(), &mut keys, args.system_id, target.as_ref()).await?;
     if !backup.tablespaces.is_empty() {
         bail!(
             "the backup at {} has tablespaces, and pgwal fetch writes the data directory only",
@@ -98,6 +104,7 @@ async fn latest(
     archive: &dyn WalSink,
     keys: &mut Vec<String>,
     system_id: Option<u64>,
+    target: Option<&Target>,
 ) -> Result<ArchivedBackup> {
     let mut found: Vec<(u64, Lsn)> = keys
         .iter()
@@ -125,6 +132,9 @@ async fn latest(
             .and_then(ArchivedBackup::parse)
             .filter(|b| (b.system_id, b.start) == (system, start))
             .with_context(|| format!("unreadable {key}"))?;
+        if !before(archive, &backup, target).await? {
+            continue;
+        }
         if !covered(keys, &backup) && !listed_again {
             archive::list_again(archive, "", keys).await?;
             listed_again = true;
@@ -134,7 +144,39 @@ async fn latest(
         }
         warn!(start = %backup.start, end = %backup.end, "the archive lacks WAL up to the end of the backup");
     }
-    bail!("no base backup in the archive with its WAL up to its end")
+    match target {
+        None => bail!("no base backup in the archive with its WAL up to its end"),
+        Some(_) => bail!(
+            "no base backup in the archive that ends before the target, with its WAL up to its end"
+        ),
+    }
+}
+
+/// A restore to `target` can use `backup`: the copy is consistent at its
+/// end. For a time, the backup started before it: a target inside the
+/// backup needs the backup before, which an earlier `--target-time` of
+/// `pgwal fetch` gives.
+async fn before(
+    archive: &dyn WalSink,
+    backup: &ArchivedBackup,
+    target: Option<&Target>,
+) -> Result<bool> {
+    let unix = match target {
+        None => return Ok(true),
+        Some(Target::Lsn(lsn)) => return Ok(backup.end <= *lsn),
+        Some(Target::Time { unix, .. }) => *unix,
+    };
+    const MANIFEST: &str = "backup_manifest";
+    let parts = (backup.streams.iter())
+        .find_map(|(name, parts)| (name == MANIFEST).then_some(*parts))
+        .with_context(|| format!("the backup at {} has no manifest", backup.start))?;
+    let mut manifest = Vec::new();
+    for part in 0..parts {
+        manifest.extend(archive::read(archive, &part_key(backup, MANIFEST, part)).await?);
+    }
+    let started = crate::target::backup_time(&String::from_utf8_lossy(&manifest))
+        .with_context(|| format!("the backup at {}", backup.start))?;
+    Ok(started < unix)
 }
 
 /// The archive holds the WAL of `backup` from its start to its end.
@@ -314,7 +356,10 @@ mod tests {
             archive.put(&key, data.into()).await.unwrap();
         }
         let mut keys = archive.list("").await.unwrap();
-        assert_eq!(latest(&archive, &mut keys, None).await.unwrap(), backup);
+        assert_eq!(
+            latest(&archive, &mut keys, None, None).await.unwrap(),
+            backup
+        );
     }
 
     #[test]

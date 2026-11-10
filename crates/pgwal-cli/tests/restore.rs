@@ -916,3 +916,122 @@ async fn verify_finds_a_broken_page() {
         .count();
     assert_eq!(scratch, 0, "a scratch copy stayed");
 }
+
+/// A restore to a point before a DELETE: `fetch` takes the backup from
+/// before the target, and the replay stops there, by LSN and by time.
+#[tokio::test]
+async fn a_restore_to_a_target_stops_before_what_follows_it() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipping: postgres binaries not found");
+        return;
+    };
+    let setup = Setup::new(bin);
+    let receiver = setup.receiver();
+    let client = setup.client().await;
+    setup.wait_for_slot(&client).await;
+    let port = setup.port.to_string();
+    let (root, archive) = (setup.root.path(), setup.path("archive"));
+    let backup = || {
+        let out = pgwal(&[
+            "backup",
+            "--host",
+            path(root),
+            "--port",
+            &port,
+            "--archive",
+            path(&archive),
+        ]);
+        assert!(
+            out.status.success(),
+            "pgwal backup failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // The manifest gives the start of a backup to the second.
+    let next_second = || tokio::time::sleep(Duration::from_millis(1100));
+
+    client
+        .batch_execute("CREATE TABLE t (i bigint)")
+        .await
+        .unwrap();
+    let first = backup();
+    next_second().await;
+    client
+        .execute(
+            "INSERT INTO t SELECT generate_series(1::bigint, $1::bigint)",
+            &[&ROWS],
+        )
+        .await
+        .unwrap();
+    let row = client
+        .query_one(
+            "SELECT pg_current_wal_lsn()::text, to_char(clock_timestamp() AT TIME ZONE 'UTC', \
+             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let (lsn, time): (String, String) = (row.get(0), row.get(1));
+    next_second().await;
+    client.batch_execute("DELETE FROM t").await.unwrap();
+    backup();
+    client
+        .batch_execute("INSERT INTO t VALUES (-1); SELECT pg_switch_wal()")
+        .await
+        .unwrap();
+    drop(client);
+    setup.stop_with(receiver);
+
+    for (dir, flag, value) in [
+        ("to_lsn", "--target-lsn", &lsn),
+        ("to_time", "--target-time", &time),
+    ] {
+        let copy = setup.path(dir);
+        let target = [
+            "--archive",
+            path(&archive),
+            "--pgdata",
+            path(&copy),
+            flag,
+            value,
+        ];
+        let out = pgwal(&[&["fetch"][..], &target].concat());
+        assert!(
+            out.status.success(),
+            "pgwal fetch {flag} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let start = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(
+            first.split_whitespace().next(),
+            Some(start.trim()),
+            "{flag}: the backup from before the target"
+        );
+        let standby = pgwal(&[&["restore", "--standby"][..], &target].concat());
+        assert!(!standby.status.success(), "a standby with a target");
+        let past = ["--archive", path(&archive), "--pgdata", path(&copy)];
+        let out = pgwal(&[&["restore", "--target-lsn", "FF/0"][..], &past].concat());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains("the end of the archived WAL"),
+            "{err}"
+        );
+        let out = pgwal(&[&["restore"][..], &target].concat());
+        assert!(
+            out.status.success(),
+            "pgwal restore {flag} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        setup.start(dir);
+        let rows: i64 = setup
+            .promoted_client()
+            .await
+            .query_one("SELECT count(*) FROM t", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(rows, ROWS, "{flag}");
+        setup.stop(dir);
+    }
+}
